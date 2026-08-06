@@ -1,0 +1,133 @@
+name    = "AXI4-Lite"
+version = "1.0"
+
+# A project's own pack. The file name is deliberate: packs are looked up nearest
+# first and shadowed **by file name**, so `axi4lite.vtp.toml` sitting in a
+# project's `packs/` replaces the one shipped in the wheel rather than competing
+# with it. Two packs matching the same interface with equal specificity would be
+# a coin toss; this is the mechanism §8.14 provides so that it never is one.
+#
+# It is the shipped AXI4-Lite pack plus one rung: §8.17's cross-interface stall
+# reason.
+#
+#     [[stall_reason]]
+#     name = "arbitration";  when = "req_valid && grant != my_id"
+#
+# That example in §8.17 is about a wire the interface does not own — the
+# arbiter's grant — which is why the expression layer resolves a name that is
+# not an interface signal as a hierarchical path in the trace. A pack shipped
+# with the tool cannot write this rung, because it cannot know what a project
+# calls its arbiter. A project can, in four lines, and this file is the worked
+# example of how.
+#
+# Everything else is inherited by copy rather than by an include directive: a
+# pack is a description, and §8.15's promise is that a new one is a single file
+# you can read top to bottom.
+
+[detect]
+required_suffixes = ["awvalid", "awready", "awaddr", "wvalid", "wready", "wdata",
+                     "bvalid", "bready", "arvalid", "arready", "araddr",
+                     "rvalid", "rready", "rdata"]
+prefix_strip      = ["m_axi_", "s_axi_", "axi_", "m_axil_", "s_axil_", "m_", "s_", ""]
+clock             = "aclk|clk|.*_aclk|.*_clk"
+reset             = "aresetn|areset_n|rst_n|resetn|.*_aresetn|.*_rst_n"
+
+[[channel]]
+name    = "AW"
+valid   = "awvalid"
+ready   = "awready"
+payload = ["awaddr", "awprot"]
+
+[[channel]]
+name    = "W"
+valid   = "wvalid"
+ready   = "wready"
+payload = ["wdata", "wstrb"]
+
+[[channel]]
+name    = "B"
+valid   = "bvalid"
+ready   = "bready"
+payload = ["bresp"]
+
+[[channel]]
+name    = "AR"
+valid   = "arvalid"
+ready   = "arready"
+payload = ["araddr", "arprot"]
+
+[[channel]]
+name    = "R"
+valid   = "rvalid"
+ready   = "rready"
+payload = ["rdata", "rresp"]
+
+[[transaction]]
+name  = "WRITE"
+start = "AW"
+body  = { channel = "W", count = "1" }
+end   = { channel = "B" }
+key   = "addr = AW.awaddr"
+
+[[transaction]]
+name  = "READ"
+start = "AR"
+end   = { channel = "R", count = "1" }
+key   = "addr = AR.araddr"
+
+[metrics]
+latency      = "end.cycle - start.cycle"
+addr_latency = "AW.accept_time - AW.assert_time"
+stall_cycles = "sum(stall)"
+
+[perf]
+transfer = ["W", "R"]
+data     = "wdata"
+strobe   = "wstrb"
+
+# The rung the shipped pack cannot write. `tb_axi_arb.slv.wcnt` is the slave's
+# internal wait-state counter — a wire inside a module none of the three
+# interfaces owns — and it resolves here because the expression layer looks a
+# name up as a hierarchical path once the interface does not have it.
+#
+# That is §8.17's whole point about the cascade being *in the pack*: a stall on
+# one interface is routinely caused by a wire on another, and only the project
+# knows which. "The address was refused" (what the shipped pack can say) and
+# "the slave was still counting its eight wait states" (what this says) are the
+# same cycles and very different bug reports.
+#
+# Note what this rung does *not* claim. §8.17's own example is
+# `req_valid && grant != my_id`, and it cannot be written here: `my_id` differs
+# per interface while a pack is one file for all of them, so `grant != 0` would
+# label the winning master's stalls as arbitration too. A rung that is right for
+# one interface and wrong for another is worse than no rung, because the shares
+# still add to 100% and look correct.
+[[stall_reason]]
+name = "slave_wait_states"
+when = "awvalid && !awready && tb_axi_arb.slv.wcnt < 8"
+msg  = "the slave was still counting its wait states"
+
+[[stall_reason]]
+name = "address_stall"
+when = "awvalid && !awready || arvalid && !arready"
+msg  = "the address was offered and not accepted"
+
+[[stall_reason]]
+name = "backpressure"
+when = "wvalid && !wready || rvalid && !rready"
+msg  = "the sink was not accepting: data was offered and refused"
+
+[[stall_reason]]
+name = "response_wait"
+when = "outstanding > 0"
+msg  = "the transaction was issued and the slave had not answered yet"
+
+[[stall_reason]]
+name = "starvation"
+when = "!valid && ready"
+msg  = "the sink was ready and the master had nothing to send"
+
+[[stall_reason]]
+name = "idle"
+when = "!valid && !ready"
+msg  = "no beat was offered and no sink was ready"

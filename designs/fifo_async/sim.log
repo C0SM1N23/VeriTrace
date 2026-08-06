@@ -1,0 +1,6 @@
+VCD info: dumpfile dump.vcd opened for output.
+VCD warning: array word tb_fifo_sync.dut.mem[0] will conflict with an escaped identifier.
+VCD warning: array word tb_fifo_sync.dut.mem[1] will conflict with an escaped identifier.
+VCD warning: array word tb_fifo_sync.dut.mem[2] will conflict with an escaped identifier.
+VCD warning: array word tb_fifo_sync.dut.mem[3] will conflict with an escaped identifier.
+tb_fifo_sync.sv:77: $finish called at 475000 (1ps)

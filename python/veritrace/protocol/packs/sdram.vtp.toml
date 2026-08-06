@@ -1,0 +1,78 @@
+name    = "SDR SDRAM"
+version = "1.0"
+
+# §8.20. A memory pack decodes a command bus instead of assembling
+# transactions from valid/ready channels — there is no backpressure on a
+# command bus, the controller drives it and the array obeys, so `[[channel]]`
+# and `[[transaction]]` simply do not apply here. `[[command]]` is the whole
+# vocabulary: one row per command, `encode` is the exact truth table the
+# datasheet prints, `args` says how to read the payload out of `ba`/`a` once a
+# row matches. §8.20's own worked example, transcribed.
+#
+# Pin names follow the JEDEC SDR SDRAM convention (Micron, ISSI, Winbond parts
+# all agree on these): CS#, RAS#, CAS#, WE# select the command, BA is the bank
+# address, A is the multiplexed row/column address bus.
+
+[detect]
+required_suffixes = ["cs_n", "ras_n", "cas_n", "we_n", "ba", "a"]
+# `*` infers a prefix from names *longer* than the anchor suffix (`sdram_cs_n`
+# strips to `sdram_`) — it does not match the anchor bare, so a controller
+# that names its own pins exactly `cs_n`/`ba`/`a` with no prefix at all needs
+# the empty string tried too.
+prefix_strip       = ["*", ""]
+clock              = "clk|clock"
+# SDR SDRAM has no RESET# pin at all — the array itself is stateless until
+# ACTIVATE opens a row, so there is nothing here for §5.5's reset-masking to
+# do. Left at the library default: if a design happens to have a reset in the
+# same scope it is still picked up, and if not `Interface.reset` is simply
+# `None`, which the decoder already treats as "never in reset".
+reset              = "rst_n|resetn|rst|reset"
+
+# The cascade is priority order, exactly like §8.17's [[stall_reason]]: the
+# first row whose `encode` holds wins, and CS# high (deselected) matches none
+# of them, which is what "no command this cycle" means — there is no explicit
+# NOP row because the absence of a match already is one.
+[[command]]
+name   = "ACTIVATE"
+encode = { cs_n = 0, ras_n = 0, cas_n = 1, we_n = 1 }
+args   = { bank = "ba", row = "a" }
+
+[[command]]
+name   = "READ"
+encode = { cs_n = 0, ras_n = 1, cas_n = 0, we_n = 1 }
+# a[10] is the auto-precharge flag on every SDR/DDR generation that reuses the
+# column address bus for it — a READ or WRITE with AP set closes its own row
+# the moment the burst finishes, without a separate PRECHARGE command.
+args   = { bank = "ba", col = "a[9:0]", ap = "a[10]" }
+
+[[command]]
+name   = "WRITE"
+encode = { cs_n = 0, ras_n = 1, cas_n = 0, we_n = 0 }
+args   = { bank = "ba", col = "a[9:0]", ap = "a[10]" }
+
+[[command]]
+name   = "PRECHARGE"
+encode = { cs_n = 0, ras_n = 0, cas_n = 1, we_n = 0 }
+# a[10] set means "precharge all banks", the same bit position READ/WRITE use
+# for auto-precharge — the datasheet reuses it as "all banks" here instead.
+args   = { bank = "ba", all = "a[10]" }
+
+[[command]]
+name   = "REFRESH"
+encode = { cs_n = 0, ras_n = 0, cas_n = 0, we_n = 1 }
+
+# §8.20's address-map inspector: "type an address, see (bank, row, col)". Not
+# derivable from the command stream — that already shows the *result* of a
+# decode a real controller performed, not the formula. A pack states the
+# formula once, and this one is illustrative rather than universal: it is a
+# bank-interleaved mapping sized for a 4-bank x16 part shaped like
+# MT48LC16M16A2 (13-bit row, 9-bit column, 2-bit bank, one low bit for the
+# byte within a 16-bit word) — bank placed *above* the column bits so that
+# sequential accesses spread across banks instead of thrashing one row buffer.
+# A project whose controller maps addresses differently overrides this
+# section the way any pack is overridden, by dropping its own
+# `sdram.vtp.toml` in `packs/`.
+[address_map]
+bank = "addr[11:10]"
+row  = "addr[24:12]"
+col  = "addr[9:1]"

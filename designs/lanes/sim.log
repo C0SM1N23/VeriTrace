@@ -1,0 +1,4 @@
+VCD info: dumpfile dump.vcd opened for output.
+VCD warning: array word tb_lanes.dut.g_lane[0].u_fifo.mem[0] will conflict with an escaped identifier.
+VCD warning: array word tb_lanes.dut.g_lane[1].u_fifo.mem[0] will conflict with an escaped identifier.
+tb_lanes.sv:55: $finish called at 495000 (1ps)

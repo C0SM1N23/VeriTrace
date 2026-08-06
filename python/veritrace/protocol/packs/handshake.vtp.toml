@@ -1,0 +1,73 @@
+name    = "Handshake"
+version = "1.0"
+
+# Generic valid/ready, the last entry in the §8.15 table: "orice interfata
+# custom". Every other pack here is a special case of this one, so it doubles as
+# the worked example for anyone writing their own — the whole file is thirty
+# lines, which is the point §8.15 makes about the DSL being the right shape.
+
+[detect]
+# `*` means: do not guess what people call their buses, read the prefix out of
+# the design. Any pair `<something>valid` / `<something>ready` in the same scope
+# is a handshake, whether it is `push_valid`, `src_valid` or `tx_valid`.
+required_suffixes = ["valid", "ready"]
+prefix_strip      = ["*"]
+clock             = "clk|clock|aclk|.*_clk"
+reset             = "rst_n|resetn|aresetn|rst|reset|.*_rst_n|.*_rst"
+
+[[channel]]
+name    = "X"
+valid   = "valid"
+ready   = "ready"
+# Optional by nature: a field the design does not have simply has no value, so
+# listing the usual suspects costs nothing and picks up whatever is there.
+payload = ["data", "last", "keep", "strb", "id", "user", "addr", "len"]
+
+# No `body` and no `end`: on a bare handshake each accepted beat is complete in
+# itself, so the transfer is the transaction.
+[[transaction]]
+name  = "XFER"
+start = "X"
+
+[metrics]
+# The waiting that preceded this beat. §8.14 writes this as
+# `sum(valid && !ready)`; at the accepting edge both are high by definition, so
+# the engine counts the waiting cycles during the scan and exposes them per beat
+# as `stall`. Same number, and it is decidable.
+stall_cycles = "sum(stall)"
+wait         = "X.accept_time - X.assert_time"
+
+# §8.17. One channel, so `valid` and `ready` in the cascade below are literally
+# these wires — the generic aggregate and the signal are the same thing here,
+# which is why §8.17 can write the rungs the way it does.
+[perf]
+transfer = ["X"]
+data     = "data"
+strobe   = "strb"
+
+[[stall_reason]]
+name = "backpressure"
+when = "valid && !ready"
+msg  = "the sink was not accepting"
+
+[[stall_reason]]
+name = "starvation"
+when = "!valid && ready"
+msg  = "the sink was ready and the source had nothing to send"
+
+[[stall_reason]]
+name = "idle"
+when = "!valid && !ready"
+msg  = "neither side was moving"
+
+[[rule]]
+id       = "HS_NODROP"
+severity = "error"
+check    = "valid && !ready |=> valid"
+msg      = "valid was withdrawn before ready accepted it"
+
+[[rule]]
+id       = "HS_DATA_STABLE"
+severity = "warn"
+check    = "valid && !ready |=> $stable(data)"
+msg      = "the payload changed while the beat was still waiting for ready"

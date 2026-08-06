@@ -1,0 +1,28 @@
+[package]
+name = "vt-trace"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arrow = "53"
+parquet = "53"
+rayon = "1.10"
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+sha2 = "0.10"
+
+# FST support is optional: the `fstapi` crate builds libfst from C sources and
+# needs zlib + libclang. Trivial on Linux (zlib1g-dev, libclang-dev), but on
+# Windows it additionally requires a vcpkg install of zlib/pthreads/mman. VCD
+# is the spec's primary target (§4.0), so it stays dependency-free.
+fstapi = { version = "0.0.3", optional = true }
+
+[features]
+default = []
+fst = ["dep:fstapi"]
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"

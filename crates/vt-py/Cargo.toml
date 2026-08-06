@@ -1,0 +1,25 @@
+[package]
+name = "vt-py"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Track a PyO3 that supports the current CPython. The version here is a hard
+# ceiling on the interpreters this package can be built for: PyO3 refuses to
+# compile against a Python newer than it knows about, and the failure surfaces
+# as a wall of Rust output during `pip install`, not as a readable message.
+# `requires-python` in pyproject.toml is kept in step with it.
+pyo3 = "0.29"
+vt-trace = { path = "../vt-trace" }
+
+# `extension-module` must stay off the default feature set: with it on, PyO3
+# skips linking libpython (so the wheel built by maturin stays portable), but
+# that also means `cargo test`/`cargo run` fail to link a standalone binary.
+# maturin enables it explicitly for real builds (see pyproject.toml).
+[features]
+extension-module = ["pyo3/extension-module"]
+fst = ["vt-trace/fst"]

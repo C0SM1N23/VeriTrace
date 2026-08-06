@@ -1,0 +1,42 @@
+VCD info: dumpfile dump.vcd opened for output.
+VCD warning: array word tb_fifo_buggy.dut.mem[0] will conflict with an escaped identifier.
+VCD warning: array word tb_fifo_buggy.dut.mem[1] will conflict with an escaped identifier.
+ERROR: assertion "p_fifo_drains" failed at time 275ns
+       tb_fifo_buggy.dut.full
+ERROR: assertion "p_fifo_drains" failed at time 285ns
+       tb_fifo_buggy.dut.full
+ERROR: assertion "p_fifo_drains" failed at time 295ns
+       tb_fifo_buggy.dut.full
+ERROR: assertion "p_fifo_drains" failed at time 305ns
+       tb_fifo_buggy.dut.full
+ERROR: assertion "p_fifo_drains" failed at time 315ns
+       tb_fifo_buggy.dut.full
+ERROR: assertion "p_fifo_drains" failed at time 325ns
+       tb_fifo_buggy.dut.full
+ERROR: assertion "p_fifo_drains" failed at time 335ns
+       tb_fifo_buggy.dut.full
+ERROR: assertion "p_fifo_drains" failed at time 345ns
+       tb_fifo_buggy.dut.full
+ERROR: assertion "p_fifo_drains" failed at time 355ns
+       tb_fifo_buggy.dut.full
+ERROR: assertion "p_fifo_drains" failed at time 365ns
+       tb_fifo_buggy.dut.full
+ERROR: assertion "p_fifo_drains" failed at time 375ns
+       tb_fifo_buggy.dut.full
+ERROR: assertion "p_fifo_drains" failed at time 385ns
+       tb_fifo_buggy.dut.full
+ERROR: assertion "p_fifo_drains" failed at time 395ns
+       tb_fifo_buggy.dut.full
+ERROR: assertion "p_fifo_drains" failed at time 405ns
+       tb_fifo_buggy.dut.full
+ERROR: assertion "p_fifo_drains" failed at time 415ns
+       tb_fifo_buggy.dut.full
+ERROR: assertion "p_fifo_drains" failed at time 425ns
+       tb_fifo_buggy.dut.full
+ERROR: assertion "p_fifo_drains" failed at time 435ns
+       tb_fifo_buggy.dut.full
+ERROR: assertion "p_fifo_drains" failed at time 445ns
+       tb_fifo_buggy.dut.full
+ERROR: assertion "p_fifo_drains" failed at time 455ns
+       tb_fifo_buggy.dut.full
+tb_fifo_buggy.sv:84: $finish called at 455000 (1ps)

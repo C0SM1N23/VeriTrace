@@ -1,0 +1,3 @@
+VCD info: dumpfile dump.vcd opened for output.
+axi_lite: finished at 1225000
+tb_axi_lite.sv:108: $finish called at 1225000 (1ps)

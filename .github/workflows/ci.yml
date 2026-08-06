@@ -1,0 +1,333 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly, so performance drift shows up without slowing every push.
+    - cron: "0 4 * * 1"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both ends of the range `requires-python` promises. PyO3 sets the
+        # ceiling, so a claim of 3.12-3.14 has to be checked at 3.14 or it is
+        # only a claim.
+        python: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # fstapi builds libfst from C sources and generates bindings with
+      # bindgen, so it needs zlib headers and libclang. Cheap here; on Windows
+      # it also wants vcpkg, which is why the `fst` feature is off by default.
+      - name: Install FST build dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libclang-dev
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: cargo test (fst feature)
+        run: cargo test -p vt-trace --features fst
+
+      - name: Install project
+        run: uv sync --python ${{ matrix.python }}
+
+      - name: pytest
+        run: uv run pytest
+
+  # §13.9: the tool gating itself. A failing build should carry the cause, not
+  # a dump nobody will open — so this runs the same commands a user would, on
+  # the designs with the deliberate flaws, and asserts what they must find.
+  self-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync
+
+      - name: Correlation must not regress
+        run: |
+          uv run veritrace correlate designs/lanes/dump.vcd --rtl designs/lanes | tee corr.txt
+          # §7 sets 90% as the bar for the hard cases of §7.1.
+          rate=$(grep -oP '\(\K[0-9.]+(?=%\))' corr.txt | head -1)
+          echo "correlation: $rate%"
+          awk -v r="$rate" 'BEGIN { exit (r >= 90) ? 0 : 1 }'
+
+      - name: Every injected problem is still reported
+        run: |
+          uv run veritrace check designs/checks/dump.vcd --rtl designs/checks | tee checks.txt
+          for c in "latch inferred" "missing 'default'" "frozen at" \
+                   "blocking assignment" "sensitivity list misses" \
+                   "unsynchronised" "left at its default"; do
+            grep -qi "$c" checks.txt || { echo "MISSING: $c"; exit 1; }
+          done
+
+      - name: Triage reaches the injected bug from the log
+        run: |
+          uv run veritrace triage designs/fifo_buggy/sim.log \
+            --trace designs/fifo_buggy/dump.vcd --rtl designs/fifo_buggy | tee triage.txt
+          grep -q "1 root cause" triage.txt
+          grep -q "rd_rst_n" triage.txt
+
+      - name: Every export format is produced
+        run: |
+          for fmt in --do --gtkw --wcfg --surfer; do
+            uv run veritrace why designs/fifo_buggy/dump.vcd \
+              "why(tb_fifo_buggy.dut.full)" --rtl designs/fifo_buggy $fmt > /dev/null
+          done
+          for fmt in vivado quartus; do
+            uv run veritrace probes tb_fifo_buggy.dut.full \
+              --rtl designs/fifo_buggy --format $fmt > /dev/null
+          done
+
+      # §8.14's acceptance criterion: every transaction found, and the
+      # correlation between signals and transactions stated explicitly.
+      - name: Transactions are extracted with the rate reported
+        run: |
+          uv run veritrace txn designs/axi_lite/dump.vcd --rtl designs/axi_lite | tee txn.txt
+          grep -q "AXI4-Lite" txn.txt
+          grep -q "12 READ, 12 WRITE" txn.txt
+          grep -q "60/60 channel events correlated, 100%" txn.txt
+          # §6.3: the table is Parquet, and it is the export as well as the cache.
+          test -f designs/axi_lite/dump.vcd.vtx/txn/cpu.parquet
+
+      # §8.16, the capability the whole transaction layer exists for: the reason
+      # master 0 is silent is a transaction belonging to master 1.
+      - name: Transaction-level why-trace crosses the arbiter
+        run: |
+          uv run veritrace why designs/axi_arb/dump.vcd \
+            "why(txn.m0.WRITE[0].not_issued)" --rtl designs/axi_arb | tee txnwhy.txt
+          grep -q "WRITE#0 on m0" txnwhy.txt
+          grep -q "\[txn\] m1.WRITE\[" txnwhy.txt
+          grep -q "grant" txnwhy.txt
+
+      - name: A protocol violation fails the build when asked
+        run: |
+          uv run veritrace check designs/axi_lite/dump.vcd --rtl designs/axi_lite \
+            --fail-on protocol && { echo "the SLVERR responses were not caught"; exit 1; }
+          uv run veritrace check designs/axi_lite/dump.vcd --rtl designs/axi_lite | grep -q PROTOCOL
+
+      # §8.17's acceptance criterion. The shares are printed so a reader can
+      # check them; CI checks them for the same reason.
+      - name: Stall attribution sums to exactly 100%
+        run: |
+          uv run veritrace perf designs/axi_lite/dump.vcd --rtl designs/axi_lite | tee perf.txt
+          grep -q "= total          100.0%" perf.txt
+          grep -q "address_stall" perf.txt
+          # And with a project pack, which shadows the shipped one by file name
+          # and adds a rung reading a wire no interface owns (§8.17).
+          uv run veritrace perf designs/axi_arb/dump.vcd --rtl designs/axi_arb \
+            | tee perf2.txt
+          grep -q "slave_wait_states" perf2.txt
+          grep -q "= total          100.0%" perf2.txt
+          # `other` is only printed when it is non-zero, and a non-zero `other`
+          # means the shipped cascade has a gap. Anchored, so the word appearing
+          # in some future message does not fail the build.
+          grep -qE "^      other " perf.txt \
+            && { echo "the cascade left cycles unattributed"; exit 1; }
+          uv run veritrace perf designs/axi_arb/dump.vcd --rtl designs/axi_arb \
+            "stalls(m0)" > /dev/null
+
+      # §8.18's acceptance criterion, both halves. The bug is a compile-time
+      # define, so the two dumps come from one source and "none found" is as
+      # checkable as "found".
+      - name: The injected deadlock is found, and only when it is there
+        run: |
+          uv run veritrace perf designs/deadlock/dump.vcd --rtl designs/deadlock | tee dl.txt
+          grep -q "DEADLOCK at" dl.txt
+          grep -q "Cycle of 2 agents" dl.txt
+          grep -q "waits on .*awready .*held by" dl.txt
+          grep -q "First blocked: WRITE#" dl.txt
+          uv run veritrace perf designs/deadlock/dump_ok.vcd --rtl designs/deadlock \
+            | tee ok.txt
+          grep -q "no deadlock, livelock or starvation found" ok.txt
+          # And it is a finding, not a separate kind of news (§11.4).
+          uv run veritrace check designs/deadlock/dump.vcd --rtl designs/deadlock \
+            --fail-on deadlock && { echo "the deadlock did not fail the build"; exit 1; }
+
+      # §8.20's acceptance criterion, both halves. Four timing violations, one
+      # per category, each with its exact cycle — and none at all on the same
+      # controller compiled clean.
+      - name: Every injected SDRAM timing violation is found, and only then
+        run: |
+          uv run veritrace memory designs/sdram/dump.vcd | tee mem.txt
+          for c in tRCD tRP tRFC tFAW; do
+            grep -q "! $c violated 1 time(s)" mem.txt || { echo "MISSED: $c"; exit 1; }
+          done
+          # The exact cycle and both commands, not just "something looks wrong".
+          grep -q "ACTIVATE@c8 -> READ@c9" mem.txt
+          # Constraints that held are stated, not merely absent.
+          grep -q "conformant" mem.txt
+          uv run veritrace memory designs/sdram/dump_ok.vcd | tee memok.txt
+          grep -q "violated" memok.txt && { echo "a clean run reported a violation"; exit 1; }
+          uv run veritrace memory designs/sdram/dump.vcd "banks(ctrl)" > /dev/null
+          # And it fails the build when asked (§13.9).
+          uv run veritrace check designs/sdram/dump.vcd --fail-on memory \
+            && { echo "the timing violations did not fail the build"; exit 1; }
+
+  # A clean machine, a wheel, and the three commands §13.4 promises. This is the
+  # packaging acceptance criterion of Prompt 8, not a smoke test.
+  packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build the UI into the package
+        run: npm ci && npm run build
+        working-directory: web
+
+      - name: Build a wheel
+        run: |
+          pip install maturin
+          maturin build --release -o dist
+
+      - name: Install it somewhere that has never seen this repo
+        run: |
+          python -m venv /tmp/fresh
+          /tmp/fresh/bin/pip install dist/*.whl
+
+      - name: A colleague's first sixty seconds (§13.4)
+        run: |
+          mkdir -p /tmp/proj/rtl /tmp/proj/sim
+          cp designs/checks/*.sv /tmp/proj/rtl/
+          cp designs/checks/dump.vcd /tmp/proj/sim/
+          cd /tmp/proj
+          printf 'y\ny\ny\n' | /tmp/fresh/bin/veritrace init | tee init.txt
+          grep -q "Trace found" init.txt
+          grep -q "correlation:" init.txt
+          # The findings are on screen before the server is even started.
+          grep -qi "stuck" init.txt
+
+      # A wheel without the packs detects nothing, which looks exactly like a
+      # design that has no bus. Check on a copy, so it cannot pass by finding
+      # the repository's own packs/ directory.
+      - name: The wheel carries its protocol packs
+        run: |
+          mkdir -p /tmp/bus/rtl /tmp/bus/sim
+          cp designs/axi_lite/*.sv /tmp/bus/rtl/
+          cp designs/axi_lite/dump.vcd /tmp/bus/sim/
+          cd /tmp/bus
+          /tmp/fresh/bin/veritrace txn sim/dump.vcd --rtl rtl | tee txn.txt
+          grep -q "AXI4-Lite" txn.txt
+          grep -q "channel events correlated, 100%" txn.txt
+
+      - name: The packaged server serves the app, not just the API
+        run: |
+          cd /tmp/proj
+          /tmp/fresh/bin/veritrace serve --port 8799 --no-browser &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8799/ >/dev/null && break; sleep 1; done
+          curl -sf http://127.0.0.1:8799/ | grep -q '"name":"veritrace"'
+          curl -sf -H 'Accept: text/html' http://127.0.0.1:8799/ | grep -q '<!doctype html>'
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - name: typecheck + build
+        run: npm run build
+        working-directory: web
+      - name: unit tests
+        run: npm test
+        working-directory: web
+
+  # End-to-end runs the real stack: convert a dump, serve it, drive Chromium.
+  # This is where the acceptance criteria for the Wave and Checks tabs are
+  # checked — 60 fps over 40 rows, a layout that survives a reload, and every
+  # injected problem reported with no manual query.
+  web-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: uv sync
+      - name: Convert the reference dumps
+        # fifo_buggy carries the injected bug, so the causal tests have a real
+        # root cause to find; checks carries the deliberate flaws for TAB 6;
+        # axi_lite and axi_arb carry the interfaces TAB 8 and §8.16 need;
+        # deadlock carries the injected wait-for cycle TAB 9 is about;
+        # sdram carries the four injected timing violations TAB 10 is about.
+        run: |
+          for d in fifo_buggy checks axi_lite axi_arb deadlock sdram; do
+            uv run veritrace convert designs/$d/dump.vcd -o designs/$d/dump.vtx
+          done
+          # The control run: TAB 9's tests need the same RTL without the bug.
+          uv run veritrace convert designs/deadlock/dump_ok.vcd \
+            -o designs/deadlock/dump_ok.vtx
+
+      - run: npm ci
+        working-directory: web
+      - name: Install Chromium for Playwright
+        run: npx playwright install --with-deps chromium
+        working-directory: web
+
+      - name: Serve the trace with RTL
+        run: |
+          uv run veritrace serve designs/fifo_buggy/dump.vtx \
+            --rtl designs/fifo_buggy --port 8765 --no-browser &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8765/ > /dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8765/
+
+      - name: Playwright
+        run: npm run test:e2e
+        working-directory: web
+
+  # The performance thresholds of §4.2 are a build gate, but a 50 MB benchmark
+  # is too slow for every push, so it runs on a schedule and on demand.
+  bench:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Benchmark against the tier-A budget
+        run: cargo run --release -p vt-trace --example bench -- 50

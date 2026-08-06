@@ -1,0 +1,169 @@
+name    = "AXI4-Lite"
+version = "1.0"
+
+# §8.15: "registri de control, SoC-ul de la Siemens". AXI4-Lite is AXI4 with no
+# bursts and no ids: one data beat per transaction, strictly in order. That
+# makes it the shortest real pack in the repo and a good second example after
+# handshake.vtp.
+
+[detect]
+required_suffixes = ["awvalid", "awready", "awaddr", "wvalid", "wready", "wdata",
+                     "bvalid", "bready", "arvalid", "arready", "araddr",
+                     "rvalid", "rready", "rdata"]
+prefix_strip      = ["m_axi_", "s_axi_", "axi_", "m_axil_", "s_axil_", "m_", "s_", ""]
+clock             = "aclk|clk|.*_aclk|.*_clk"
+reset             = "aresetn|areset_n|rst_n|resetn|.*_aresetn|.*_rst_n"
+
+[[channel]]
+name    = "AW"
+valid   = "awvalid"
+ready   = "awready"
+payload = ["awaddr", "awprot"]
+
+[[channel]]
+name    = "W"
+valid   = "wvalid"
+ready   = "wready"
+payload = ["wdata", "wstrb"]
+
+[[channel]]
+name    = "B"
+valid   = "bvalid"
+ready   = "bready"
+payload = ["bresp"]
+
+[[channel]]
+name    = "AR"
+valid   = "arvalid"
+ready   = "arready"
+payload = ["araddr", "arprot"]
+
+[[channel]]
+name    = "R"
+valid   = "rvalid"
+ready   = "rready"
+payload = ["rdata", "rresp"]
+
+# Exactly one data beat, then the response. No `id`: AXI4-Lite has no ids, so
+# matching falls back to age — which is also what the protocol mandates.
+[[transaction]]
+name  = "WRITE"
+start = "AW"
+body  = { channel = "W", count = "1" }
+end   = { channel = "B" }
+key   = "addr = AW.awaddr"
+
+[[transaction]]
+name  = "READ"
+start = "AR"
+end   = { channel = "R", count = "1" }
+key   = "addr = AR.araddr"
+
+# In cycles, not in raw time units: §8.13's own example reads "latency: 22
+# cycles (addr->resp)", and a column of picoseconds is one nobody can read
+# without knowing the timescale — including §8.17's latency histogram, whose
+# axis would otherwise be meaningless.
+[metrics]
+latency      = "end.cycle - start.cycle"
+addr_latency = "AW.accept_time - AW.assert_time"
+stall_cycles = "sum(stall)"
+
+# §8.17. W and R are where the bus does work; AW, AR and B are the overhead a
+# transfer cycle is measured against.
+[perf]
+transfer = ["W", "R"]
+data     = "wdata"
+strobe   = "wstrb"
+
+# The cascade, in priority order. Every cycle that moved no data gets the first
+# label that matches, and what nothing matches lands in `other` — so the shares
+# add to exactly 100% and an incomplete cascade is visible rather than silent.
+#
+# These rungs use only this interface's own wires, because a shipped pack cannot
+# know what a project calls its arbiter. A project that wants `arbitration`
+# broken out drops its own pack in `packs/` naming the grant signal — the
+# expression layer resolves a hierarchical path when the name is not a signal of
+# the interface, which is exactly what §8.17's `grant != my_id` needs.
+# First, because it is the more serious of the two refusals and because on
+# AXI4-Lite a master asserts AW and W together: if both are refused, the cycle
+# belongs to the reason the transaction could not *start*, not to the reason its
+# data could not stream. Ranking backpressure above this would label every
+# blocked master "the sink was slow" and point at the wrong module.
+#
+# This is also where arbitration surfaces on a shipped pack. The arbiter drives
+# `awready`, so an address offered and refused is the master being held off — the
+# pack cannot name *which* arbiter, but "refused" and "never asked" are different
+# bugs and it can always tell them apart.
+[[stall_reason]]
+name = "address_stall"
+when = "awvalid && !awready || arvalid && !arready"
+msg  = "the address was offered and not accepted; something upstream is holding the bus"
+
+[[stall_reason]]
+name = "backpressure"
+when = "wvalid && !wready || rvalid && !rready"
+msg  = "the sink was not accepting: data was offered and refused"
+
+[[stall_reason]]
+name = "response_wait"
+when = "outstanding > 0"
+msg  = "the transaction was issued and the slave had not answered yet"
+
+[[stall_reason]]
+name = "starvation"
+when = "!valid && ready"
+msg  = "the sink was ready and the master had nothing to send"
+
+# Distinct from `other` on purpose. `idle` is a fact about the design — nobody
+# wanted the bus; `other` is a fact about the *pack* — the cascade has a gap.
+# Merging them would destroy the only signal that says the attribution is
+# incomplete.
+[[stall_reason]]
+name = "idle"
+when = "!valid && !ready"
+msg  = "no beat was offered and no sink was ready"
+
+[[rule]]
+id       = "AXI_AWSTABLE"
+severity = "error"
+check    = "awvalid && !awready |=> $stable(awaddr)"
+msg      = "the write address changed before it was accepted"
+
+[[rule]]
+id       = "AXI_ARSTABLE"
+severity = "error"
+check    = "arvalid && !arready |=> $stable(araddr)"
+msg      = "the read address changed before it was accepted"
+
+[[rule]]
+id       = "AXI_NODROP"
+severity = "error"
+check    = "awvalid && !awready |=> awvalid"
+msg      = "awvalid was withdrawn before awready"
+
+[[rule]]
+id       = "AXI_WDATA_STABLE"
+severity = "error"
+check    = "wvalid && !wready |=> $stable(wdata)"
+msg      = "the write data changed before it was accepted"
+
+[[rule]]
+id       = "AXI_SLVERR"
+severity = "warn"
+check    = "bresp == 0"
+msg      = "the slave answered a write with something other than OKAY"
+
+[[rule]]
+id       = "AXI_RRESP"
+severity = "warn"
+check    = "rresp == 0"
+msg      = "the slave answered a read with something other than OKAY"
+
+# AXI4-Lite has no ids, so a master may legally have only one transaction of
+# each kind in flight. More than that is a protocol error, not a tuning knob.
+[[rule]]
+id       = "AXIL_MAXOUTSTANDING"
+severity = "warn"
+check    = "outstanding <= param.max"
+param.max = 1
+msg      = "more than one outstanding transaction on an AXI4-Lite interface"

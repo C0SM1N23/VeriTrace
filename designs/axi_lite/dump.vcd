@@ -1,0 +1,1449 @@
+$date
+	Tue Aug 04 18:47:17 2026
+$end
+$version
+	Icarus Verilog
+$end
+$timescale
+	1ps
+$end
+$scope module tb_axi_lite $end
+$var wire 3 ! s_axi_arprot [2:0] $end
+$var wire 3 " s_axi_awprot [2:0] $end
+$var wire 4 # s_axi_wstrb [3:0] $end
+$var wire 1 $ s_axi_wvalid $end
+$var wire 1 % s_axi_wready $end
+$var wire 32 & s_axi_wdata [31:0] $end
+$var wire 1 ' s_axi_rvalid $end
+$var wire 2 ( s_axi_rresp [1:0] $end
+$var wire 1 ) s_axi_rready $end
+$var wire 32 * s_axi_rdata [31:0] $end
+$var wire 1 + s_axi_bvalid $end
+$var wire 2 , s_axi_bresp [1:0] $end
+$var wire 1 - s_axi_bready $end
+$var wire 1 . s_axi_awvalid $end
+$var wire 1 / s_axi_awready $end
+$var wire 32 0 s_axi_awaddr [31:0] $end
+$var wire 1 1 s_axi_arvalid $end
+$var wire 1 2 s_axi_arready $end
+$var wire 32 3 s_axi_araddr [31:0] $end
+$var wire 1 4 cpu_busy $end
+$var reg 1 5 aclk $end
+$var reg 1 6 aresetn $end
+$scope module cpu $end
+$var wire 1 5 aclk $end
+$var wire 32 7 araddr [31:0] $end
+$var wire 1 6 aresetn $end
+$var wire 3 8 arprot [2:0] $end
+$var wire 1 9 aw_ok $end
+$var wire 3 : awprot [2:0] $end
+$var wire 1 . awvalid $end
+$var wire 1 ; bad $end
+$var wire 1 < grant_ok $end
+$var wire 1 = w_ok $end
+$var wire 4 > wstrb [3:0] $end
+$var wire 1 $ wvalid $end
+$var wire 1 % wready $end
+$var wire 32 ? wdata [31:0] $end
+$var wire 1 ' rvalid $end
+$var wire 2 @ rresp [1:0] $end
+$var wire 1 ) rready $end
+$var wire 32 A rdata [31:0] $end
+$var wire 1 + bvalid $end
+$var wire 1 4 busy $end
+$var wire 2 B bresp [1:0] $end
+$var wire 1 - bready $end
+$var wire 1 / awready $end
+$var wire 32 C awaddr [31:0] $end
+$var wire 1 1 arvalid $end
+$var wire 1 2 arready $end
+$var parameter 32 D BAD_AT $end
+$var parameter 32 E BASE $end
+$var parameter 1 F DO_READS $end
+$var parameter 32 G N_TXN $end
+$var reg 1 H aw_done $end
+$var reg 8 I cnt [7:0] $end
+$var reg 3 J state [2:0] $end
+$var reg 1 K w_done $end
+$upscope $end
+$scope module regs $end
+$var wire 1 5 aclk $end
+$var wire 32 L araddr [31:0] $end
+$var wire 1 6 aresetn $end
+$var wire 3 M arprot [2:0] $end
+$var wire 1 2 arready $end
+$var wire 1 1 arvalid $end
+$var wire 32 N awaddr [31:0] $end
+$var wire 3 O awprot [2:0] $end
+$var wire 1 / awready $end
+$var wire 1 . awvalid $end
+$var wire 1 - bready $end
+$var wire 1 P r_settled $end
+$var wire 1 ) rready $end
+$var wire 1 Q w_settled $end
+$var wire 32 R wdata [31:0] $end
+$var wire 1 % wready $end
+$var wire 4 S wstrb [3:0] $end
+$var wire 1 $ wvalid $end
+$var wire 4 T waddr_sel [3:0] $end
+$var wire 4 U raddr_sel [3:0] $end
+$var parameter 2 V OKAY $end
+$var parameter 1 W R_DATA $end
+$var parameter 1 X R_IDLE $end
+$var parameter 2 Y SLVERR $end
+$var parameter 32 Z WAIT_STATES $end
+$var parameter 1 [ W_IDLE $end
+$var parameter 1 \ W_RESP $end
+$var reg 2 ] bresp [1:0] $end
+$var reg 1 + bvalid $end
+$var reg 4 ^ rcnt [3:0] $end
+$var reg 32 _ rdata [31:0] $end
+$var reg 2 ` rresp [1:0] $end
+$var reg 1 a rstate $end
+$var reg 1 ' rvalid $end
+$var reg 4 b wcnt [3:0] $end
+$var reg 1 c wstate $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+$comment Show the parameter values. $end
+$dumpall
+1\
+0[
+b10 Z
+b10 Y
+0X
+1W
+b0 V
+b1100 G
+1F
+b0 E
+b1001 D
+$end
+#0
+$dumpvars
+xc
+bx b
+xa
+bx `
+bx _
+bx ^
+bx ]
+bx U
+bx T
+b1111 S
+b0xxxxxxxx R
+xQ
+xP
+b0 O
+bx N
+b0 M
+bx L
+xK
+bx J
+bx I
+xH
+bx C
+bx B
+bx A
+bx @
+b0xxxxxxxx ?
+b1111 >
+x=
+1<
+x;
+b0 :
+x9
+b0 8
+bx 7
+06
+05
+x4
+bx 3
+x2
+x1
+bx 0
+x/
+x.
+x-
+bx ,
+x+
+bx *
+x)
+bx (
+x'
+b0xxxxxxxx &
+x%
+x$
+b1111 #
+b0 "
+b0 !
+$end
+#5000
+b0 T
+b0 U
+09
+0=
+b0 3
+b0 7
+b0 L
+b0 0
+b0 C
+b0 N
+0/
+0%
+0;
+0.
+0$
+02
+0Q
+0P
+0K
+0H
+b0 &
+b0 ?
+b0 R
+b0 I
+0-
+01
+0)
+14
+b0 J
+b0 ,
+b0 B
+b0 ]
+0+
+b0 b
+0c
+b0 (
+b0 @
+b0 `
+b0 *
+b0 A
+b0 _
+0'
+b0 ^
+0a
+15
+#10000
+05
+#15000
+15
+#20000
+05
+#25000
+15
+#30000
+05
+#35000
+16
+15
+#40000
+05
+#45000
+1.
+1$
+b1 J
+15
+#50000
+05
+#55000
+b1 b
+15
+#60000
+05
+#65000
+19
+1=
+1/
+1%
+1Q
+b10 b
+15
+#70000
+05
+#75000
+0=
+09
+0/
+0%
+0Q
+0$
+0.
+1c
+1+
+b0 b
+1-
+b10 J
+0K
+0H
+15
+#80000
+05
+#85000
+0-
+11
+b11 J
+0c
+0+
+15
+#90000
+05
+#95000
+b1 ^
+15
+#100000
+05
+#105000
+12
+1P
+b10 ^
+15
+#110000
+05
+#115000
+0P
+02
+1a
+1'
+b0 ^
+01
+1)
+b100 J
+15
+#120000
+05
+#125000
+b1 T
+b1 U
+b100 3
+b100 7
+b100 L
+b100 0
+b100 C
+b100 N
+b1 &
+b1 ?
+b1 R
+b1 I
+0)
+b0 J
+0a
+0'
+15
+#130000
+05
+#135000
+1.
+1$
+b1 J
+15
+#140000
+05
+#145000
+b1 b
+15
+#150000
+05
+#155000
+19
+1=
+1/
+1%
+1Q
+b10 b
+15
+#160000
+05
+#165000
+0=
+09
+0/
+0%
+0$
+0.
+0Q
+1-
+b10 J
+0K
+0H
+1c
+1+
+b0 b
+15
+#170000
+05
+#175000
+0c
+0+
+0-
+11
+b11 J
+15
+#180000
+05
+#185000
+b1 ^
+15
+#190000
+05
+#195000
+12
+1P
+b10 ^
+15
+#200000
+05
+#205000
+02
+0P
+01
+1)
+b100 J
+1a
+b1 *
+b1 A
+b1 _
+1'
+b0 ^
+15
+#210000
+05
+#215000
+b0 T
+b0 U
+b0 3
+b0 7
+b0 L
+b0 0
+b0 C
+b0 N
+0a
+0'
+b10 &
+b10 ?
+b10 R
+b10 I
+0)
+b0 J
+15
+#220000
+05
+#225000
+1.
+1$
+b1 J
+15
+#230000
+05
+#235000
+b1 b
+15
+#240000
+05
+#245000
+19
+1=
+1/
+1%
+1Q
+b10 b
+15
+#250000
+05
+#255000
+0=
+09
+0/
+0%
+0Q
+0$
+0.
+1c
+1+
+b0 b
+1-
+b10 J
+0K
+0H
+15
+#260000
+05
+#265000
+0-
+11
+b11 J
+0c
+0+
+15
+#270000
+05
+#275000
+b1 ^
+15
+#280000
+05
+#285000
+12
+1P
+b10 ^
+15
+#290000
+05
+#295000
+0P
+02
+1a
+b10 *
+b10 A
+b10 _
+1'
+b0 ^
+01
+1)
+b100 J
+15
+#300000
+05
+#305000
+b1 T
+b1 U
+b100 3
+b100 7
+b100 L
+b100 0
+b100 C
+b100 N
+b11 &
+b11 ?
+b11 R
+b11 I
+0)
+b0 J
+0a
+0'
+15
+#310000
+05
+#315000
+1.
+1$
+b1 J
+15
+#320000
+05
+#325000
+b1 b
+15
+#330000
+05
+#335000
+19
+1=
+1/
+1%
+1Q
+b10 b
+15
+#340000
+05
+#345000
+0=
+09
+0/
+0%
+0$
+0.
+0Q
+1-
+b10 J
+0K
+0H
+1c
+1+
+b0 b
+15
+#350000
+05
+#355000
+0c
+0+
+0-
+11
+b11 J
+15
+#360000
+05
+#365000
+b1 ^
+15
+#370000
+05
+#375000
+12
+1P
+b10 ^
+15
+#380000
+05
+#385000
+02
+0P
+01
+1)
+b100 J
+1a
+b11 *
+b11 A
+b11 _
+1'
+b0 ^
+15
+#390000
+05
+#395000
+b0 T
+b0 U
+b0 3
+b0 7
+b0 L
+b0 0
+b0 C
+b0 N
+0a
+0'
+b100 &
+b100 ?
+b100 R
+b100 I
+0)
+b0 J
+15
+#400000
+05
+#405000
+1.
+1$
+b1 J
+15
+#410000
+05
+#415000
+b1 b
+15
+#420000
+05
+#425000
+19
+1=
+1/
+1%
+1Q
+b10 b
+15
+#430000
+05
+#435000
+0=
+09
+0/
+0%
+0Q
+0$
+0.
+1c
+1+
+b0 b
+1-
+b10 J
+0K
+0H
+15
+#440000
+05
+#445000
+0-
+11
+b11 J
+0c
+0+
+15
+#450000
+05
+#455000
+b1 ^
+15
+#460000
+05
+#465000
+12
+1P
+b10 ^
+15
+#470000
+05
+#475000
+0P
+02
+1a
+b100 *
+b100 A
+b100 _
+1'
+b0 ^
+01
+1)
+b100 J
+15
+#480000
+05
+#485000
+b1 T
+b1 U
+b100 3
+b100 7
+b100 L
+b100 0
+b100 C
+b100 N
+b101 &
+b101 ?
+b101 R
+b101 I
+0)
+b0 J
+0a
+0'
+15
+#490000
+05
+#495000
+1.
+1$
+b1 J
+15
+#500000
+05
+#505000
+b1 b
+15
+#510000
+05
+#515000
+19
+1=
+1/
+1%
+1Q
+b10 b
+15
+#520000
+05
+#525000
+0=
+09
+0/
+0%
+0$
+0.
+0Q
+1-
+b10 J
+0K
+0H
+1c
+1+
+b0 b
+15
+#530000
+05
+#535000
+0c
+0+
+0-
+11
+b11 J
+15
+#540000
+05
+#545000
+b1 ^
+15
+#550000
+05
+#555000
+12
+1P
+b10 ^
+15
+#560000
+05
+#565000
+02
+0P
+01
+1)
+b100 J
+1a
+b101 *
+b101 A
+b101 _
+1'
+b0 ^
+15
+#570000
+05
+#575000
+b0 T
+b0 U
+b0 3
+b0 7
+b0 L
+b0 0
+b0 C
+b0 N
+0a
+0'
+b110 &
+b110 ?
+b110 R
+b110 I
+0)
+b0 J
+15
+#580000
+05
+#585000
+1.
+1$
+b1 J
+15
+#590000
+05
+#595000
+b1 b
+15
+#600000
+05
+#605000
+19
+1=
+1/
+1%
+1Q
+b10 b
+15
+#610000
+05
+#615000
+0=
+09
+0/
+0%
+0Q
+0$
+0.
+1c
+1+
+b0 b
+1-
+b10 J
+0K
+0H
+15
+#620000
+05
+#625000
+0-
+11
+b11 J
+0c
+0+
+15
+#630000
+05
+#635000
+b1 ^
+15
+#640000
+05
+#645000
+12
+1P
+b10 ^
+15
+#650000
+05
+#655000
+0P
+02
+1a
+b110 *
+b110 A
+b110 _
+1'
+b0 ^
+01
+1)
+b100 J
+15
+#660000
+05
+#665000
+b1 T
+b1 U
+b100 3
+b100 7
+b100 L
+b100 0
+b100 C
+b100 N
+b111 &
+b111 ?
+b111 R
+b111 I
+0)
+b0 J
+0a
+0'
+15
+#670000
+05
+#675000
+1.
+1$
+b1 J
+15
+#680000
+05
+#685000
+b1 b
+15
+#690000
+05
+#695000
+19
+1=
+1/
+1%
+1Q
+b10 b
+15
+#700000
+05
+#705000
+0=
+09
+0/
+0%
+0$
+0.
+0Q
+1-
+b10 J
+0K
+0H
+1c
+1+
+b0 b
+15
+#710000
+05
+#715000
+0c
+0+
+0-
+11
+b11 J
+15
+#720000
+05
+#725000
+b1 ^
+15
+#730000
+05
+#735000
+12
+1P
+b10 ^
+15
+#740000
+05
+#745000
+02
+0P
+01
+1)
+b100 J
+1a
+b111 *
+b111 A
+b111 _
+1'
+b0 ^
+15
+#750000
+05
+#755000
+b0 T
+b0 U
+b0 3
+b0 7
+b0 L
+b0 0
+b0 C
+b0 N
+0a
+0'
+b1000 &
+b1000 ?
+b1000 R
+b1000 I
+0)
+b0 J
+15
+#760000
+05
+#765000
+1.
+1$
+b1 J
+15
+#770000
+05
+#775000
+b1 b
+15
+#780000
+05
+#785000
+19
+1=
+1/
+1%
+1Q
+b10 b
+15
+#790000
+05
+#795000
+0=
+09
+0/
+0%
+0Q
+0$
+0.
+1c
+1+
+b0 b
+1-
+b10 J
+0K
+0H
+15
+#800000
+05
+#805000
+0-
+11
+b11 J
+0c
+0+
+15
+#810000
+05
+#815000
+b1 ^
+15
+#820000
+05
+#825000
+12
+1P
+b10 ^
+15
+#830000
+05
+#835000
+0P
+02
+1a
+b1000 *
+b1000 A
+b1000 _
+1'
+b0 ^
+01
+1)
+b100 J
+15
+#840000
+05
+#845000
+b1000 T
+b1000 U
+b100000 3
+b100000 7
+b100000 L
+b100000 0
+b100000 C
+b100000 N
+1;
+b1001 &
+b1001 ?
+b1001 R
+b1001 I
+0)
+b0 J
+0a
+0'
+15
+#850000
+05
+#855000
+1.
+1$
+b1 J
+15
+#860000
+05
+#865000
+b1 b
+15
+#870000
+05
+#875000
+19
+1=
+1/
+1%
+1Q
+b10 b
+15
+#880000
+05
+#885000
+0=
+09
+0/
+0%
+0$
+0.
+0Q
+1-
+b10 J
+0K
+0H
+1c
+b10 ,
+b10 B
+b10 ]
+1+
+b0 b
+15
+#890000
+05
+#895000
+0c
+0+
+0-
+11
+b11 J
+15
+#900000
+05
+#905000
+b1 ^
+15
+#910000
+05
+#915000
+12
+1P
+b10 ^
+15
+#920000
+05
+#925000
+02
+0P
+01
+1)
+b100 J
+1a
+b10 (
+b10 @
+b10 `
+b11011110101011011011111011101111 *
+b11011110101011011011111011101111 A
+b11011110101011011011111011101111 _
+1'
+b0 ^
+15
+#930000
+05
+#935000
+b0 T
+b0 U
+b0 3
+b0 7
+b0 L
+b0 0
+b0 C
+b0 N
+0;
+0a
+0'
+b1010 &
+b1010 ?
+b1010 R
+b1010 I
+0)
+b0 J
+15
+#940000
+05
+#945000
+1.
+1$
+b1 J
+15
+#950000
+05
+#955000
+b1 b
+15
+#960000
+05
+#965000
+19
+1=
+1/
+1%
+1Q
+b10 b
+15
+#970000
+05
+#975000
+0=
+09
+0/
+0%
+0Q
+0$
+0.
+1c
+b0 ,
+b0 B
+b0 ]
+1+
+b0 b
+1-
+b10 J
+0K
+0H
+15
+#980000
+05
+#985000
+0-
+11
+b11 J
+0c
+0+
+15
+#990000
+05
+#995000
+b1 ^
+15
+#1000000
+05
+#1005000
+12
+1P
+b10 ^
+15
+#1010000
+05
+#1015000
+0P
+02
+1a
+b0 (
+b0 @
+b0 `
+b1010 *
+b1010 A
+b1010 _
+1'
+b0 ^
+01
+1)
+b100 J
+15
+#1020000
+05
+#1025000
+b1 T
+b1 U
+b100 3
+b100 7
+b100 L
+b100 0
+b100 C
+b100 N
+b1011 &
+b1011 ?
+b1011 R
+b1011 I
+0)
+b0 J
+0a
+0'
+15
+#1030000
+05
+#1035000
+1.
+1$
+b1 J
+15
+#1040000
+05
+#1045000
+b1 b
+15
+#1050000
+05
+#1055000
+19
+1=
+1/
+1%
+1Q
+b10 b
+15
+#1060000
+05
+#1065000
+0=
+09
+0/
+0%
+0$
+0.
+0Q
+1-
+b10 J
+0K
+0H
+1c
+1+
+b0 b
+15
+#1070000
+05
+#1075000
+0c
+0+
+0-
+11
+b11 J
+15
+#1080000
+05
+#1085000
+b1 ^
+15
+#1090000
+05
+#1095000
+12
+1P
+b10 ^
+15
+#1100000
+05
+#1105000
+02
+0P
+01
+1)
+b100 J
+1a
+b1011 *
+b1011 A
+b1011 _
+1'
+b0 ^
+15
+#1110000
+05
+#1115000
+b0 T
+b0 U
+b0 3
+b0 7
+b0 L
+b0 0
+b0 C
+b0 N
+0a
+0'
+b1100 &
+b1100 ?
+b1100 R
+b1100 I
+0)
+b0 J
+15
+#1120000
+05
+#1125000
+04
+b101 J
+15
+#1130000
+05
+#1135000
+15
+#1140000
+05
+#1145000
+15
+#1150000
+05
+#1155000
+15
+#1160000
+05
+#1165000
+15
+#1170000
+05
+#1175000
+15
+#1180000
+05
+#1185000
+15
+#1190000
+05
+#1195000
+15
+#1200000
+05
+#1205000
+15
+#1210000
+05
+#1215000
+15
+#1220000
+05
+#1225000
+15

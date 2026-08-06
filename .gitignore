@@ -1,0 +1,59 @@
+# Rust
+/target
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+build/
+dist/
+*.so
+*.pyd
+# MSVC debug symbols for the extension. `maturin develop` drops a 130 MB .pdb
+# next to the .pyd on Windows.
+*.pdb
+.pytest_cache/
+.ruff_cache/
+
+# Web
+node_modules/
+
+# Simulation artifacts. dump.vcd is committed on purpose: it is the fixture the
+# round-trip test runs against, so CI does not need a simulator installed.
+*.vvp
+*.vtx/
+*.fst
+# Session sidecars are per-developer here; in a real project they are committed
+# on purpose (P5 — layout and bookmarks are versionable).
+*.session.json
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Frontend build + test output. designs/*/sim.log IS committed: the triage
+# acceptance test reads it, so CI needs no simulator.
+web/dist/
+web/test-results/
+web/playwright-report/
+web/vite.log
+
+# The frontend built into the Python package for shipping (`make web-build`).
+# Generated, so not committed; the wheel carries it.
+python/veritrace/web/
+# ModelSim / xsim / Verilator working directories.
+designs/*/work/
+designs/*/obj_dir/
+designs/*/xsim.dir/
+designs/*/dump_modelsim.do
+designs/*/dump_xsim.tcl
+designs/*/*.wlf
+designs/*/transcript
+
+# Scratch files from interactive probing.
+probe_tmp.sv
+
+# TypeScript's incremental build state.
+web/tsconfig.tsbuildinfo

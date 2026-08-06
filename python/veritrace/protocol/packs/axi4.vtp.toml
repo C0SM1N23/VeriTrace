@@ -1,0 +1,160 @@
+name    = "AXI4"
+version = "1.0"
+
+# The worked example of §8.14, as shipped. Two places where this differs from
+# the text there, both deliberate:
+#
+#   * `stall_cycles` is `sum(stall)`, not `sum(valid && !ready)`. At the edge a
+#     beat is accepted on, valid and ready are both high by definition, so that
+#     expression is 0 everywhere. The scan already counts the cycles a beat spent
+#     waiting and exposes them per beat as `stall`; this is the same quantity,
+#     stated so it can actually be decided.
+#   * The response channels carry `bresp`/`rresp` rules the text does not list.
+#     A DECERR that nobody looked at is the cheapest bug this pack can find.
+
+# cum se recunoaste automat interfata in design
+[detect]
+required_suffixes = ["awvalid", "awready", "awaddr", "wvalid", "wready", "wdata",
+                     "bvalid", "bready", "arvalid", "arready", "rvalid", "rdata"]
+prefix_strip      = ["m_axi_", "s_axi_", "axi_", "m_", "s_", ""]
+clock             = "aclk|clk|.*_aclk|.*_clk"
+reset             = "aresetn|areset_n|rst_n|resetn|.*_aresetn|.*_rst_n"
+
+# canalele: fiecare e un handshake valid/ready cu payload
+[[channel]]
+name    = "AW"
+valid   = "awvalid"
+ready   = "awready"
+payload = ["awaddr", "awlen", "awsize", "awburst", "awid", "awprot", "awcache"]
+
+[[channel]]
+name    = "W"
+valid   = "wvalid"
+ready   = "wready"
+payload = ["wdata", "wstrb", "wlast"]
+
+[[channel]]
+name    = "B"
+valid   = "bvalid"
+ready   = "bready"
+payload = ["bresp", "bid"]
+
+[[channel]]
+name    = "AR"
+valid   = "arvalid"
+ready   = "arready"
+payload = ["araddr", "arlen", "arsize", "arburst", "arid"]
+
+[[channel]]
+name    = "R"
+valid   = "rvalid"
+ready   = "rready"
+payload = ["rdata", "rresp", "rlast", "rid"]
+
+# cum se asambleaza tranzactiile din evenimente de canal
+[[transaction]]
+name  = "WRITE"
+start = "AW"
+body  = { channel = "W", count = "AW.awlen + 1", terminator = "wlast" }
+end   = { channel = "B", match_on = "bid == AW.awid" }
+id    = "awid"                      # permite outstanding / out-of-order
+key   = "addr = AW.awaddr"
+
+[[transaction]]
+name  = "READ"
+start = "AR"
+end   = { channel = "R", count = "AR.arlen + 1", terminator = "rlast", match_on = "rid == AR.arid" }
+id    = "arid"
+key   = "addr = AR.araddr"
+
+# metrici calculate automat pentru fiecare tranzactie
+[metrics]
+# In cycles, not raw time units — vezi axi4lite.vtp.toml.
+latency      = "end.cycle - start.cycle"
+addr_latency = "AW.accept_time - AW.assert_time"
+data_beats   = "count(W)"
+stall_cycles = "sum(stall)"
+
+# §8.17 — atribuirea ciclurilor pierdute. Vezi axi4lite.vtp.toml pentru de ce
+# treptele folosesc doar semnalele interfetei: un pack livrat nu poate sti cum
+# isi cheama un proiect arbitrul, iar `[[stall_reason]]` cu o cale ierarhica e
+# exact extensia pe care si-o adauga proiectul.
+[perf]
+transfer = ["W", "R"]
+data     = "wdata"
+strobe   = "wstrb"
+
+# Prima treapta: a nu putea *incepe* e mai grav decat a nu putea curge, iar pe
+# AXI masterul asserteaza AW si W impreuna — daca ambele sunt refuzate, ciclul
+# apartine motivului pentru care tranzactia n-a putut porni. Vezi axi4lite.
+[[stall_reason]]
+name = "address_stall"
+when = "awvalid && !awready || arvalid && !arready"
+msg  = "adresa a fost oferita si nu a fost acceptata; ceva in amonte tine bus-ul"
+
+[[stall_reason]]
+name = "backpressure"
+when = "wvalid && !wready || rvalid && !rready"
+msg  = "sink-ul nu accepta: beat-ul a fost oferit si refuzat"
+
+[[stall_reason]]
+name = "response_wait"
+when = "outstanding > 0"
+msg  = "tranzactia era emisa si slave-ul inca nu raspunsese"
+
+[[stall_reason]]
+name = "starvation"
+when = "!valid && ready"
+msg  = "sink-ul era gata si masterul nu avea ce trimite"
+
+# `idle` e o afirmatie despre design (nimeni n-a cerut bus-ul); `other` e una
+# despre pack (cascada are o gaura). Unite, s-ar pierde exact semnalul care
+# spune ca atribuirea e incompleta.
+[[stall_reason]]
+name = "idle"
+when = "!valid && !ready"
+msg  = "niciun beat oferit si niciun sink gata"
+
+# reguli de protocol verificate pe fiecare tranzactie
+[[rule]]
+id       = "AXI_AWSTABLE"
+severity = "error"
+check    = "awvalid && !awready |=> $stable(awaddr) && $stable(awlen)"
+msg      = "the address payload changed before it was accepted"
+
+[[rule]]
+id       = "AXI_NODROP"
+severity = "error"
+check    = "awvalid && !awready |=> awvalid"
+msg      = "valid was withdrawn before ready"
+
+[[rule]]
+id       = "AXI_WLAST"
+severity = "error"
+check    = "count(W) == AW.awlen + 1"
+msg      = "the number of data beats does not match awlen + 1"
+
+[[rule]]
+id        = "AXI_MAXOUTSTANDING"
+severity  = "warn"
+check     = "outstanding <= param.max"
+param.max = 16
+msg       = "more outstanding write transactions than the interface is sized for"
+
+[[rule]]
+id       = "AXI_WDATA_STABLE"
+severity = "error"
+check    = "wvalid && !wready |=> $stable(wdata) && $stable(wlast)"
+msg      = "the write data changed before it was accepted"
+
+[[rule]]
+id       = "AXI_BRESP"
+severity = "warn"
+check    = "bresp == 0"
+msg      = "the slave answered a write with something other than OKAY"
+
+[[rule]]
+id       = "AXI_RRESP"
+severity = "warn"
+check    = "rresp == 0"
+msg      = "the slave answered a read with something other than OKAY"

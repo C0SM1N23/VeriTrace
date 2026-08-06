@@ -1,0 +1,37 @@
+# §8.20 — SDR SDRAM timing constraints, Micron MT48LC16M16A2 (4 banks x 4M x16,
+# the part behind many FPGA dev-board "32 MB SDRAM" headers). Figures below are
+# the -7E speed grade (133-143 MHz, CL3) numbers commonly reproduced from the
+# datasheet; treat them as representative of this device class rather than as
+# a substitute for the PDF on a real board bring-up (P1 — this file says what
+# it is, rather than claiming more precision than a transcription deserves).
+#
+# Every delay is in nanoseconds, matching how the datasheet prints it — the
+# engine converts to the trace's own time units once per session
+# (`clocks.to_trace_units`), not once per parameter. CL and CWL are the one
+# exception: SDRAM datasheets always give latency as a count of clock cycles,
+# never a time, so these two are plain integers.
+
+name = "MT48LC16M16A2"
+
+tRCD  = 20      # ACTIVATE -> READ/WRITE, same bank
+tRP   = 20      # PRECHARGE -> ACTIVATE, same bank
+tRAS  = 44      # ACTIVATE -> PRECHARGE, same bank (minimum row-open time)
+tRC   = 66      # ACTIVATE -> ACTIVATE, same bank (full row cycle)
+tRRD  = 15      # ACTIVATE -> ACTIVATE, different banks
+tWR   = 15      # last WRITE beat -> PRECHARGE
+tWTR  = 15      # last WRITE beat -> READ (data-bus turnaround)
+tRTP  = 15      # READ -> PRECHARGE, same bank
+# SDR SDRAM predates the tFAW naming convention — a single bank's activation
+# current is small enough that the base part datasheet imposes no four-bank
+# window. This is therefore a controller-level power-integrity policy the
+# checker enforces, not a number printed in the datasheet, and it is set at
+# 5 x tRRD: on the DDR generations that *do* specify tFAW it lands between
+# 4x and 6x tRRD, so that ratio is the defensible way to state the same
+# intent for a part whose datasheet is silent. Raise or lower it here to
+# match what a board's supply rail was actually budgeted for.
+tFAW  = 75
+tRFC  = 66      # REFRESH -> any command
+tREFI = 15625   # maximum interval between REFRESH commands (4096 rows / 64ms)
+
+CL  = 3         # CAS latency, in clock cycles
+CWL = 0         # SDR has no separate write latency: data is presented with WRITE

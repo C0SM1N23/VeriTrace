@@ -1,0 +1,9 @@
+# LF everywhere, including Windows checkouts. The reference dumps under
+# designs/ are committed fixtures that the round-trip tests read byte for byte,
+# so a CRLF conversion on checkout would change the bytes under the test on one
+# platform and not the other.
+* text=auto eol=lf
+
+# Binary, never touched.
+*.png binary
+*.vtx binary

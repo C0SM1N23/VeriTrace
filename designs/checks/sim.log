@@ -1,0 +1,2 @@
+VCD info: dumpfile dump.vcd opened for output.
+tb_checks.sv:69: $finish called at 3285000 (1ps)

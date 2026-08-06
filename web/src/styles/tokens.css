@@ -1,0 +1,52 @@
+/* Design tokens, transcribed verbatim from SPEC.md §11.2.
+ *
+ * The thesis (§11.1) is that the interface is monochrome and colour means
+ * causality. Only two things may break the grey-blue palette:
+ *   - --causal, and only for a causal chain (nothing in this stage uses it yet);
+ *   - logic states X and Z, which carry the logic-analyser convention and are
+ *     information rather than decoration.
+ * Anything else reaching for colour is a bug.
+ */
+
+:root {
+  --bg-deep: #0e1116; /* application background */
+  --bg-panel: #151a21; /* panels */
+  --bg-raised: #1c232c; /* alternating rows, headers */
+  --line: #262f3a; /* borders, grid */
+  --text-dim: #6b7785; /* secondary labels, line numbers */
+  --text: #a8b4c2; /* normal text */
+  --text-bright: #e4eaf1; /* values, focus */
+
+  --causal: #e8a33d; /* AMBER — causal chain only */
+  --causal-dim: #7a5a22; /* secondary causal branches */
+
+  --sig-0: #4a5a6b; /* logic 0 */
+  --sig-1: #7fd1a8; /* logic 1 */
+  --sig-x: #e5484d; /* X — unknown */
+  --sig-z: #8b7ab8; /* Z — high impedance */
+  --sig-bus: #a8b4c2; /* bus values (text) */
+
+  --diff: #d45bb5; /* magenta — Diff tab exclusively */
+  --ok: #7fd1a8;
+  --warn: #e8a33d;
+
+  --row-h: 20px; /* signal row height (compact) */
+  --row-h-tall: 28px; /* comfortable mode */
+  --gutter: 8px;
+  --panel-gap: 1px; /* panels touch; the separator is --line */
+
+  /* One radius for every floating box (cards, chips, menus, inputs) so the
+   * app reads as one system rather than a mix of sharp and rounded corners.
+   * Chrome bars, full-width rows and tables stay sharp — see app.css. */
+  --radius: 3px;
+
+  --font-data: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --font-chrome: "IBM Plex Sans Condensed", "IBM Plex Sans", system-ui, sans-serif;
+
+  --fs-data: 12px;
+  --fs-chrome: 12px;
+  --lh-data: 1.35;
+
+  --hierarchy-w: 240px;
+  --inspector-w: 300px;
+}
