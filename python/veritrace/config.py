@@ -94,6 +94,12 @@ class Config:
     protocol_packs: list[str] = field(default_factory=list)
     protocol_ignore: list[str] = field(default_factory=list)
 
+    # [coverage] — §8.12. The database `veritrace serve` imports on open. Left
+    # empty it is searched for in the usual places, which covers a project whose
+    # coverage run wrote where its tool defaults to; naming it is for one whose
+    # build puts it somewhere else.
+    coverage_path: str | None = None
+
     @classmethod
     def empty(cls, root: Path | str = ".") -> Config:
         return cls(root=Path(root))
@@ -174,6 +180,7 @@ def load(start: Path | str = ".") -> Config | None:
     checks = _table(data, "checks")
     triage = _table(data, "triage")
     proto = _table(data, "protocol")
+    cov = _table(data, "coverage")
     defines = _table(design, "defines")
 
     return Config(
@@ -198,6 +205,7 @@ def load(start: Path | str = ".") -> Config | None:
         log_patterns={str(k): str(v) for k, v in _table(triage, "patterns").items()},
         protocol_packs=[str(x) for x in (proto.get("packs") or [])],
         protocol_ignore=[str(x) for x in (proto.get("ignore") or [])],
+        coverage_path=(str(cov.get("path")) if cov.get("path") else None),
     )
 
 

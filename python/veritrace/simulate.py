@@ -14,7 +14,10 @@ all:
   tree untouched.
 * **Everything lands in a work directory**, so a run leaves `sim.vvp` and a
   dump somewhere obvious and deletable instead of scattering them next to the
-  RTL.
+  RTL — but the simulation still *runs* where the user's own flow runs it, so
+  that `$readmemh("program.hex")` and `+incdir+../../hdl` resolve to the same
+  files they always did. Those two are separate directories on purpose, and
+  conflating them is what breaks every real project's testbench.
 
 Icarus is the only simulator driven from here on purpose. It is §4.0's primary
 target, it needs no flags to keep the hierarchy, and it is the one that installs
@@ -25,6 +28,7 @@ three more places for them to drift.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import time
@@ -125,8 +129,17 @@ def icarus(
     defines: list[str] | None = None,
     incdirs: list[str] | None = None,
     timeout: float = 120.0,
+    run_dir: Path | None = None,
 ) -> Result:
-    """Compile and run with Icarus, and return where the waveform landed."""
+    """Compile and run with Icarus, and return where the waveform landed.
+
+    `run_dir` is where both tools are invoked — the directory the project's own
+    flow runs from. It defaults to where the first source lives. Everything a
+    testbench reads at run time is relative to it: `$readmemh("program.hex")`,
+    a `+incdir+../../hdl` inside a `.f` filelist, an `$fopen` of a log. Running
+    somewhere else would break all three, so the *outputs* go to `work` and the
+    *run* happens here.
+    """
     tools = find_iverilog()
     if tools is None:
         raise SimulationError(
@@ -137,17 +150,21 @@ def icarus(
             "needs no simulator."
         )
     iverilog, vvp = tools
-    # Both tools are run *inside* the work directory, so that a `$dumpfile`
-    # with a bare name lands there rather than wherever the shell happened to
-    # be. Everything handed to them therefore has to be absolute.
     work = work.resolve()
     work.mkdir(parents=True, exist_ok=True)
     sources = [Path(s).resolve() for s in sources]
+    here = (run_dir or (sources[0].parent if sources else Path.cwd())).resolve()
 
-    injected = not any(_DUMP_CALL in _read(f) for f in sources)
-    compiled = list(sources)
-    if injected:
-        compiled.append(write_dumper(work, top))
+    # A `.f` file is a list of arguments, not Verilog: it is handed to the
+    # compiler with `-f` and its own relative paths resolve against `run_dir`,
+    # which is the whole reason that directory is a parameter. Nothing here
+    # parses it — Icarus already does, and so does every other simulator, which
+    # is what makes a filelist the portable way to describe a build.
+    filelists = [s for s in sources if s.suffix.lower() == ".f"]
+    verilog = [s for s in sources if s.suffix.lower() != ".f"]
+
+    injected = not any(_DUMP_CALL in _read(f) for f in verilog + filelists)
+    dump = work / "dump.vcd"
 
     started = time.perf_counter()
     vvp_path = work / "sim.vvp"
@@ -157,18 +174,25 @@ def icarus(
         # them explicitly also pins the top when the sources contain more than
         # one candidate, which is exactly when a guess would be wrong.
         build += ["-s", DUMPER_MODULE]
-    for d in incdirs or []:
+    # The run directory and every directory a source came from, as include
+    # paths. A `.vh` next to the file that includes it is the overwhelmingly
+    # common case, and `+incdir+.` is what every hand-written flow adds anyway.
+    for d in _include_path(here, verilog, incdirs or []):
         build += ["-I", str(d)]
     for d in defines or []:
         build += [f"-D{d}"]
-    build += [str(f) for f in compiled]
+    for f in filelists:
+        build += ["-f", str(f)]
+    build += [str(f) for f in verilog]
+    if injected:
+        build.append(str(write_dumper(work, top, str(dump).replace("\\", "/"))))
 
-    got = _run(build, work, timeout)
+    got = _run(build, here, timeout)
     if got.returncode != 0:
-        raise SimulationError(f"compilation failed:\n{_tail(got.stderr or got.stdout)}")
+        raise SimulationError(_compile_error(got.stderr or got.stdout))
     warnings = [ln for ln in (got.stderr or "").splitlines() if "warning" in ln.lower()]
 
-    ran = _run([vvp, vvp_path.name], work, timeout)
+    ran = _run([vvp, str(vvp_path)], here, timeout)
     seconds = time.perf_counter() - started
     output = (ran.stdout or "") + (ran.stderr or "")
     log = work / "sim.log"
@@ -176,15 +200,15 @@ def icarus(
     if ran.returncode != 0:
         raise SimulationError(f"the simulation exited {ran.returncode}:\n{_tail(output)}")
 
-    dump = _newest_dump(work)
-    if dump is None:
+    found = dump if dump.is_file() else (_newest_dump(work) or _newest_dump(here))
+    if found is None:
         raise SimulationError(
             "the simulation ran but wrote no waveform.\n"
             "  Its $dumpfile may name a path outside the work directory; pass "
             "the dump to `veritrace check` directly."
         )
     return Result(
-        dump=dump,
+        dump=found,
         log=log,
         top=top,
         injected=injected,
@@ -192,6 +216,89 @@ def icarus(
         output=output,
         warnings=warnings,
     )
+
+
+#: A filelist line that is an option rather than a file.
+_INCDIR = re.compile(r"^\+incdir\+(.*)$")
+_DEFINE = re.compile(r"^\+define\+(.*)$")
+
+
+def read_filelist(path: Path, seen: set[Path] | None = None) -> tuple[list[Path], list[Path], list[str]]:
+    """The files, include directories and defines a `.f` names.
+
+    The *compiler* is still handed `-f` and remains the authority on the build.
+    This reads the same file for a different consumer: pyslang, which builds the
+    design graph and has no notion of a command file. Two readers of one file is
+    a smell; a second *opinion* would be the bug, and there is none — if this
+    disagrees with Icarus about which files exist, the graph is short and the
+    correlation rate says so out loud.
+
+    Deliberately small: paths, `+incdir+`, `+define+`, comments, and nested
+    `-f`. Anything else is a compiler flag and not this reader's business.
+    """
+    path = Path(path).resolve()
+    seen = seen if seen is not None else set()
+    if path in seen or not path.is_file():
+        return [], [], []
+    seen.add(path)
+
+    root = path.parent
+    files: list[Path] = []
+    incdirs: list[Path] = []
+    defines: list[str] = []
+    tokens = []
+    for raw in _read(path).splitlines():
+        line = raw.split("//", 1)[0].split("#", 1)[0].strip()
+        if line:
+            tokens.extend(line.split())
+
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        i += 1
+        if m := _INCDIR.match(tok):
+            incdirs += [(root / d).resolve() for d in m.group(1).split("+") if d]
+        elif m := _DEFINE.match(tok):
+            defines += [d for d in m.group(1).split("+") if d]
+        elif tok in ("-f", "-F"):
+            if i < len(tokens):
+                nested = read_filelist((root / tokens[i]).resolve(), seen)
+                i += 1
+                files += nested[0]
+                incdirs += nested[1]
+                defines += nested[2]
+        elif tok.startswith(("-", "+")):
+            continue  # a compiler flag; Icarus reads the file itself
+        else:
+            files.append((root / tok).resolve())
+    return files, incdirs, defines
+
+
+def _include_path(here: Path, sources: list[Path], extra: list[str]) -> list[Path]:
+    """Where to look for ``include`, nearest first and without duplicates."""
+    out: list[Path] = [Path(d).resolve() for d in extra]
+    for d in [here] + [s.parent for s in sources]:
+        if d not in out:
+            out.append(d)
+    return out
+
+
+#: Icarus says `Include file foo.vh not found`. Turning that into the flag that
+#: fixes it is the difference between a wall of output and one thing to do.
+_MISSING_INCLUDE = re.compile(r"Include file (\S+) not found")
+
+
+def _compile_error(text: str) -> str:
+    missing = sorted(set(_MISSING_INCLUDE.findall(text or "")))
+    out = f"compilation failed:\n{_tail(text)}"
+    if missing:
+        out += (
+            f"\n\n  {', '.join(missing)} is included but not on the include path.\n"
+            "  Add the directory holding it:  --incdir <dir>\n"
+            "  If your project already has a `.f` filelist with `+incdir+` in it, "
+            "point at that instead:  veritrace run path/to/rtl.f path/to/tb.f --top <top>"
+        )
+    return out
 
 
 def _read(path: Path) -> str:

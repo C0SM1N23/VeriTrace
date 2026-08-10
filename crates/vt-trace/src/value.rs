@@ -212,7 +212,19 @@ impl fmt::Display for Value {
 /// `0`/`1`, and with the MSB itself when it is `x` or `z`.
 pub fn parse_vcd_vector(digits: &[u8], width: u32) -> Option<Value> {
     if digits.is_empty() {
-        return None;
+        // `b` with nothing after it. Icarus emits exactly this for a
+        // zero-width `$var`, which is how it declares a *string* parameter:
+        //
+        //     $var parameter 0 p# INIT_FILE $end
+        //     b p#
+        //
+        // A testbench that passes a filename to a memory model has one of
+        // these, and rejecting it used to fail the entire conversion — one
+        // string parameter costing the whole trace. It carries no bits, so it
+        // is one unknown bit rather than an error: honest about having no
+        // value, and readable everywhere a value is expected.
+        let w = width.max(1);
+        return Some(Value::from_bits(w, &vec![Bit::X; w as usize]));
     }
     let mut bits = Vec::with_capacity(width as usize);
     // Digits arrive MSB-first; store LSB-first.
@@ -240,6 +252,22 @@ pub fn parse_vcd_scalar(c: u8) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Icarus declares a string parameter as a zero-width `$var` and dumps it
+    /// as a bare `b`. One of those in a testbench used to fail the whole
+    /// conversion, which is a high price for a filename.
+    #[test]
+    fn empty_vector_is_unknown_not_an_error() {
+        let v = parse_vcd_vector(b"", 0).expect("a bare `b` must not fail the parse");
+        assert_eq!(v.to_vcd_bits(), "x");
+        // With a declared width every bit is unknown, and the rendering strips
+        // the leading `x`s that the left-extension rule puts back — so the
+        // property to assert is the bits, not the string.
+        let wide = parse_vcd_vector(b"", 4).expect("same, with a declared width");
+        assert_eq!(wide.width(), 4);
+        assert!((0..4).all(|i| wide.bit(i) == Bit::X));
+        assert_eq!(parse_vcd_vector(wide.to_vcd_bits().as_bytes(), 4), Some(wide));
+    }
 
     #[test]
     fn scalar_round_trip() {

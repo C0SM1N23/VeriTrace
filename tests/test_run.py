@@ -52,7 +52,7 @@ def test_a_folder_with_no_sources_says_so(tmp_path):
     empty.mkdir()
     got = CliRunner().invoke(main, ["run", str(empty)])
     assert got.exit_code != 0
-    assert "No .sv/.v files" in got.output
+    assert "No .sv/.v/.f files" in got.output
 
 
 def test_another_simulator_prints_its_recipe_instead_of_guessing(dropped):
@@ -98,7 +98,11 @@ def test_one_command_turns_a_folder_of_sv_into_findings(dropped):
     # The correlation rate is the number that says whether any of it can be
     # trusted (§4.0), so it is on screen without being asked for.
     assert "correlation:" in got.output
-    assert (dropped / ".veritrace" / "dump.vcd").is_file()
+    # This testbench calls `$dumpfile("dump.vcd")` itself, so the waveform lands
+    # where *it* says — next to the sources, exactly as running the simulation
+    # by hand would. The build products still go to the work directory.
+    assert (dropped / "dump.vcd").is_file()
+    assert (dropped / ".veritrace" / "sim.vvp").is_file()
 
 
 @needs_icarus
@@ -112,8 +116,13 @@ def test_it_reports_exactly_what_check_reports(dropped):
     from veritrace.correlate.resolver import correlate
     from veritrace.graph.elaborate import discover, elaborate
 
-    CliRunner().invoke(main, ["run", str(dropped)], catch_exceptions=False)
-    dump = dropped / ".veritrace" / "dump.vcd"
+    first = CliRunner().invoke(
+        main, ["run", str(dropped), "--json"], catch_exceptions=False
+    )
+    import json
+
+    dump = Path(json.loads(first.stdout)["dump"])
+    assert dump.is_file()
 
     out = dropped / "again.vtx"
     convert(str(dump), str(out))
@@ -123,14 +132,9 @@ def test_it_reports_exactly_what_check_reports(dropped):
     clock = clocks.resolve(store, el.graph, Config.empty())
     expected = checks_mod.run_all(store, el.graph, el, clock, Config.empty())
 
-    got = CliRunner().invoke(
-        main, ["run", str(dropped), "--json"], catch_exceptions=False
-    )
-    import json
-
     # stdout only: the conversion notice goes to stderr precisely so that
     # `--json` stays a document something else can read.
-    assert sorted(json.loads(got.stdout)["counts"]) == sorted(expected.counts())
+    assert sorted(json.loads(first.stdout)["counts"]) == sorted(expected.counts())
 
 
 @needs_icarus
@@ -214,3 +218,77 @@ def test_it_is_also_the_ci_gate(dropped):
     # deadlock, so gating on one must not fail the build.
     clean = CliRunner().invoke(main, ["run", str(dropped), "--fail-on", "deadlock"])
     assert clean.exit_code == 0, clean.output
+
+
+# --- a real project's shape: filelists, and running where it runs -----------
+
+
+def test_a_filelist_is_read_for_the_graph_and_passed_to_the_compiler(tmp_path):
+    """`.f` files are how a real project already describes its build. The
+    compiler gets `-f`; this reader exists only so pyslang, which has no notion
+    of a command file, elaborates the same sources."""
+    (tmp_path / "rtl").mkdir()
+    (tmp_path / "rtl" / "a.v").write_text("module a; endmodule\n", encoding="utf-8")
+    (tmp_path / "inc").mkdir()
+    fl = tmp_path / "build.f"
+    fl.write_text(
+        "// a comment\n+incdir+inc\n+define+WIDTH=8\nrtl/a.v\n", encoding="utf-8"
+    )
+    files, incdirs, defines = simulate.read_filelist(fl)
+    assert files == [(tmp_path / "rtl" / "a.v").resolve()]
+    assert incdirs == [(tmp_path / "inc").resolve()]
+    assert defines == ["WIDTH=8"]
+
+
+def test_a_nested_filelist_is_followed_once(tmp_path):
+    inner = tmp_path / "inner.f"
+    outer = tmp_path / "outer.f"
+    (tmp_path / "a.v").write_text("module a; endmodule\n", encoding="utf-8")
+    inner.write_text("a.v\n-f outer.f\n", encoding="utf-8")
+    outer.write_text("-f inner.f\n", encoding="utf-8")
+    files, _i, _d = simulate.read_filelist(outer)
+    # Once, and without recursing forever on the cycle.
+    assert files == [(tmp_path / "a.v").resolve()]
+
+
+@needs_icarus
+def test_the_simulation_runs_where_the_project_runs_it(tmp_path):
+    """The case every real testbench depends on: `$readmemh("program.hex")` is
+    relative to the directory the flow runs from, not to wherever the build
+    products are put. Getting this wrong loads no program and silently
+    simulates a design that does nothing."""
+    work = tmp_path / "proj"
+    work.mkdir()
+    (work / "program.hex").write_text("0000002a\n", encoding="utf-8")
+    (work / "tb.sv").write_text(
+        "module tb;\n"
+        "  logic clk = 0;\n"
+        "  logic [31:0] mem [0:0];\n"
+        "  always #5 clk = ~clk;\n"
+        "  initial begin\n"
+        '    $readmemh("program.hex", mem);\n'
+        "    repeat (10) @(posedge clk);\n"
+        '    $display("loaded %0d", mem[0]);\n'
+        "    $finish;\n"
+        "  end\n"
+        "endmodule\n",
+        encoding="utf-8",
+    )
+    got = CliRunner().invoke(main, ["run", str(work)], catch_exceptions=False)
+    assert got.exit_code == 0, got.output
+    assert "loaded 42" in (work / ".veritrace" / "sim.log").read_text(encoding="utf-8")
+
+
+@needs_icarus
+def test_a_missing_include_names_the_flag_that_fixes_it(tmp_path):
+    """Icarus says `Include file x.vh not found`; on its own that is a wall of
+    output. The one thing to do next is worth saying."""
+    work = tmp_path / "inc"
+    work.mkdir()
+    (work / "tb.sv").write_text(
+        '`include "elsewhere.vh"\nmodule tb; initial $finish; endmodule\n', encoding="utf-8"
+    )
+    got = CliRunner().invoke(main, ["run", str(work)])
+    assert got.exit_code != 0
+    assert "elsewhere.vh" in got.output
+    assert "--incdir" in got.output

@@ -55,5 +55,12 @@ designs/*/transcript
 # Scratch files from interactive probing.
 probe_tmp.sv
 
+# `veritrace run`'s work directory: the build, the waveform and the log for one
+# run. Generated, and rebuilt every time.
+.veritrace/
+# ...and the config it writes for a reference design, which the Makefile does
+# not need. A real project commits its own `.veritrace.toml` on purpose.
+designs/*/.veritrace.toml
+
 # TypeScript's incremental build state.
 web/tsconfig.tsbuildinfo

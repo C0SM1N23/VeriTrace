@@ -472,3 +472,30 @@ def test_check_fails_the_build_on_a_timing_violation(sdram):
     r = run(["check", str(sdram / "dump.vtx"), "--fail-on", "memory"])
     assert r.exit_code != 0
     assert "MEMORY" in r.output
+
+
+# --- §4.3: the trace and the query are named once, and told apart ----------
+
+
+def test_a_query_is_not_mistaken_for_a_trace(tmp_path):
+    """`veritrace txn "txn(m0)"` and `veritrace txn dump.vtx` are both valid,
+    and click cannot tell them apart once the trace is optional — a query is
+    never a path that exists, which is what decides it."""
+    from veritrace.cli import _trace_and_query
+
+    assert _trace_and_query(Path("txn(m0)"), None) == (None, "txn(m0)")
+    real = tmp_path / "dump.vtx"
+    real.mkdir()
+    assert _trace_and_query(real, None) == (real, None)
+    assert _trace_and_query(real, "txn(m0)") == (real, "txn(m0)")
+    assert _trace_and_query(None, None) == (None, None)
+
+
+def test_why_without_a_question_says_what_to_type():
+    from click.testing import CliRunner
+
+    from veritrace.cli import main
+
+    got = CliRunner().invoke(main, ["why"])
+    assert got.exit_code != 0
+    assert "why needs a question" in got.output

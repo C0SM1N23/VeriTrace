@@ -260,7 +260,7 @@ class Context:
 
 
 def _load(
-    trace: Path,
+    trace: Path | None,
     rtl: tuple[Path, ...] = (),
     top: str | None = None,
     need_rtl: bool = False,
@@ -277,8 +277,11 @@ def _load(
             "This needs RTL. Pass --rtl <file|dir>, or set design.rtl in .veritrace.toml."
         )
 
-    # §13's examples pass raw dumps, so accept one and convert transparently.
-    trace = _ensure_store(trace)
+    # §13's examples pass raw dumps, so accept one and convert transparently —
+    # and §4.3's whole point is that the trace is named once, in the config, so
+    # a command with no argument finds the one recorded there rather than
+    # asking for it again.
+    trace = _default_trace(trace, flag="a trace path")
     ctx = Context(
         store=TraceStore(str(trace)),
         config=cfg.load_or_empty(trace.parent),
@@ -489,8 +492,10 @@ def serve(
 
 
 @main.command()
-@click.argument("trace", type=click.Path(exists=True, path_type=Path))
-@click.argument("query")
+@click.argument(
+    "trace", type=click.Path(path_type=Path), required=False, default=None
+)
+@click.argument("query", required=False)
 @rtl_options
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 @viewer_options
@@ -506,6 +511,11 @@ def why(trace, query, rtl, top, as_json, output, **flags):
     from veritrace.analysis import vtq
     from veritrace.analysis.whytrace import WhyTracer, root_cause
 
+    trace, query = _trace_and_query(trace, query)
+    if not query:
+        raise click.ClickException(
+            'why needs a question, e.g. veritrace why "why(top.dut.full)"'
+        )
     ctx = _load(trace, rtl, top, need_rtl=True)
     try:
         parsed = vtq.parse(query)
@@ -604,7 +614,9 @@ def _print_chain(node, clock, depth: int = 0, seen: set | None = None) -> None:
 
 
 @main.command()
-@click.argument("trace", type=click.Path(exists=True, path_type=Path))
+@click.argument(
+    "trace", type=click.Path(exists=True, path_type=Path), required=False, default=None
+)
 @click.argument("signal")
 @rtl_options
 @click.option("--depth", default=4, type=int, help="How many graph edges out.")
@@ -653,7 +665,9 @@ def cone(trace, signal, rtl, top, depth, direction, active_only, t_from, t_to, o
 
 
 @main.command()
-@click.argument("trace", type=click.Path(exists=True, path_type=Path))
+@click.argument(
+    "trace", type=click.Path(exists=True, path_type=Path), required=False, default=None
+)
 @rtl_options
 @click.option("--cycles", default=None, type=int, help="Threshold, in clock cycles.")
 @viewer_options
@@ -679,7 +693,9 @@ def stuck(trace, rtl, top, cycles, output, **flags):
 
 
 @main.command()
-@click.argument("trace", type=click.Path(exists=True, path_type=Path))
+@click.argument(
+    "trace", type=click.Path(exists=True, path_type=Path), required=False, default=None
+)
 @rtl_options
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 @click.option(
@@ -777,20 +793,47 @@ def run(
     from veritrace.analysis import checks as checks_mod
 
     roots = list(sources) or [Path.cwd()]
-    files: list[Path] = []
+    # A `.f` filelist is passed through to the compiler rather than expanded:
+    # it is the portable way a project already describes its build, `+incdir+`
+    # and all, and re-implementing that parser here would be a second opinion
+    # about what the project contains.
+    filelists = [r.resolve() for r in roots if r.is_file() and r.suffix.lower() == ".f"]
+    files: list[Path] = list(filelists)
     for r in roots:
+        if r in filelists or (r.is_file() and r.suffix.lower() == ".f"):
+            continue
         files.extend([r] if r.is_file() else find_rtl_files(r))
-    files = sorted({f.resolve() for f in files})
+    files = list(dict.fromkeys(f.resolve() for f in files))
     if not files:
         raise click.ClickException(
-            f"No .sv/.v files under {', '.join(str(r) for r in roots)}."
+            f"No .sv/.v/.f files under {', '.join(str(r) for r in roots)}."
         )
 
-    top = top or guess_top_module(files)
+    # Where the project's own flow runs from, and therefore where `$readmemh`
+    # and a filelist's relative paths resolve. A filelist names it exactly;
+    # otherwise it is the directory that was pointed at.
+    run_dir = (filelists[0].parent if filelists else (
+        roots[0] if roots[0].is_dir() else roots[0].parent
+    )).resolve()
+
+    # What the *graph* should elaborate. A filelist is read here — the compiler
+    # still gets `-f` and remains the authority on the build; pyslang simply has
+    # no notion of a command file, and a graph built from nothing would turn
+    # every `why()` into "no RTL loaded" on exactly the projects that have their
+    # build written down properly.
+    rtl: list[Path] = [f for f in files if f.suffix.lower() != ".f"]
+    for fl in filelists:
+        named, dirs, defs = simulate.read_filelist(fl)
+        rtl += named
+        incdirs = tuple(incdirs) + tuple(str(d) for d in dirs)
+        defines = tuple(defines) + tuple(defs)
+    rtl = list(dict.fromkeys(rtl))
+
+    top = top or guess_top_module([f for f in rtl if f.is_file()])
     if not top:
         raise click.ClickException(
-            "Could not work out the top module — every module here is instantiated "
-            "by another. Name it with --top."
+            "Could not work out the top module: every module in these sources is "
+            "instantiated by another one. Name it with --top."
         )
 
     if sim != "icarus":
@@ -804,8 +847,11 @@ def run(
             f"Then: veritrace check <dir>/dump.vcd --rtl <dir>"
         )
 
-    base = roots[0] if roots[0].is_dir() else roots[0].parent
-    work = work or base / ".veritrace"
+    base = run_dir
+    work = (work or base / ".veritrace").resolve()
+    # What to name in the "open it" line: the directory the RTL came from, which
+    # is not the run directory when a filelist points somewhere else.
+    rtl_hint = rtl[0].parent if rtl else base
 
     # `--json` has to be parseable on stdout, so the running commentary is
     # silenced rather than interleaved with the document.
@@ -813,7 +859,9 @@ def run(
 
     say(f"{len(files)} source file(s), top module {top!r}")
     try:
-        got = simulate.icarus(files, top, work, list(defines), list(incdirs), timeout)
+        got = simulate.icarus(
+            files, top, work, list(defines), list(incdirs), timeout, run_dir
+        )
     except simulate.SimulationError as e:
         raise click.ClickException(str(e)) from e
     say(f"simulated with Icarus Verilog in {got.seconds:.1f} s")
@@ -822,7 +870,7 @@ def run(
     for w in got.warnings[:3]:
         say(f"  {w.strip()}")
 
-    ctx = _load(got.dump, tuple(roots), top)
+    ctx = _load(got.dump, tuple(rtl) or tuple(roots), top)
     say(f"waveform: {_rel(got.dump)} ({ctx.store.n_signals} signals)")
     if ctx.correlation is not None:
         say(
@@ -851,14 +899,14 @@ def run(
         click.echo(_format_report(report, ctx.clock))
         _write_config_if_missing(base, top, files, got)
         click.echo("")
-        click.echo(f"  veritrace serve {_rel(ctx.trace_path)} --rtl {_rel(base)}")
+        click.echo(f"  veritrace serve {_rel(ctx.trace_path)} --rtl {_rel(rtl_hint)}")
 
     _gate(report, fail_on)
     if then_serve:
         # The real `serve` command, invoked rather than reimplemented, so the
         # banner, the browser and the RTL handling stay in one place.
         click_ctx.invoke(
-            serve, trace=ctx.trace_path, rtl=tuple(roots), top=top, browser=True
+            serve, trace=ctx.trace_path, rtl=tuple(rtl) or tuple(roots), top=top, browser=True
         )
 
 
@@ -891,7 +939,9 @@ def _write_config_if_missing(base: Path, top: str, files: list[Path], got) -> No
 
 
 @main.command()
-@click.argument("trace", type=click.Path(exists=True, path_type=Path))
+@click.argument(
+    "trace", type=click.Path(path_type=Path), required=False, default=None
+)
 @click.argument("query", required=False)
 @rtl_options
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
@@ -915,6 +965,7 @@ def txn(trace, query, rtl, top, as_json, packs, output, **flags):
     from veritrace.analysis import vtq
     from veritrace.protocol import query as txn_query
 
+    trace, query = _trace_and_query(trace, query)
     ctx = _load(trace, rtl, top)
     if packs:
         ctx.config.protocol_packs = [p.strip() for p in packs.split(",") if p.strip()]
@@ -1011,7 +1062,9 @@ def _format_transactions(result, clock) -> str:
 
 
 @main.command()
-@click.argument("trace", type=click.Path(exists=True, path_type=Path))
+@click.argument(
+    "trace", type=click.Path(path_type=Path), required=False, default=None
+)
 @click.argument("query", required=False)
 @rtl_options
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
@@ -1034,6 +1087,7 @@ def perf(trace, query, rtl, top, as_json):
     from veritrace.analysis import vtq
     from veritrace.perf import query as perf_query
 
+    trace, query = _trace_and_query(trace, query)
     ctx = _load(trace, rtl, top)
     report = ctx.measure()
 
@@ -1057,7 +1111,9 @@ def perf(trace, query, rtl, top, as_json):
 
 
 @main.command()
-@click.argument("trace", type=click.Path(exists=True, path_type=Path))
+@click.argument(
+    "trace", type=click.Path(path_type=Path), required=False, default=None
+)
 @click.argument("query", required=False)
 @rtl_options
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
@@ -1084,6 +1140,7 @@ def memory(trace, query, rtl, top, as_json, chip):
     from veritrace.analysis import vtq
     from veritrace.memory import query as mem_query
 
+    trace, query = _trace_and_query(trace, query)
     ctx = _load(trace, rtl, top)
     reports = ctx.memory_reports(chip)
 
@@ -1171,7 +1228,9 @@ def _format_memory(reports, clock) -> str:
 
 
 @main.command()
-@click.argument("trace", type=click.Path(exists=True, path_type=Path))
+@click.argument(
+    "trace", type=click.Path(path_type=Path), required=False, default=None
+)
 @click.argument("query", required=False)
 @rtl_options
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
@@ -1192,6 +1251,7 @@ def track(trace, query, rtl, top, as_json):
     Needs no testbench code: the reference model is built from the write
     transactions the protocol packs already extract.
     """
+    trace, query = _trace_and_query(trace, query)
     ctx = _load(trace, rtl, top)
     report = ctx.data_integrity()
 
@@ -1268,7 +1328,9 @@ def _format_integrity(report, clock) -> str:
 
 
 @main.command()
-@click.argument("trace", type=click.Path(exists=True, path_type=Path))
+@click.argument(
+    "trace", type=click.Path(path_type=Path), required=False, default=None
+)
 @click.argument("query", required=False)
 @rtl_options
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
@@ -1299,6 +1361,7 @@ def coverage(trace, query, rtl, top, as_json, coverage_path, source):
       veritrace coverage dump.vtx "fcov(cpu)"
       veritrace coverage dump.vtx "uncovered()" --rtl rtl/
     """
+    trace, query = _trace_and_query(trace, query)
     ctx = _load(trace, rtl, top)
     report = ctx.coverage_report(coverage_path, source)
 
@@ -1586,6 +1649,18 @@ def triage(log, trace, rtl, top, as_json, output, **flags):
         return
     click.echo(triage_mod.format_report(report, ctx.clock))
 
+
+def _trace_and_query(trace: Path | None, query: str | None) -> tuple[Path | None, str | None]:
+    """Sort out `veritrace txn "txn(m0)"` from `veritrace txn dump.vtx`.
+
+    Click cannot: with the trace optional (§4.3 — it is named once, in the
+    config) both positionals are strings and the first one wins. A query is
+    never a path that exists, and a trace never contains `(`, so the two are
+    told apart by what they are rather than by where they sit.
+    """
+    if query is None and trace is not None and not Path(trace).exists():
+        return None, str(trace)
+    return trace, query
 
 def _default_trace(trace: Path | None, flag: str = "--trace") -> Path:
     """`--trace`, else `trace.default` from `.veritrace.toml` (§4.3).

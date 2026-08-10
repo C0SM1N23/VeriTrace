@@ -435,12 +435,18 @@ fn convert(src: &str, out: &str) -> PyResult<u64> {
 fn write_txn_table(path: &str, columns: Vec<(String, Vec<Option<Bound<'_, PyAny>>>)>) -> PyResult<()> {
     let mut cols: Vec<(String, RsColumn)> = Vec::with_capacity(columns.len());
     for (name, values) in columns {
+        // Textual if *any* value is, not if the first one is. A read that came
+        // back X part-way through a run is ordinary in a real design — the
+        // memory was not ready yet — and deciding the schema from element zero
+        // used to make that whole column unwritable, so the table §6.3 promises
+        // as the export was silently skipped for the interface. The four-state
+        // digits *are* the value, so one of them makes the column text; the
+        // integers alongside render losslessly into it.
         let textual = values
             .iter()
             .flatten()
-            .find(|v| !v.is_none())
-            .map(|v| v.extract::<i64>().is_err())
-            .unwrap_or(false);
+            .filter(|v| !v.is_none())
+            .any(|v| v.extract::<i64>().is_err());
         let col = if textual {
             RsColumn::Text(
                 values
