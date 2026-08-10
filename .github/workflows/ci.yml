@@ -378,6 +378,7 @@ jobs:
         run: |
           uv run veritrace serve designs/fifo_buggy/dump.vtx \
             --rtl designs/fifo_buggy --port 8765 --no-browser &
+          echo $! > server.pid
           for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:8765/ > /dev/null && break
             sleep 1
@@ -387,6 +388,17 @@ jobs:
       - name: Playwright
         run: npm run test:e2e
         working-directory: web
+
+      # The server outlives the step that started it, and a running `uv run`
+      # makes the cache prune in setup-uv's own post step fail — so the job
+      # went red after every one of its tests had passed. The same rule the
+      # project documents for a local run: stop the server when you are done.
+      - name: Stop the server
+        if: always()
+        run: |
+          [ -f server.pid ] && kill "$(cat server.pid)" 2>/dev/null || true
+          pkill -f 'veritrace serve' 2>/dev/null || true
+          exit 0
 
   # The performance thresholds of §4.2 are a build gate, but a 50 MB benchmark
   # is too slow for every push, so it runs on a schedule and on demand.
