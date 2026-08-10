@@ -1691,3 +1691,316 @@ select:focus-visible {
 .mem-bar-seg.hit { background: var(--ok); }
 .mem-bar-seg.miss { background: var(--text-dim); }
 .mem-bar-seg.conflict { background: var(--sig-x); }
+
+/* --- TAB 7, Coverage (§8.21, §8.12) --------------------------------------
+ *
+ * §11.1 reserves colour for causality, so nothing here takes the accent. A
+ * reached bin is filled with ordinary foreground; an unreached one is an
+ * outlined void, because the void is the finding.
+ */
+
+.cov {
+  height: 100%;
+  overflow-y: auto;
+  background: var(--bg-deep);
+}
+
+.cov-sections {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--panel-gap);
+  align-items: start;
+  min-height: 100%;
+}
+
+@media (max-width: 1100px) {
+  .cov-sections {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.cov-section {
+  background: var(--bg-panel);
+  min-width: 0;
+  padding-bottom: var(--gutter);
+}
+
+.cov-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--gutter);
+  padding: var(--gutter);
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  background: var(--bg-panel);
+  z-index: 1;
+}
+
+.cov-head h2 {
+  font: 600 var(--fs-chrome) / 1.2 var(--font-chrome);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-bright);
+  margin: 0;
+}
+
+.cov-sub {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.cov-head .txn-iface {
+  margin-left: auto;
+}
+
+.cov-summary {
+  display: flex;
+  align-items: baseline;
+  gap: var(--gutter);
+  padding: var(--gutter);
+  flex-wrap: wrap;
+}
+
+.cov-score {
+  font: 600 20px/1 var(--font-data);
+  color: var(--text-bright);
+}
+
+.cov-meta,
+.cov-note {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.cov-note {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 1px 6px;
+}
+
+.cov-point {
+  padding: 6px var(--gutter) 10px;
+  border-top: 1px solid var(--line);
+}
+
+.cov-point-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+.cov-point-name {
+  font: 500 var(--fs-data) / 1.2 var(--font-data);
+  color: var(--text-bright);
+}
+
+.cov-point-shape {
+  color: var(--text-dim);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.cov-point-count {
+  color: var(--text);
+  font-family: var(--font-data);
+  font-size: 11px;
+}
+
+.cov-point-msg,
+.cov-point-skipped {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.cov-bins {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.cov-bin {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-family: var(--font-data);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.cov-bin.on {
+  background: var(--bg-raised);
+  border-color: transparent;
+  color: var(--text-bright);
+}
+
+.cov-bin-hits {
+  color: var(--text-dim);
+}
+
+.cov-matrix-wrap {
+  overflow-x: auto;
+}
+
+.cov-matrix {
+  border-collapse: collapse;
+  font-family: var(--font-data);
+  font-size: 11px;
+}
+
+.cov-matrix th {
+  font-weight: 400;
+  color: var(--text-dim);
+  padding: 2px 8px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.cov-matrix td {
+  border: 1px solid var(--line);
+  min-width: 34px;
+  height: 22px;
+  text-align: center;
+  color: var(--text-dim);
+}
+
+.cov-matrix td.on {
+  background: var(--bg-raised);
+  color: var(--text-bright);
+}
+
+.cov-files {
+  padding: 0 var(--gutter);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.cov-file {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 120px 60px;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-data);
+  font-size: 11px;
+}
+
+.cov-file-name {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cov-file-bar {
+  height: 6px;
+  background: var(--bg-deep);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.cov-file-fill {
+  display: block;
+  height: 100%;
+  background: var(--text-dim);
+}
+
+.cov-file-count {
+  color: var(--text-dim);
+  text-align: right;
+}
+
+.cov-holes {
+  padding: var(--gutter);
+}
+
+.cov-holes h3 {
+  display: flex;
+  align-items: baseline;
+  gap: var(--gutter);
+  font: 600 var(--fs-chrome) / 1.2 var(--font-chrome);
+  color: var(--text-bright);
+  margin: 0 0 6px;
+}
+
+.cov-hole {
+  border-top: 1px solid var(--line);
+  padding: 4px 0;
+}
+
+.cov-hole-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cov-hole-kind {
+  color: var(--text-dim);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.cov-hole-src {
+  color: var(--text);
+  font-family: var(--font-data);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+/* The one accent on the page: the hole being worked on right now. */
+.cov-hole.on > .cov-hole-head > .link {
+  color: var(--causal);
+}
+
+.cov-hole-body {
+  padding: 6px 0 6px 16px;
+}
+
+.cov-conds-lead,
+.cov-hole-note {
+  color: var(--text-dim);
+  font-size: 11px;
+  margin-bottom: 4px;
+}
+
+.cov-cond {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 0;
+  font-family: var(--font-data);
+  font-size: 11px;
+}
+
+.cov-cond-state {
+  color: var(--text-dim);
+}
+
+.cov-cond-state.bad {
+  color: var(--sig-x);
+}
+
+.cov-cond-src {
+  flex-basis: 100%;
+  margin: 2px 0 4px 16px;
+  padding: 0;
+  list-style: none;
+  color: var(--text-dim);
+  border-left: 1px solid var(--line);
+}
+
+.cov-cond-src li {
+  padding-left: 8px;
+}

@@ -90,7 +90,15 @@ export interface SessionStatus {
 
 // --- TAB 6, Checks (§11.4) -------------------------------------------------
 
-export type FindingGroup = "stuck" | "x_sources" | "protocol" | "lint" | "parameters";
+export type FindingGroup =
+  | "stuck"
+  | "x_sources"
+  | "protocol"
+  | "liveness"
+  | "memory"
+  | "integrity"
+  | "lint"
+  | "parameters";
 export type Severity = "error" | "warn" | "info";
 
 export interface Finding {
@@ -501,4 +509,93 @@ export interface CmdsResult {
   kind: string;
   iface: string;
   commands: CmdEvent[];
+}
+
+// --- TAB 7, Coverage (§8.21, §8.12) ----------------------------------------
+
+export interface CoverCell {
+  key: string[];
+  hits: number;
+}
+
+export interface CoverPoint {
+  name: string;
+  /** `field`, `cross`, `sequence` or `corner`. */
+  shape: string;
+  axes: string[];
+  /** Bin labels per axis, in order — an empty cell exists because this says so. */
+  labels: string[][];
+  cells: CoverCell[];
+  total: number;
+  covered: number;
+  score: number | null;
+  msg: string;
+  /** Why it could not be measured. Different from a point at 0% (P1). */
+  skipped: string;
+}
+
+export interface FunctionalCoverage {
+  iface: string;
+  pack: string;
+  n_transactions: number;
+  /** True when the bins were derived rather than declared by the pack. */
+  automatic: boolean;
+  score: number | null;
+  points: CoverPoint[];
+}
+
+export interface LinePoint {
+  file: string;
+  line: number;
+  count: number;
+  kind: string;
+  label: string;
+  covered: boolean;
+}
+
+export interface FileCoverage {
+  file: string;
+  total: number;
+  covered: number;
+  score: number | null;
+  points: LinePoint[];
+}
+
+export interface CodeCoverage {
+  /** `verilator` or `vivado` — the two counts are not comparable. */
+  source: string;
+  path: string;
+  total: number;
+  covered: number;
+  score: number | null;
+  files: FileCoverage[];
+  error: string;
+}
+
+export interface HoleCondition {
+  text: string;
+  held: number | null;
+  sampled: number;
+  ever: boolean | null;
+  produced_by: string[];
+}
+
+export interface Hole {
+  file: string;
+  line: number;
+  kind: string;
+  label: string;
+  text: string;
+  signal: string;
+  conditions: HoleCondition[];
+  note: string;
+}
+
+export interface CoverageReport {
+  functional: FunctionalCoverage[];
+  code: CodeCoverage | null;
+  holes: Hole[];
+  skipped: Record<string, string>;
+  errors: string[];
+  ms: number;
 }

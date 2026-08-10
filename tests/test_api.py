@@ -783,3 +783,94 @@ def test_timing_violations_are_findings_in_checks(sdram_api):
     memory = [f for f in body["findings"] if f["group"] == "memory"]
     assert len(memory) == 4
     assert memory[0]["check"] == "memory_timing"
+
+
+# ---------------------------------------------------------------------------
+# TAB 7 — Coverage, and §8.19's scoreboard (Prompt 12)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def dma_api(tmp_path_factory):
+    """The DMA path with the injected byte-enable bug, served as a session
+    serves it — both new tabs read from one open."""
+    work = tmp_path_factory.mktemp("api-dma")
+    shutil.copytree(DESIGNS / "dma", work / "dma")
+    design = work / "dma"
+    convert(str(design / "dump.vcd"), str(design / "dump.vtx"))
+    with TestClient(create_app(default_trace=design / "dump.vtx", rtl=[str(design)])) as c:
+        yield c, c.get("/").json()["default_session"]
+
+
+def test_the_scoreboard_is_on_the_wire_when_the_session_opens(dma_api):
+    """§8.19 runs on open like every other scan, so this is a read."""
+    client, sid = dma_api
+    body = client.get(f"/session/{sid}/integrity").json()
+    assert len(body["mismatches"]) == 16
+    assert {m["lane_text"] for m in body["mismatches"]} == {"0-1"}
+    # What was compared, so "found nothing" could not be confused with
+    # "compared nothing".
+    assert body["compared_paths"] == [{"a": "dma.s_axi", "b": "mem", "writes": 8}]
+    assert body["errors"] == []
+
+
+def test_the_corruption_is_also_a_finding_in_checks(dma_api):
+    """§11.4: corrupted data is not a separate kind of news."""
+    client, sid = dma_api
+    body = client.get(f"/session/{sid}/checks").json()
+    found = [f for f in body["findings"] if f["group"] == "integrity"]
+    assert len(found) == 16
+    assert found[0]["check"] == "data_mismatch"
+    assert found[0]["severity"] == "error"
+
+
+def test_coverage_endpoint_carries_both_sections(dma_api):
+    client, sid = dma_api
+    body = client.get(f"/session/{sid}/coverage").json()
+    assert {f["iface"] for f in body["functional"]} == {"dma.s_axi", "mem"}
+    # No coverage database in this design, and the tab is told why rather than
+    # being handed an empty section.
+    assert body["code"] is None
+    assert "coverage database" in body["skipped"]["code"]
+    assert body["errors"] == []
+
+
+def test_the_functional_matrix_reaches_the_wire_with_its_empty_cells(dma_api):
+    """The cell that was never hit has to survive JSON, or the tab cannot draw
+    the hole."""
+    client, sid = dma_api
+    body = client.get(f"/session/{sid}/coverage").json()
+    cpu = next(f for f in body["functional"] if f["iface"] == "dma.s_axi")
+    kind = next(p for p in cpu["points"] if p["name"] == "kind")
+    assert kind["labels"] == [["READ", "WRITE"], ["READ", "WRITE"]]
+    assert len(kind["cells"]) == 4
+    assert kind["covered"] < kind["total"]
+    partial = next(p for p in cpu["points"] if p["name"] == "partial_write")
+    assert partial["covered"] == 0
+
+
+def test_the_status_says_whether_the_coverage_tab_has_anything(dma_api):
+    client, sid = dma_api
+    assert client.get(f"/session/{sid}/status").json()["has_coverage"] is True
+
+
+def test_the_new_commands_share_the_query_endpoint(dma_api):
+    """§10.1 is one language: `track(...)` is written like `txn(...)`."""
+    client, sid = dma_api
+    for query, key in (
+        ("track(addr=0x0)", "steps"),
+        ("track(data=0xdeadbeef)", "steps"),
+        ("scoreboard(mem)", "mismatches"),
+        ("fcov(mem)", "functional"),
+        ("uncovered()", "holes"),
+    ):
+        r = client.post(f"/session/{sid}/transactions/query", json={"vtq": query})
+        assert r.status_code == 200, (query, r.text)
+        assert key in r.json()
+
+
+def test_a_bad_track_query_is_a_400_with_the_reason(dma_api):
+    client, sid = dma_api
+    r = client.post(f"/session/{sid}/transactions/query", json={"vtq": "scoreboard(nope)"})
+    assert r.status_code == 400
+    assert "mem" in r.json()["detail"]

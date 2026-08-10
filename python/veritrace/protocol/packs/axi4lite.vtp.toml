@@ -123,6 +123,47 @@ name = "idle"
 when = "!valid && !ready"
 msg  = "no beat was offered and no sink was ready"
 
+# §8.19. One beat per transaction, so the default `addr + beat * stride` never
+# leaves beat 0 — but it is stated by the same table AXI4 uses, and the engine
+# needs no case for "this protocol has no bursts".
+[integrity]
+addr  = "addr"
+write = { kind = "WRITE", data = "wdata", strobe = "wstrb" }
+read  = { kind = "READ",  data = "rdata" }
+
+# §8.21. AXI4-Lite has no bursts and no ids, so the interesting axes are the
+# ones it does have: which byte lanes were exercised, and how the slave answered.
+[[cover]]
+field = "bresp"
+bins  = { OKAY = 0, EXOKAY = 1, SLVERR = 2, DECERR = 3 }
+
+[[cover]]
+field = "rresp"
+bins  = { OKAY = 0, EXOKAY = 1, SLVERR = 2, DECERR = 3 }
+
+# Which kinds followed which. An empty READ->WRITE cell means the test never
+# turned the bus around, which is where the read-after-write bugs live.
+[[cover]]
+sequence = "kind"
+
+# `stride` is the bus width in bytes, taken from `wdata`'s own width — so these
+# two say what they mean on a 32-bit bus and on a 64-bit one, instead of
+# hard-coding a 4 that is wrong half the time.
+[[cover]]
+corner = "unaligned"
+when   = "addr % stride != 0"
+msg    = "an address that is not aligned to the bus width"
+
+[[cover]]
+corner = "partial_write"
+when   = "wstrb != (1 << stride) - 1"
+msg    = "a write that did not enable every byte lane"
+
+[[cover]]
+corner = "error_response"
+when   = "bresp != 0 || rresp != 0"
+msg    = "the slave answered with something other than OKAY"
+
 [[rule]]
 id       = "AXI_AWSTABLE"
 severity = "error"

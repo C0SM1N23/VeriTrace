@@ -15,6 +15,7 @@ import type {
   SourceFile,
   TxnQueryResult,
   CmdsResult,
+  CoverageReport,
   MemoryReport,
   PerfReport,
   TxnReport,
@@ -277,4 +278,10 @@ export async function fetchCommands(session: string, iface: string): Promise<Cmd
     throw new Error(detail.detail ?? `query failed: ${r.status}`);
   }
   return (await r.json()) as CmdsResult;
+}
+
+// --- TAB 7, Coverage (§8.21, §8.12) ----------------------------------------
+
+export async function fetchCoverage(session: string): Promise<CoverageReport> {
+  return getJson<CoverageReport>(`${API}/session/${session}/coverage`);
 }

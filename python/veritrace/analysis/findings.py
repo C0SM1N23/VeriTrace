@@ -57,6 +57,11 @@ class Group(Enum):
     #: news from one that violates an AXI rule, it is the same kind of thing
     #: the tool already watches for.
     MEMORY = "memory"
+    #: §8.19 — a read that disagreed with the write before it, or a write that
+    #: changed shape between two interfaces. Above lint and next to the other
+    #: transaction-derived findings, because corrupted data outranks every
+    #: structural warning in the list.
+    INTEGRITY = "integrity"
     LINT = "lint"
     PARAMETERS = "parameters"
 
@@ -67,7 +72,7 @@ class Group(Enum):
     @property
     def label(self) -> str:
         return {"stuck": "STUCK", "x_sources": "X SOURCES", "protocol": "PROTOCOL",
-                "memory": "MEMORY",
+                "memory": "MEMORY", "integrity": "DATA INTEGRITY",
                 "liveness": "LIVENESS", "lint": "LINT",
                 "parameters": "PARAMETERS"}[self.value]
 

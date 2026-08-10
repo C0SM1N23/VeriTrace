@@ -3,6 +3,7 @@ import { WaveCanvas } from "./canvas/WaveCanvas";
 import { CausalTab } from "./panels/CausalTab";
 import { ChecksTab } from "./panels/ChecksTab";
 import { CommandPalette } from "./panels/CommandPalette";
+import { CoverageTab } from "./panels/CoverageTab";
 import { HelpOverlay, QueryBar, StatusBar, TabStrip, TopBar } from "./panels/Chrome";
 import { SignalPanel } from "./panels/SignalPanel";
 import { SourceTab } from "./panels/SourceTab";
@@ -84,6 +85,11 @@ export default function App() {
           {tab === 5 && (
             <div className="pane on">
               <ChecksTab />
+            </div>
+          )}
+          {tab === 7 && (
+            <div className="pane on">
+              <CoverageTab />
             </div>
           )}
           {tab === 8 && (

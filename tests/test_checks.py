@@ -18,6 +18,7 @@ from veritrace.analysis.findings import Group, Severity
 from veritrace.config import Config
 from veritrace.correlate.resolver import correlate
 from veritrace.graph.elaborate import discover, elaborate
+from veritrace.integrity import report as int_report
 from veritrace.memory import report as mem_report
 from veritrace.perf import report as perf_report
 from veritrace.protocol import engine
@@ -44,8 +45,12 @@ def session(tmp_path_factory):
     # §8.20's scan, same reasoning: a design with no memory interfaces still
     # has to show a *ran* result, not a skip.
     memory = mem_report.build_all(store, analysis.packs, clock, Config.empty())
+    # §8.19's scoreboard, same reasoning once more: a design whose packs declare
+    # no data path still has to show that the scan ran.
+    integrity = int_report.build(analysis, store, clock)
     report = checks.run_all(
-        store, el.graph, el, clock, Config.empty(), analysis, perf.liveness, memory
+        store, el.graph, el, clock, Config.empty(), analysis, perf.liveness, memory,
+        integrity,
     )
     return store, el, clock, report
 

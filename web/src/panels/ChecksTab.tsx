@@ -15,14 +15,28 @@ import { useEffect, useState } from "react";
 import type { ChecksReport, Finding, FindingGroup, ParamNode } from "../lib/types";
 import { useWave } from "../state/store";
 
-/** Section order and headings, exactly as §11.4 lists them. */
-const SECTIONS: { key: FindingGroup; label: string }[] = [
-  { key: "stuck", label: "STUCK" },
-  { key: "x_sources", label: "X SOURCES" },
-  { key: "protocol", label: "PROTOCOL" },
-  { key: "lint", label: "LINT" },
-  { key: "parameters", label: "PARAMETERS" },
-];
+/**
+ * Section order and headings, exactly as §11.4 lists them — and it has to be
+ * every group the server can emit. A group missing from this list is not shown
+ * anywhere, so a finding the backend produced would vanish between the API and
+ * the screen, which is worse than one that was never produced (P1). The type
+ * annotation is what keeps that from happening quietly: adding a `FindingGroup`
+ * without a section here is a compile error.
+ */
+const LABELS: Record<FindingGroup, string> = {
+  stuck: "STUCK",
+  x_sources: "X SOURCES",
+  protocol: "PROTOCOL",
+  liveness: "LIVENESS",
+  memory: "MEMORY",
+  integrity: "DATA INTEGRITY",
+  lint: "LINT",
+  parameters: "PARAMETERS",
+};
+
+const SECTIONS = (Object.entries(LABELS) as [FindingGroup, string][]).map(
+  ([key, label]) => ({ key, label }),
+);
 
 export function ChecksTab() {
   const checks = useWave((s) => s.checks);

@@ -29,11 +29,11 @@ from typing import Any
 from veritrace._native import read_txn_table, write_txn_table
 from veritrace.clocks import Clock
 from veritrace.perf.model import CyclePerf
-from veritrace.protocol.model import Extraction, Interface, Transaction, Violation
+from veritrace.protocol.model import Beat, Extraction, Interface, Transaction, Violation
 
 #: Bumped when the columns or the assembly semantics change, so an old table is
 #: rebuilt instead of being read with today's assumptions.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 #: Columns every table has, whatever the protocol. Kept first and in this order
 #: so a `SELECT *` is readable without knowing the pack.
@@ -73,8 +73,23 @@ def perf_path(trace_path: Path, iface: str) -> Path:
     return txn_dir(trace_path) / f"{_safe(iface)}.perf.parquet"
 
 
+def beats_path(trace_path: Path, iface: str) -> Path:
+    """§8.19's data beats, beside the transaction table.
+
+    Its own file for the same reason the profile has one: a row per beat is not
+    a row per transaction, and §6.3 promises that reading the table gives
+    transactions. It is also the export a data-integrity question wants on its
+    own — `read_parquet(".../mem.beats.parquet")` is every byte the bus moved.
+    """
+    return txn_dir(trace_path) / f"{_safe(iface)}.beats.parquet"
+
+
 #: Columns of the per-cycle profile, in `CyclePerf` field order.
 PERF_COLUMNS = ("edge", "label", "requesting", "transferring", "outstanding", "blocked_on")
+
+#: Columns of the beat table, in `Beat` field order minus `iface` — which is the
+#: file's own name and would be the same string on every row.
+BEAT_COLUMNS = ("txn", "dir", "time", "beat", "addr", "data", "strobe", "stride")
 
 
 def _column_name(raw: str, taken: set[str], prefix: str) -> str:
@@ -220,10 +235,17 @@ def write(
             ],
         )
 
+    if extraction.beats:
+        write_txn_table(
+            str(beats_path(trace_path, extraction.interface.name)),
+            [(name, [getattr(b, name) for b in extraction.beats]) for name in BEAT_COLUMNS],
+        )
+
     Cache.for_trace(trace_path).update(
         extraction.interface.name,
         {
             "stamp": _stamp(store, extraction.interface),
+            "n_beats": len(extraction.beats),
             "file": out.name,
             "columns": origin,
             # The profile's own names, which the columnar file cannot carry:
@@ -273,6 +295,7 @@ def restore(trace_path: Path, store: Any, iface: Interface) -> Extraction | None
         skipped=dict(entry.get("skipped") or {}),
         parquet=str(path),
         perf=_restore_perf(trace_path, iface, entry.get("perf")),
+        beats=_restore_beats(trace_path, iface, int(entry.get("n_beats") or 0)),
     )
     by_ref = ex.by_ref()
     for v in ex.violations:
@@ -280,6 +303,32 @@ def restore(trace_path: Path, store: Any, iface: Interface) -> Extraction | None
         if txn is not None:
             txn.violations.append(v)
     return ex
+
+
+def _restore_beats(trace_path: Path, iface: Interface, expected: int) -> list[Beat]:
+    """Read back §8.19's beats, or nothing.
+
+    A short or missing file costs the scoreboard, not the session — but it must
+    not cost it *silently*, so the count recorded when the table was written is
+    checked against what came back. A truncated beat table would otherwise look
+    exactly like a bus that moved less data.
+    """
+    if not expected:
+        return []
+    path = beats_path(trace_path, iface.name)
+    if not path.is_file():
+        return []
+    try:
+        cols = read(path)
+    except Exception:  # noqa: BLE001 - a damaged cache must not close the session
+        return []
+    n = len(cols.get("time") or [])
+    if n != expected:
+        return []
+    return [
+        Beat(iface=iface.name, **{name: cols[name][i] for name in BEAT_COLUMNS})
+        for i in range(n)
+    ]
 
 
 def _restore_perf(trace_path: Path, iface: Interface, meta: Any) -> CyclePerf | None:

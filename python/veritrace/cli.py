@@ -187,6 +187,9 @@ class Context:
     wait_for: list = field(default_factory=list)
     #: §8.20's per-interface memory reports, likewise.
     memory: object = None
+    #: §8.19's scoreboard and §8.21/§8.12's coverage, likewise on demand.
+    integrity: object = None
+    coverage: object = None
 
     def transactions(self) -> object:
         """Extract transactions once per command run (§8.14)."""
@@ -227,6 +230,33 @@ class Context:
                 self.store, analysis.packs, self.clock, self.config, root, chip
             )
         return self.memory
+
+    def data_integrity(self) -> object:
+        """§8.19's scoreboard and path comparison, once per command run."""
+        from veritrace.integrity import report as int_report
+
+        if self.integrity is None:
+            self.integrity = int_report.build(self.transactions(), self.store, self.clock)
+        return self.integrity
+
+    def coverage_report(self, coverage_path: Path | None = None, source: str | None = None) -> object:
+        """§8.21's functional coverage and §8.12's imported code coverage."""
+        from veritrace.coverage import report as cov_report
+
+        if self.coverage is None:
+            root = getattr(self.config, "root", None) or (
+                self.trace_path.parent if self.trace_path else None
+            )
+            self.coverage = cov_report.build(
+                self.transactions(),
+                self.store,
+                self.clock,
+                self.graph,
+                coverage_path=coverage_path,
+                project_root=root,
+                source=source,
+            )
+        return self.coverage
 
 
 def _load(
@@ -655,7 +685,8 @@ def stuck(trace, rtl, top, cycles, output, **flags):
 @click.option(
     "--fail-on",
     default="",
-    help="Exit non-zero if any of these fire. Names or groups: stuck,x,lint,cdc,protocol,deadlock.",
+    help="Exit non-zero if any of these fire. Names or groups: "
+    "stuck,x,lint,cdc,protocol,deadlock,memory,integrity.",
 )
 def check(trace, rtl, top, as_json, fail_on):
     """Every automatic finding: stuck, X sources, lint, parameters (§13, §13.9).
@@ -675,6 +706,7 @@ def check(trace, rtl, top, as_json, fail_on):
         ctx.transactions(),
         ctx.measure().liveness,
         ctx.memory_reports(),
+        ctx.data_integrity(),
     )
 
     if as_json:
@@ -966,6 +998,205 @@ def _format_memory(reports, clock) -> str:
         for name, why_not in r.skipped.items():
             out.append(f"    not checked: {name} - {why_not}")
     return "\n".join(out)
+
+
+@main.command()
+@click.argument("trace", type=click.Path(exists=True, path_type=Path))
+@click.argument("query", required=False)
+@rtl_options
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def track(trace, query, rtl, top, as_json):
+    """Follow data through the design, and check it arrived (§8.19).
+
+    With no query, the whole scoreboard: what was compared on each interface,
+    which stretches of the path could be compared across two of them, and every
+    mismatch with the byte lanes named. With one:
+
+    \b
+      veritrace track dump.vtx
+      veritrace track dump.vtx "track(addr=0x10)"
+      veritrace track dump.vtx "track(data=0xdeadbeef)"
+      veritrace track dump.vtx "track(from=src, to=sink)"
+      veritrace track dump.vtx "scoreboard(mem)"
+
+    Needs no testbench code: the reference model is built from the write
+    transactions the protocol packs already extract.
+    """
+    ctx = _load(trace, rtl, top)
+    report = ctx.data_integrity()
+
+    if not query:
+        if as_json:
+            click.echo(json.dumps(report.to_dict(), indent=2))
+            return
+        click.echo(_format_integrity(report, ctx.clock))
+        return
+
+    click.echo(json.dumps(_run_data_query(ctx, query), indent=2))
+
+
+def _run_data_query(ctx: Context, query: str, coverage_path=None, source=None) -> dict:
+    """Dispatch a §8.19/§8.21 query, computing only the half it asks for.
+
+    `veritrace track` and `veritrace coverage` accept the same language (§10.1
+    is one language), so both come through here — and neither pays for the
+    other's analysis unless the query actually names it.
+    """
+    from veritrace.analysis import vtq
+    from veritrace.coverage import query as cov_query
+
+    try:
+        pipeline = vtq.parse_pipeline(query)
+        return cov_query.run(
+            ctx.data_integrity() if pipeline.name in cov_query.INTEGRITY_COMMANDS else None,
+            (
+                ctx.coverage_report(coverage_path, source)
+                if pipeline.name in cov_query.COVERAGE_COMMANDS
+                else None
+            ),
+            pipeline,
+        )
+    except vtq.QueryError as e:
+        raise click.ClickException(str(e)) from e
+
+
+def _format_integrity(report, clock) -> str:
+    from veritrace import clocks as _clocks
+
+    out: list[str] = []
+    if not report.interfaces:
+        out.append("no interface carried data that could be tracked")
+    for i in report.interfaces:
+        out.append(
+            f"{i.iface}   [{i.pack}]   {i.writes} write(s), {i.reads} read(s), "
+            f"{i.compared} byte(s) compared"
+        )
+    for a, b, n in report.compared_paths:
+        out.append(f"    path {a} -> {b}: {n} write(s) matched by address and order")
+
+    if not report.mismatches:
+        # §8.19's own standard: "nothing found" has to be a stated result, not
+        # an empty screen that could equally mean nothing ran.
+        if report.interfaces:
+            out.append("")
+            out.append("ok  every read matched what was written, on every path compared")
+    else:
+        out.append("")
+        out.append(f"! {len(report.mismatches)} data mismatch(es)")
+        for m in report.mismatches:
+            addr = "" if m.addr is None else f"0x{m.addr:x}"
+            out.append(
+                f"    {_clocks.format_time(m.time, clock)}  {m.where}  {addr}"
+                f"  byte(s) {m.lane_text}"
+            )
+            out.append(f"        {m.detail}")
+            if m.source or m.victim:
+                out.append(f"        {m.source or '?'} -> {m.victim or '?'}")
+    for name, why_not in report.skipped.items():
+        out.append(f"    not tracked: {name} - {why_not}")
+    return "\n".join(out)
+
+
+@main.command()
+@click.argument("trace", type=click.Path(exists=True, path_type=Path))
+@click.argument("query", required=False)
+@rtl_options
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+@click.option(
+    "--coverage",
+    "coverage_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Coverage database to import (verilator coverage.dat or xcrg XML). "
+    "Found automatically next to the project when not given.",
+)
+@click.option(
+    "--source",
+    type=click.Choice(["verilator", "vivado"]),
+    default=None,
+    help="Which tool wrote it. Detected from the file when not given.",
+)
+def coverage(trace, query, rtl, top, as_json, coverage_path, source):
+    """What was not tested — functional and code, in one place (§8.21, §8.12).
+
+    The functional half is computed from the extracted transactions and needs
+    no covergroup and no simulator feature. The code half is imported from
+    Verilator or Vivado when a database is there.
+
+    \b
+      veritrace coverage dump.vtx
+      veritrace coverage dump.vtx --coverage logs/coverage.dat
+      veritrace coverage dump.vtx "fcov(cpu)"
+      veritrace coverage dump.vtx "uncovered()" --rtl rtl/
+    """
+    ctx = _load(trace, rtl, top)
+    report = ctx.coverage_report(coverage_path, source)
+
+    if not query:
+        if as_json:
+            click.echo(json.dumps(report.to_dict(), indent=2))
+            return
+        click.echo(_format_coverage(report))
+        return
+
+    click.echo(json.dumps(_run_data_query(ctx, query, coverage_path, source), indent=2))
+
+
+def _format_coverage(report) -> str:
+    out: list[str] = []
+
+    for f in report.functional:
+        out.append("")
+        score = "-" if f.score is None else f"{f.score * 100:.0f}%"
+        auto = "  (automatic bins: the pack declares no [[cover]])" if f.automatic else ""
+        out.append(f"{f.iface}   [{f.pack}]   {f.n_transactions} transactions   {score}{auto}")
+        for p in f.points:
+            if p.skipped:
+                out.append(f"    {p.name:<22} not measured - {p.skipped}")
+                continue
+            out.append(f"    {p.name:<22} {p.shape:<9} {p.covered}/{p.total}")
+            holes = p.holes()
+            for key in holes[:6]:
+                label = " x ".join(key)
+                out.append(f"        never: {label}" + (f"   {p.msg}" if p.msg else ""))
+            if len(holes) > 6:
+                out.append(f"        ... and {len(holes) - 6} more empty cell(s)")
+
+    code = report.code
+    if code is not None:
+        out.append("")
+        score = "-" if code.score is None else f"{code.score * 100:.1f}%"
+        out.append(f"code coverage from {code.source}: {code.covered}/{code.total} points {score}")
+        if code.error:
+            out.append(f"    {code.error}")
+        for f in code.files:
+            fscore = "-" if f.score is None else f"{f.score * 100:.0f}%"
+            out.append(f"    {f.file:<40} {f.covered}/{len(f.points)}  {fscore}")
+
+    if report.holes:
+        out.append("")
+        out.append(f"{len(report.holes)} uncovered point(s), with what would close them (§8.12)")
+        for h in report.holes[:10]:
+            out.append("")
+            label = f' "{h.label}"' if h.label else ""
+            out.append(f"    {h.file}:{h.line} [{h.kind}]{label}")
+            if h.text:
+                out.append(f"        {h.text}")
+            if h.note:
+                out.append(f"        {h.note}")
+            for c in h.conditions:
+                state = (
+                    "not evaluated against this trace"
+                    if c.held is None
+                    else (f"{c.held}/{c.sampled} cycles" if c.held else "NEVER observed")
+                )
+                out.append(f"        {c.text:<34} {state}")
+                for p in c.produced_by:
+                    out.append(f"            <- {p}")
+
+    for name, why_not in report.skipped.items():
+        out.append(f"    {name}: {why_not}")
+    return "\n".join(out) if out else "nothing to report"
 
 
 def _bar(share: float, width: int = 28) -> str:

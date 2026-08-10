@@ -153,6 +153,13 @@ class Session:
     #: whether a memory interface exists before it can choose a default tab.
     memory: Any = None
     memory_error: str = ""
+    #: §8.19's scoreboard and path comparison, and §8.21+§8.12's coverage. Both
+    #: are passes over the transaction table extraction already produced, so
+    #: they cost no trace access and run on open like everything else.
+    integrity: Any = None
+    integrity_error: str = ""
+    coverage: Any = None
+    coverage_error: str = ""
 
     @classmethod
     def open(
@@ -202,6 +209,8 @@ class Session:
         self._extract()
         self._measure()
         self._memory()
+        self._integrity()
+        self._coverage()
         self.report = checks.run_all(
             self.store,
             self.graph,
@@ -211,6 +220,7 @@ class Session:
             self.protocol,
             self.performance.liveness if self.performance is not None else None,
             self.memory,
+            self.integrity,
         )
         return self.report
 
@@ -271,6 +281,42 @@ class Session:
         except Exception as e:  # noqa: BLE001 - memory analysis must not close the trace
             self.memory = None
             self.memory_error = str(e)
+
+    def _integrity(self) -> None:
+        """§8.19, on session open. Degrades the same way everything else does."""
+        from veritrace.integrity import report as int_report
+
+        if self.protocol is None:
+            return
+        try:
+            self.integrity = int_report.build(self.protocol, self.store, self.clock)
+        except Exception as e:  # noqa: BLE001 - one scan must not close the trace
+            self.integrity = None
+            self.integrity_error = str(e)
+
+    def _coverage(self) -> None:
+        """§8.21 and §8.12, on session open.
+
+        The code half looks for a coverage database next to the project and
+        imports it if one is there. Not asking for it is deliberate: §8.12's
+        value is closing the loop, and a loop with a mandatory argument in it
+        does not close by itself.
+        """
+        from veritrace.coverage import report as cov_report
+
+        root = self.config.root if self.config is not None else self.trace_path.parent
+        try:
+            self.coverage = cov_report.build(
+                self.protocol,
+                self.store,
+                self.clock,
+                self.graph,
+                coverage_path=getattr(self.config, "coverage_path", None),
+                project_root=root,
+            )
+        except Exception as e:  # noqa: BLE001 - one scan must not close the trace
+            self.coverage = None
+            self.coverage_error = str(e)
 
     def suppressions(self) -> dict[str, str]:
         return dict(self.layout_file.load().get("suppressions") or {})
@@ -370,6 +416,12 @@ class Session:
             "n_transactions": len(self.protocol.transactions) if self.protocol else 0,
             "protocol_error": self.protocol_error,
             "memory_error": self.memory_error,
+            # TAB 7 is enabled when either half of it has anything to show, so
+            # the tab strip is not offering an empty page (§13.4).
+            "has_coverage": bool(
+                self.coverage
+                and (self.coverage.functional or self.coverage.code is not None)
+            ),
             "clock": self.clock.path if self.clock else None,
             "clock_method": self.clock.method if self.clock else None,
             "n_cycles": self.clock.n_cycles if self.clock else 0,

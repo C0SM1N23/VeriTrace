@@ -184,6 +184,59 @@ jobs:
           uv run veritrace check designs/sdram/dump.vcd --fail-on memory \
             && { echo "the timing violations did not fail the build"; exit 1; }
 
+      # §8.19's acceptance criterion, both halves. The byte-enable bug is a
+      # compile-time define, so the two dumps come from one source and "no
+      # corruption" is as checkable as "sixteen mismatches".
+      - name: The injected data corruption is found, with the bytes and the place
+        run: |
+          uv run veritrace track designs/dma/dump.vcd | tee dma.txt
+          grep -q "16 data mismatch(es)" dma.txt
+          # Which bytes, and between which two interfaces — not "something is wrong".
+          grep -q "dma.s_axi -> mem" dma.txt
+          grep -q "byte(s) 0-1" dma.txt
+          grep -q "were enabled upstream and not downstream" dma.txt
+          # And the read-back, which is the question §8.19 opens with.
+          grep -q "path dma.s_axi -> mem: 8 write(s) matched" dma.txt
+          uv run veritrace track designs/dma/dump_ok.vcd | tee dmaok.txt
+          grep -q "every read matched what was written" dmaok.txt
+          grep -q "mismatch" dmaok.txt && { echo "a clean run reported corruption"; exit 1; }
+          uv run veritrace track designs/dma/dump.vcd "track(addr=0x0)" > /dev/null
+          uv run veritrace check designs/dma/dump.vcd --fail-on integrity \
+            && { echo "the corruption did not fail the build"; exit 1; }
+
+      # §8.21's acceptance criterion: the matrix shows the *right* empty cells.
+      # Every one asserted here is a fact about designs/axi_lite's master —
+      # wstrb is tied to 4'hF, addresses are word-aligned, and it strictly
+      # alternates a write and a read.
+      - name: Functional coverage reports the cells the test never reached
+        run: |
+          uv run veritrace coverage designs/axi_lite/dump.vcd --rtl designs/axi_lite \
+            | tee fcov.txt
+          grep -q "never: WRITE x WRITE" fcov.txt
+          grep -q "never: READ x READ" fcov.txt
+          grep -qE "partial_write +corner +0/1" fcov.txt
+          grep -qE "unaligned +corner +0/1" fcov.txt
+          # The control: a corner this design *does* reach is not reported as a
+          # hole, or the four lines above would pass on an empty matrix.
+          grep -qE "error_response +corner +1/1" fcov.txt
+          uv run veritrace coverage designs/axi_lite/dump.vcd "fcov(cpu)" > /dev/null
+
+      # §8.12: an uncovered point becomes the conditions that would close it,
+      # derived from the graph. The database is a fixture — the readers are
+      # what is under test, and installing Verilator and Vivado to produce one
+      # would test their versions rather than this code.
+      - name: An uncovered branch is turned into its conditions
+        run: |
+          printf '%s\n' 'v_branch,fifo_buggy.sv,49,0' > cov.csv
+          uv run veritrace coverage designs/fifo_buggy/dump.vcd \
+            --rtl designs/fifo_buggy --coverage cov.csv | tee holes.txt
+          grep -q "fifo_buggy.sv:49" holes.txt
+          grep -q "rd_rst_n" holes.txt
+          grep -q "NEVER observed" holes.txt
+          # The second level of §8.12's example: how the unmet condition is
+          # produced, read off the graph rather than suggested.
+          grep -q "<- rd_rst_n <= 0" holes.txt
+
   # A clean machine, a wheel, and the three commands §13.4 promises. This is the
   # packaging acceptance criterion of Prompt 8, not a smoke test.
   packaging:
@@ -291,14 +344,18 @@ jobs:
         # root cause to find; checks carries the deliberate flaws for TAB 6;
         # axi_lite and axi_arb carry the interfaces TAB 8 and §8.16 need;
         # deadlock carries the injected wait-for cycle TAB 9 is about;
-        # sdram carries the four injected timing violations TAB 10 is about.
+        # sdram carries the four injected timing violations TAB 10 is about;
+        # dma carries the byte-enable bug TAB 7 and §8.19 are about.
         run: |
-          for d in fifo_buggy checks axi_lite axi_arb deadlock sdram; do
+          for d in fifo_buggy checks axi_lite axi_arb deadlock sdram dma; do
             uv run veritrace convert designs/$d/dump.vcd -o designs/$d/dump.vtx
           done
-          # The control run: TAB 9's tests need the same RTL without the bug.
-          uv run veritrace convert designs/deadlock/dump_ok.vcd \
-            -o designs/deadlock/dump_ok.vtx
+          # The control runs: TAB 9's and TAB 7's tests need the same RTL
+          # without the bug, so that "none found" is checkable in the browser
+          # too and not only on the command line.
+          for d in deadlock dma; do
+            uv run veritrace convert designs/$d/dump_ok.vcd -o designs/$d/dump_ok.vtx
+          done
 
       - run: npm ci
         working-directory: web

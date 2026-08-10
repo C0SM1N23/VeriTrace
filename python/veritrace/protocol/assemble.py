@@ -253,6 +253,7 @@ def assemble(
         out.transactions.extend(m.done)
 
     for txn in out.transactions:
+        lift_payload(txn)
         apply_metrics(txn, pack, clock)
         txn.violations = check_transaction_rules(txn, pack, clock)
         out.violations.extend(txn.violations)
@@ -415,6 +416,32 @@ class _Machine:
 
 def _is_set(v: FieldValue) -> bool:
     return isinstance(v, int) and v != 0
+
+
+def lift_payload(txn: Transaction) -> None:
+    """Carry every channel's first-beat payload onto the transaction.
+
+    Two things depend on this, and both were quietly wrong without it.
+
+    §6.3 promises the Parquet table *is* the export — "Andrei wants a scatter
+    plot of DMA latency, `pl.read_parquet(...)`, no API and without asking you".
+    A table with `awaddr` and no `bresp` cannot answer "which writes were
+    refused", which is not a question anyone should need this tool for.
+
+    And the table is also the cache. `TxnEnv` resolves a bare payload name by
+    looking at the start event and then at any beat, so a *freshly extracted*
+    transaction can evaluate `bresp != 0` and a *restored* one could not — the
+    events are not stored. Same trace, two answers, depending on whether a
+    previous command happened to run first. That is precisely the quiet lie P1
+    forbids, so the values move onto the transaction where both paths see them.
+
+    First beat per channel, and never overwriting a name already there, which is
+    exactly `TxnEnv`'s own resolution order — so nothing changes meaning, it
+    only survives the round trip.
+    """
+    for ev in txn.events:
+        for name, value in ev.fields.items():
+            txn.fields.setdefault(name, value)
 
 
 # --- step 4: metrics ---------------------------------------------------------

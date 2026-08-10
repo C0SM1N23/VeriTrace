@@ -1,0 +1,11 @@
+VCD info: dumpfile dump.vcd opened for output.
+dma: read 0xdead0000 from 0x00000000 (wrote 0xdeadbeef)
+dma: read 0xdead0000 from 0x00000004 (wrote 0xdeadbeee)
+dma: read 0xdead0000 from 0x00000008 (wrote 0xdeadbeed)
+dma: read 0xdead0000 from 0x0000000c (wrote 0xdeadbeec)
+dma: read 0xdead0000 from 0x00000010 (wrote 0xdeadbeeb)
+dma: read 0xdead0000 from 0x00000014 (wrote 0xdeadbeea)
+dma: read 0xdead0000 from 0x00000018 (wrote 0xdeadbee9)
+dma: read 0xdead0000 from 0x0000001c (wrote 0xdeadbee8)
+dma: finished at 1115000
+tb_dma.sv:204: $finish called at 1115000 (1ps)

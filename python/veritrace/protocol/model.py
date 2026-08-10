@@ -95,6 +95,75 @@ class ChannelEvent:
 
 
 @dataclass(slots=True)
+class Beat:
+    """One data beat, resolved to a byte address — §8.19's unit of reasoning.
+
+    A write beat says *these bytes of memory now hold these values*; a read beat
+    says *this is what came back*. Both are the same shape, so the scoreboard is
+    one ordered walk rather than two.
+
+    Produced during extraction (`protocol.beats`) because it is derived from the
+    channel events, which are not kept: the transaction table records how many
+    beats there were, not what each carried.
+    """
+
+    iface: str
+    #: `dma.WRITE[3]` — how the transaction is named everywhere else.
+    txn: str
+    #: `"write"` or `"read"`.
+    dir: str
+    time: int
+    #: 0-based index of this beat within its transaction.
+    beat: int
+    #: Byte address of lane 0, from the pack's `beat_addr`. `None` when the pack
+    #: declares no address (a stream) or the address could not be decoded.
+    addr: int | None
+    data: FieldValue
+    #: Byte-enable mask, already defaulted to "every lane" when the protocol has
+    #: no strobes.
+    strobe: int
+    #: Bus width in bytes.
+    stride: int
+
+    @property
+    def cycle_key(self) -> tuple[int, str, int]:
+        """Total order over beats from different interfaces at the same instant.
+
+        Ties broken by name and beat index rather than left to sort stability,
+        so two runs over the same trace produce the same report (P1).
+        """
+        return (self.time, self.iface, self.beat)
+
+    def lanes(self) -> dict[int, int]:
+        """Byte address -> byte value, for the lanes this beat actually drove.
+
+        Empty when the payload was not a plain integer: a beat carrying X is a
+        beat whose bytes are unknown, and inventing zeros for it would put a
+        fabricated value into the reference memory (P1).
+        """
+        if self.addr is None or not isinstance(self.data, int):
+            return {}
+        return {
+            self.addr + i: (self.data >> (8 * i)) & 0xFF
+            for i in range(self.stride)
+            if self.strobe >> i & 1
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "iface": self.iface,
+            "txn": self.txn,
+            "dir": self.dir,
+            "time": self.time,
+            "beat": self.beat,
+            "addr": self.addr,
+            "data": self.data,
+            "strobe": self.strobe,
+            "stride": self.stride,
+        }
+
+
+@dataclass(slots=True)
 class Violation:
     """A protocol rule that did not hold (§8.14, step 5)."""
 
@@ -209,6 +278,10 @@ class Extraction:
     #: of the trace to answer "why was it slow" would double the only expensive
     #: part of opening a session.
     perf: CyclePerf | None = None
+    #: §8.19's data beats, for the same reason and from the same pass. The
+    #: transaction table records how many beats a transaction had; only this
+    #: records what each one carried, and the scoreboard needs the payload.
+    beats: list[Beat] = field(default_factory=list)
 
     @property
     def correlation(self) -> float | None:

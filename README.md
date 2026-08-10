@@ -474,6 +474,99 @@ states.
 
 A design with a memory interface opens on this tab (§11.4b).
 
+### Check the data arrived
+
+*I wrote `0xDEADBEEF` to `0x4000` through the DMA. What reached memory?*
+
+Every write transaction on every interface updates a byte-granular `addr →
+value` model, and every read is compared against it. It is a scoreboard with no
+testbench written, and it runs when the session opens:
+
+```sh
+$ veritrace track dump.vcd
+dma.s_axi   [AXI4-Lite]   8 write(s), 8 read(s), 32 byte(s) compared
+mem         [AXI4-Lite]   8 write(s), 8 read(s), 16 byte(s) compared
+    path dma.s_axi -> mem: 8 write(s) matched by address and order
+
+! 16 data mismatch(es)
+    c8   dma.s_axi -> mem  0x0  byte(s) 0-1
+        byte(s) 0-1 were enabled upstream and not downstream
+    c58  dma.s_axi  0x0  byte(s) 0-1
+        read back 0xdead0000 where 0xdeadbeef was written
+```
+
+Two answers, and the second is the one that saves the week: *which bytes*, and
+*where in the path they changed*. The value is never what is followed — the same
+word appears a thousand times in a real trace — so what is followed is the
+**(address, sequence)** pair, and two interfaces are compared only when their
+write address sequences are identical. That rule is what keeps two unrelated
+masters that happen to share an address from being reported as corruption.
+
+```sh
+veritrace track dump.vcd "track(addr=0x10)"
+veritrace track dump.vcd "track(from=src, to=sink)"   # a stream: order, not address
+```
+
+For a stream with no address, the check is the other one §8.19 names: the n-th
+word in must be the n-th word out. Reordering, duplication, loss and words that
+were never sent are told apart rather than merged.
+
+Mismatches arrive in Checks as ordinary findings, at ERROR without qualification.
+A latch might not matter; a word that came back different always does.
+
+### See what you did not test
+
+One tab, two sections, because they answer one question. **Functional coverage
+is computed from the extracted transactions** — no covergroup, no simulator
+feature, nothing to write:
+
+```sh
+$ veritrace coverage dump.vcd --rtl rtl/
+cpu   [AXI4-Lite]   24 transactions   47%
+    bresp                  field     2/4
+        never: EXOKAY
+        never: DECERR
+    kind                   sequence  2/4
+        never: READ x READ
+        never: WRITE x WRITE
+    partial_write          corner    0/1
+        never: hit   a write that did not enable every byte lane
+```
+
+The bins come from the pack's declared domain, so a value that never occurred is
+an **empty box rather than a missing row** — which is the whole point. A `[[cover]]`
+entry is a field, a cross, a consecutive-pair matrix or a corner, and a corner is
+an expression, so the engine still knows no protocol:
+
+```toml
+[[cover]]
+corner = "burst_crosses_4k"
+when   = "(addr % 4096) + (awlen + 1) * (1 << awsize) > 4096"
+```
+
+**Code coverage is imported**, from Verilator or from Vivado — both are valid
+sources and neither is required:
+
+```sh
+verilator --binary --coverage --coverage-line rtl/*.sv tb.sv && ./obj_dir/Vtb
+veritrace coverage dump.vcd --coverage logs/coverage.dat --rtl rtl/
+```
+
+And an uncovered point becomes the conditions that would close it, derived from
+the graph rather than suggested:
+
+```
+fifo_buggy.sv:49 [branch]
+    else if (rd_en && !empty) rd_ptr <= rd_ptr + 1'b1;
+    rd_rst_n            NEVER observed
+        <- rd_rst_n <= 0
+    rd_en               24/46 cycles
+    !empty              44/46 cycles
+```
+
+Three conjuncts, two of them routinely true, one never — and the assignment that
+makes it never. That is the injected bug, reached from a coverage hole.
+
 ## The `.vtx` store
 
 A directory of Parquet plus one binary index, so the data is usable without this
@@ -514,7 +607,9 @@ veritrace stuck trace --cycles N
 veritrace txn   trace ["txn(iface, type=WRITE) | slowest(10)"]
 veritrace perf  trace ["stalls(iface)" | "deadlock()" | "latency(iface, by=master)"]
 veritrace memory trace ["cmds(iface)" | "banks(iface)" | "timing(iface, chip=…)"]
-veritrace check trace --fail-on stuck,x,cdc,protocol,deadlock,memory   # the CI gate
+veritrace track trace ["track(addr=0x10)" | "track(data=0x…)" | "scoreboard(iface)"]
+veritrace coverage trace ["fcov(iface)" | "uncovered()"] [--coverage logs/coverage.dat]
+veritrace check trace --fail-on stuck,x,cdc,protocol,deadlock,memory,integrity  # the CI gate
 veritrace probes sig --format vivado|quartus
 veritrace correlate trace --rtl src/
 veritrace convert dump.vcd -o dump.vtx
@@ -547,6 +642,7 @@ the tool stops finding them.
 | `designs/axi_arb` | two masters, an arbiter and real starvation ([README](designs/axi_arb/README.md)) |
 | `designs/deadlock` | two nodes waiting on each other — the bug is one `define` away from being gone ([README](designs/deadlock/README.md)) |
 | `designs/sdram` | an SDR SDRAM command bus with four injected timing violations, one per category ([README](designs/sdram/README.md)) |
+| `designs/dma` | a DMA path whose byte-enable mask drops two lanes — also one `define` from being clean ([README](designs/dma/README.md)) |
 
 ## Status
 
@@ -557,10 +653,12 @@ graph and correlation layer, why-trace, stuck / X-prop / cone / lint / parameter
 checks, log triage, viewer and probe export, protocol packs with automatic
 interface detection and rule checking, transaction-level why-trace, stall
 attribution and the liveness scan, SDRAM command decode with the twelve timing
-constraints — and the Wave, Causal, Source, Checks, Transactions, Performance
-and Memory tabs.
+constraints, the automatic data-integrity scoreboard, and functional coverage
+from transactions with code coverage imported from Verilator or Vivado — and the
+Wave, Causal, Source, Checks, Coverage, Transactions, Performance and Memory
+tabs.
 
-Not yet: data integrity and coverage, diff, FSM extraction.
+Not yet: diff, FSM extraction.
 
 Measured on a 50 MB / 3.6 M-event synthetic dump over 5000 signals, against the
 tier-A budget:
@@ -602,5 +700,5 @@ make bench       # the tier-A budget
 make designs     # re-simulate every reference design
 ```
 
-**586 tests**: 70 Rust, 418 Python, 38 Vitest, 60 Playwright — with the
+**668 tests**: 70 Rust, 490 Python, 38 Vitest, 70 Playwright — with the
 acceptance criterion of each stage tested rather than asserted.

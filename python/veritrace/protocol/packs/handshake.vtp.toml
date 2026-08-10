@@ -60,6 +60,24 @@ name = "idle"
 when = "!valid && !ready"
 msg  = "neither side was moving"
 
+# §8.19's second half. A bare handshake usually has no address, and then the
+# only thing there is to check is order: the n-th word in must be the n-th word
+# out. `addr` is declared anyway because the channel may carry one — when it
+# does, the byte-level scoreboard runs instead, and when it does not, the
+# ordering check does. The pack states the fields; the engine decides which
+# question it can answer with them.
+[integrity]
+addr  = "addr"
+write = { kind = "XFER", data = "data", strobe = "strb" }
+
+# §8.21 on a protocol with one channel and no declared domains: the sequence
+# matrix is trivially one cell, so what is left is the corner that matters on a
+# stream — a beat that did not carry every byte.
+[[cover]]
+corner = "partial_beat"
+when   = "strb != (1 << stride) - 1"
+msg    = "a beat that did not enable every byte lane"
+
 [[rule]]
 id       = "HS_NODROP"
 severity = "error"

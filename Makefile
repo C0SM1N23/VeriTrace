@@ -16,7 +16,7 @@ VTX      = $(DESIGN)/dump.vtx
 
 .PHONY: help sim-icarus sim-verilator sim-modelsim sim-xsim \
         convert serve serve-rtl correlate check stuck triage export probes \
-        txn txn-why perf deadlock memory sdram \
+        txn txn-why perf deadlock memory sdram track coverage dma \
         web web-build test test-web test-all bench designs clean
 
 help:
@@ -25,6 +25,7 @@ help:
 	@echo "Protocol:  txn  txn-why      (§8.13-8.16)"
 	@echo "Perf:      perf  deadlock    (§8.17-8.18)"
 	@echo "Memory:    memory  sdram      (§8.20)"
+	@echo "Data:      track  coverage  dma  (§8.19, §8.21, §8.12)"
 	@echo "Serve:     serve  serve-rtl  web"
 	@echo "Test:      test  test-web  test-all  bench"
 	@echo ""
@@ -157,6 +158,25 @@ sdram:
 	@echo "== the same controller with the violations compiled out =="
 	veritrace memory designs/sdram/dump_ok.vcd
 
+## The automatic scoreboard (§8.19): what was written, what came back, and
+## which byte lanes changed in between. Add a query, e.g.
+## `make track Q='track(addr=0x10)'`.
+track: convert
+	veritrace track $(VTX) $(Q) --rtl $(DESIGN)
+
+## Functional coverage from transactions (§8.21) plus imported code coverage
+## (§8.12). COV=<file> points at a verilator or xcrg database.
+coverage: convert
+	veritrace coverage $(VTX) $(Q) --rtl $(DESIGN) $(if $(COV),--coverage $(COV),)
+
+## The §8.19 walk-through: the same DMA path with a byte-enable bug injected
+## and compiled out, so "no corruption" is as visible as "sixteen mismatches".
+dma:
+	$(MAKE) --no-print-directory track DESIGN=designs/dma
+	@echo ""
+	@echo "== the same bridge with the corruption compiled out =="
+	veritrace track designs/dma/dump_ok.vcd
+
 ## --- serving --------------------------------------------------------------
 
 serve: convert
@@ -198,10 +218,14 @@ designs:
 	  $(MAKE) --no-print-directory sim-icarus convert DESIGN=$${d%/} \
 	    TOP=$$(basename $$(ls $$d/tb_*.sv) .sv); \
 	done
-	@# designs/deadlock is the one design that produces two dumps from one
-	@# source: §8.18 needs the bug injected *and* compiled out, so that "no
-	@# deadlock found" is checkable and not merely asserted.
+	@# Three designs produce two dumps each from one source: §8.18, §8.20 and
+	@# §8.19 all need their bug injected *and* compiled out, so that "none
+	@# found" is checkable and not merely asserted.
 	cd designs/deadlock && iverilog -g2012 -DNO_DEADLOCK -o sim_ok.vvp *.sv \
+	    && vvp sim_ok.vvp | tee sim_ok.log
+	cd designs/sdram && iverilog -g2012 -DNO_VIOLATION -o sim_ok.vvp *.sv \
+	    && vvp sim_ok.vvp | tee sim_ok.log
+	cd designs/dma && iverilog -g2012 -DNO_CORRUPTION -o sim_ok.vvp *.sv \
 	    && vvp sim_ok.vvp | tee sim_ok.log
 
 clean:

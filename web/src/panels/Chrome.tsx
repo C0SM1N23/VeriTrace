@@ -9,9 +9,9 @@ const TABS = [
   "Wave", "Causal", "Source", "FSM", "Checks", "Diff", "Coverage",
   "Transactions", "Performance", "Memory",
 ];
-/** 1-based indices of the tabs that are built. FSM (4), Diff (6) and
- *  Coverage (7) are still design only. */
-const BUILT = new Set([1, 2, 3, 5, 8, 9, 10]);
+/** 1-based indices of the tabs that are built. FSM (4) and Diff (6) are still
+ *  design only. */
+const BUILT = new Set([1, 2, 3, 5, 7, 8, 9, 10]);
 /** Checks is tab 5; its badge shows how much it already knows (§13.4). */
 export const CHECKS_TAB = 5;
 

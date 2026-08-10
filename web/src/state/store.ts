@@ -21,6 +21,7 @@ import {
   putLayout,
   runQuery,
   fetchCommands,
+  fetchCoverage,
   fetchMemory,
   fetchPerformance,
   runTxnQuery,
@@ -38,6 +39,7 @@ import type {
   SourceFile,
   Transaction,
   CmdEvent,
+  CoverageReport,
   MemoryReport,
   PerfReport,
   TxnReport,
@@ -121,6 +123,14 @@ export interface WaveState {
   /** Decoded command stream for `memIface`, fetched on demand (it is large). */
   memCommands: CmdEvent[];
   memFilter: string;
+  // §8.21 + §8.12, TAB 7.
+  coverage: CoverageReport | null;
+  coverageBusy: boolean;
+  coverageError: string | null;
+  /** Which interface's functional matrix is shown. */
+  covIface: string | null;
+  /** Which uncovered point is expanded into its derived conditions. */
+  covHole: string | null;
   filter: string;
   paletteOpen: boolean;
   helpOpen: boolean;
@@ -170,6 +180,9 @@ export interface WaveState {
   loadMemory: () => Promise<void>;
   selectMemIface: (name: string) => Promise<void>;
   setMemFilter: (q: string) => void;
+  loadCoverage: () => Promise<void>;
+  selectCovIface: (name: string) => void;
+  selectHole: (key: string | null) => void;
   jumpTo: (t: number, signals?: string[]) => void;
   suppress: (id: string, reason: string) => Promise<void>;
   unsuppress: (id: string) => Promise<void>;
@@ -279,6 +292,11 @@ export const useWave = create<WaveState>((set, get) => ({
   memIface: null,
   memCommands: [],
   memFilter: "",
+  coverage: null,
+  coverageBusy: false,
+  coverageError: null,
+  covIface: null,
+  covHole: null,
   filter: "",
   paletteOpen: false,
   helpOpen: false,
@@ -674,6 +692,28 @@ export const useWave = create<WaveState>((set, get) => ({
   },
 
   setMemFilter: (q) => set({ memFilter: q }),
+
+  // --- TAB 7, Coverage (§8.21, §8.12) ---------------------------------
+
+  loadCoverage: async () => {
+    const s = get();
+    if (!s.session || s.coverageBusy) return;
+    set({ coverageBusy: true, coverageError: null });
+    try {
+      const report = await fetchCoverage(s.session);
+      set({
+        coverage: report,
+        coverageBusy: false,
+        covIface: get().covIface ?? report.functional[0]?.iface ?? null,
+      });
+    } catch (e) {
+      set({ coverageBusy: false, coverageError: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  selectCovIface: (name) => set({ covIface: name }),
+
+  selectHole: (key) => set({ covHole: key }),
 
   /**
    * Centre Wave on an instant, optionally loading the signals that explain it.

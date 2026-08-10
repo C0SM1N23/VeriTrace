@@ -268,6 +268,7 @@ def create_app(
         `stalls(m0)` differ in what they return, not in how they are written, and
         splitting them would make the query bar need to know which is which.
         """
+        from veritrace.coverage import query as cov_query
         from veritrace.memory import query as mem_query
         from veritrace.perf import query as perf_query
         from veritrace.protocol import query as txn_query
@@ -279,6 +280,9 @@ def create_app(
             )
         try:
             pipeline = vtq.parse_pipeline(body.vtq)
+            if pipeline.name in cov_query.COMMANDS:
+                got = cov_query.run(session.integrity, session.coverage, pipeline)
+                return {"query": body.vtq, **got}
             if pipeline.name in perf_query.COMMANDS:
                 got = perf_query.run(
                     session.performance, session.protocol, session.wait_for, pipeline
@@ -339,6 +343,47 @@ def create_app(
         return {
             "interfaces": [r.to_dict(with_commands=False) for r in session.memory],
             "errors": [session.memory_error] if session.memory_error else [],
+        }
+
+    @api.get("/session/{session_id}/coverage")
+    def coverage(session_id: str) -> dict[str, Any]:
+        """TAB 7 — §8.21's functional matrix, §8.12's imported code coverage, and
+        the derived conditions for what neither of them reached.
+
+        Computed on open like the other tabs, so this is a read. Both halves and
+        the reasons a half is missing come back together: an empty section with
+        no explanation is exactly the thing §11.4 says a coverage tool must not
+        do.
+        """
+        session = require(session_id)
+        if session.coverage is None:
+            return {
+                "functional": [],
+                "code": None,
+                "holes": [],
+                "skipped": {},
+                "errors": [e for e in (session.coverage_error, session.protocol_error) if e],
+            }
+        return {
+            **session.coverage.to_dict(),
+            "errors": [session.coverage_error] if session.coverage_error else [],
+        }
+
+    @api.get("/session/{session_id}/integrity")
+    def integrity(session_id: str) -> dict[str, Any]:
+        """§8.19's scoreboard: what was compared, and every mismatch."""
+        session = require(session_id)
+        if session.integrity is None:
+            return {
+                "interfaces": [],
+                "mismatches": [],
+                "compared_paths": [],
+                "skipped": {},
+                "errors": [e for e in (session.integrity_error, session.protocol_error) if e],
+            }
+        return {
+            **session.integrity.to_dict(),
+            "errors": [session.integrity_error] if session.integrity_error else [],
         }
 
     @api.get("/session/{session_id}/checks")

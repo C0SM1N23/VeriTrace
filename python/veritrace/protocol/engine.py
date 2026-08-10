@@ -33,7 +33,14 @@ from typing import Any, Iterable
 from veritrace import clocks
 from veritrace.clocks import Clock
 from veritrace.perf import stalls
-from veritrace.protocol import assemble, channels, detect, pack as packs_mod, persist
+from veritrace.protocol import (
+    assemble,
+    beats,
+    channels,
+    detect,
+    pack as packs_mod,
+    persist,
+)
 from veritrace.protocol.model import Extraction, Interface, Transaction
 from veritrace.protocol.pack import Pack, PackError
 
@@ -223,6 +230,16 @@ def _extract_one(
         ex.perf = stalls.attribute(iface, sampler, in_reset, scans, ex.transactions)
     except Exception as e:  # noqa: BLE001 - performance is an extra, not a gate
         ex.skipped["stalls"] = str(e)
+
+    # §8.19, while the *channel events* are still in hand. The transaction table
+    # keeps how many beats there were, not what each carried, so a scoreboard
+    # built later would have to re-extract the whole trace to see them.
+    try:
+        notes: dict[str, str] = {}
+        ex.beats = beats.collect(store, ex, clock, notes)
+        ex.skipped.update(notes)
+    except Exception as e:  # noqa: BLE001 - integrity is an extra, not a gate
+        ex.skipped["beats"] = str(e)
 
     temporal, notes = assemble.check_temporal_rules(iface, sampler, in_reset, clock)
     ex.violations.extend(temporal)

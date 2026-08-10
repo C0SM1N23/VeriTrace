@@ -17,7 +17,16 @@ from __future__ import annotations
 import time as _time
 from typing import Any, Callable, Iterator
 
-from veritrace.analysis import lint, liveness, memory, params, protocol, stuck, xprop
+from veritrace.analysis import (
+    integrity,
+    lint,
+    liveness,
+    memory,
+    params,
+    protocol,
+    stuck,
+    xprop,
+)
 from veritrace.analysis.findings import Finding, Group, Report
 from veritrace.clocks import Clock
 
@@ -29,6 +38,7 @@ ALL_CHECKS: dict[str, str] = {
     protocol.CHECK: "protocol rule from a pack that did not hold (§8.14)",
     **liveness.CHECKS,
     **memory.CHECKS,
+    **integrity.CHECKS,
     **lint.CHECKS,
 }
 
@@ -43,6 +53,7 @@ GROUP_ALIASES: dict[str, tuple[str, ...]] = {
     "liveness": tuple(liveness.CHECKS),
     "deadlock": (liveness.CHECK_DEADLOCK,),
     "memory": tuple(memory.CHECKS),
+    "integrity": tuple(integrity.CHECKS),
 }
 
 
@@ -66,6 +77,7 @@ def run_all(
     analysis: Any = None,
     liveness_report: Any = None,
     memory_reports: Any = None,
+    integrity_report: Any = None,
 ) -> Report:
     """Run every applicable check.
 
@@ -124,6 +136,14 @@ def run_all(
         Group.MEMORY.value,
         None if memory_reports is not None else "the memory scan was not run",
         lambda: memory.scan(memory_reports, config),
+    )
+    # §8.19, on the same terms once more: a design whose packs declare no
+    # `[integrity]` produces an empty report with its reasons on it, which is a
+    # result; a caller that never built one gets a skip.
+    run(
+        Group.INTEGRITY.value,
+        None if integrity_report is not None else "the data-integrity scan was not run",
+        lambda: integrity.scan(integrity_report, config),
     )
     run(
         Group.LINT.value,
