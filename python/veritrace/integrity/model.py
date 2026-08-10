@@ -70,7 +70,13 @@ class Mismatch:
     source: str = ""
     victim: str = ""
     detail: str = ""
-    #: VTQ that opens the guilty signal in Causal, when there is one to open.
+    #: Full path of the wire this finding is about — the one that carried the
+    #: wrong bytes. Resolved from the pack's own field names, so it is a real
+    #: signal a `why()` can start from.
+    signal: str | None = None
+    #: VTQ that opens that signal in Causal at the instant it went wrong. §11.4
+    #: requires a working `[why]` on every row, and a data mismatch has the most
+    #: obvious question of any finding: where did this value come from.
     why: str | None = None
 
     @property
@@ -90,6 +96,7 @@ class Mismatch:
             "source": self.source,
             "victim": self.victim,
             "detail": self.detail,
+            "signal": self.signal,
             "why": self.why,
         }
 

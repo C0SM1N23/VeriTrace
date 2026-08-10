@@ -50,8 +50,18 @@ const WS_ORIGIN: string = import.meta.env.DEV
   ? (import.meta.env.VITE_BACKEND ?? "http://127.0.0.1:8765")
   : location.origin;
 
+/**
+ * `Accept: application/json` on every read, and it is not decoration.
+ *
+ * The API root answers a browser with the application itself and everything
+ * else with JSON, so a request that does not say what it wants is answered by
+ * whatever the engine's default `Accept` happens to be. That default is not the
+ * same everywhere, and when it carried `text/html` the app asked for its own
+ * configuration and was handed its own index page — "Unexpected token '<'".
+ * Saying what we want makes it the server's decision instead of the browser's.
+ */
 async function getJson<T>(url: string): Promise<T> {
-  const r = await fetch(url);
+  const r = await fetch(url, { headers: { Accept: "application/json" } });
   if (!r.ok) throw new Error(`${r.status} ${r.statusText} for ${url}`);
   return (await r.json()) as T;
 }
@@ -78,7 +88,7 @@ export async function fetchLayout(session: string): Promise<Layout> {
 export async function putLayout(session: string, layout: Layout): Promise<void> {
   const r = await fetch(`${API}/session/${session}/layout`, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(layout),
   });
   if (!r.ok) throw new Error(`layout save failed: ${r.status}`);
@@ -191,7 +201,7 @@ export class WaveSocket {
 export async function runQuery(session: string, vtq: string): Promise<WhyResult> {
   const r = await fetch(`${API}/session/${session}/query`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({ vtq }),
   });
   if (!r.ok) {
@@ -217,7 +227,7 @@ export async function suppressFinding(
 ): Promise<void> {
   const r = await fetch(`${API}/session/${session}/checks/${id}/suppress`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({ reason }),
   });
   if (!r.ok) throw new Error(`suppress failed: ${r.status}`);
@@ -240,7 +250,7 @@ export async function fetchTransactions(session: string): Promise<TxnReport> {
 export async function runTxnQuery(session: string, vtq: string): Promise<TxnQueryResult> {
   const r = await fetch(`${API}/session/${session}/transactions/query`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({ vtq }),
   });
   if (!r.ok) {
@@ -270,7 +280,7 @@ export async function fetchMemory(session: string): Promise<MemoryReport> {
 export async function fetchCommands(session: string, iface: string): Promise<CmdsResult> {
   const r = await fetch(`${API}/session/${session}/transactions/query`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({ vtq: `cmds(${iface})` }),
   });
   if (!r.ok) {

@@ -35,6 +35,7 @@ def scan(report: Any, config: Any = None) -> Iterator[Finding]:
             severity=Severity.ERROR,
             check=CHECK,
             title=f"byte(s) {m.lane_text}{addr} changed {where} {m.where}",
+            signal=m.signal,
             time=m.time,
             detail=m.detail,
             why=m.why,

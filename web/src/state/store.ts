@@ -123,6 +123,24 @@ export interface WaveState {
   /** Decoded command stream for `memIface`, fetched on demand (it is large). */
   memCommands: CmdEvent[];
   memFilter: string;
+  /**
+   * The row list a click-through replaced, kept so the move can be undone.
+   *
+   * §11.4b's click-throughs focus Wave on one transaction or one violation,
+   * which means replacing the list you assembled. Without this that was a
+   * one-way door: no undo, and the replacement was persisted, so a reload
+   * did not bring your work back either. Everything else in the app is
+   * additive or reversible; this was the exception.
+   *
+   * Held as a *swap* rather than an undo stack: going back stashes what you
+   * were looking at, so neither list can be lost in either direction, and
+   * there is no history to reason about.
+   */
+  stashedRows: Row[] | null;
+  /** What the swap will bring back — shown on the button. */
+  stashedLabel: string;
+  /** What the current list is, when a click-through chose it. */
+  focusLabel: string;
   // §8.21 + §8.12, TAB 7.
   coverage: CoverageReport | null;
   coverageBusy: boolean;
@@ -180,10 +198,14 @@ export interface WaveState {
   loadMemory: () => Promise<void>;
   selectMemIface: (name: string) => Promise<void>;
   setMemFilter: (q: string) => void;
+  /** Focus Wave on a set of signals, remembering what it replaced. */
+  focusRows: (rows: Row[], label: string) => void;
+  /** Swap the current list with the one a click-through replaced. */
+  swapRows: () => void;
   loadCoverage: () => Promise<void>;
   selectCovIface: (name: string) => void;
   selectHole: (key: string | null) => void;
-  jumpTo: (t: number, signals?: string[]) => void;
+  jumpTo: (t: number, signals?: string[], label?: string) => void;
   suppress: (id: string, reason: string) => Promise<void>;
   unsuppress: (id: string) => Promise<void>;
   openFinding: (f: { why: string | null; loc: { file: string; line: number } | null }) => void;
@@ -292,6 +314,9 @@ export const useWave = create<WaveState>((set, get) => ({
   memIface: null,
   memCommands: [],
   memFilter: "",
+  stashedRows: null,
+  stashedLabel: "",
+  focusLabel: "",
   coverage: null,
   coverageBusy: false,
   coverageError: null,
@@ -601,7 +626,7 @@ export const useWave = create<WaveState>((set, get) => ({
       const rows: Row[] = s.signals
         .filter((sig) => paths.has(sig.path))
         .map((sig) => ({ kind: "signal", handle: sig.handle, path: sig.path }) as Row);
-      if (rows.length) set({ rows });
+      get().focusRows(rows, t.ref);
     }
     const end = t.end_time ?? s.bounds.t1;
     // A little air either side, so the transaction is not flush with the edge.
@@ -693,6 +718,35 @@ export const useWave = create<WaveState>((set, get) => ({
 
   setMemFilter: (q) => set({ memFilter: q }),
 
+  focusRows: (rows, label) => {
+    const s = get();
+    // Nothing to show, or already showing it: leave the list and the stash
+    // alone rather than offering to undo a move that never happened.
+    if (!rows.length) return;
+    const same =
+      rows.length === s.rows.length &&
+      rows.every((r, i) => JSON.stringify(r) === JSON.stringify(s.rows[i]));
+    if (same) return;
+    set({
+      rows,
+      stashedRows: s.rows,
+      stashedLabel: s.focusLabel || "your signal list",
+      focusLabel: label,
+    });
+  },
+
+  swapRows: () => {
+    const s = get();
+    if (!s.stashedRows) return;
+    set({
+      rows: s.stashedRows,
+      stashedRows: s.rows,
+      stashedLabel: s.focusLabel,
+      focusLabel: s.stashedLabel,
+    });
+    schedulePersist(get);
+  },
+
   // --- TAB 7, Coverage (§8.21, §8.12) ---------------------------------
 
   loadCoverage: async () => {
@@ -722,14 +776,14 @@ export const useWave = create<WaveState>((set, get) => ({
    * segment — because both mean the same thing to the rest of the app: *put
    * the cursor there and show me these wires*.
    */
-  jumpTo: (t, signals) => {
+  jumpTo: (t, signals, label) => {
     const s = get();
     if (signals && signals.length) {
       const wanted = new Set(signals);
       const rows: Row[] = s.signals
         .filter((sig) => wanted.has(sig.path))
         .map((sig) => ({ kind: "signal", handle: sig.handle, path: sig.path }) as Row);
-      if (rows.length) set({ rows });
+      get().focusRows(rows, label || "this moment");
     }
     const span = Math.max(1, Math.round((s.bounds.t1 - s.bounds.t0) / 40));
     set({

@@ -38,6 +38,10 @@ export function SignalPanel() {
   const removeRow = useWave((s) => s.removeRow);
   const toggleGroup = useWave((s) => s.toggleGroup);
   const setSelected = useWave((s) => s.setSelected);
+  const stashedRows = useWave((s) => s.stashedRows);
+  const stashedLabel = useWave((s) => s.stashedLabel);
+  const focusLabel = useWave((s) => s.focusLabel);
+  const swapRows = useWave((s) => s.swapRows);
   const addGroup = useWave((s) => s.addGroup);
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -89,6 +93,24 @@ export function SignalPanel() {
           + group
         </button>
       </div>
+      {stashedRows && (
+        /* A click-through replaced the list. Say what it is showing and offer
+         * the way back — §11.4b's focus is meant to help, not to cost someone
+         * the list they spent ten minutes assembling. */
+        <div className="signal-focus" data-testid="signal-focus">
+          <span className="signal-focus-what" title={focusLabel}>
+            {focusLabel || "focused"}
+          </span>
+          <button
+            className="link"
+            onClick={swapRows}
+            data-testid="signal-focus-back"
+            title={`Show ${stashedLabel} again (${stashedRows.length} row(s))`}
+          >
+            ← {stashedLabel}
+          </button>
+        </div>
+      )}
       <div className="signal-rows" ref={scrollRef} data-testid="signal-rows">
         <div style={{ height: ROW_OFFSET }} className="signal-rows-spacer" />
         {shown.map((row, i) => (

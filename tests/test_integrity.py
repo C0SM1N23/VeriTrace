@@ -162,6 +162,38 @@ def test_a_mismatch_is_an_ordinary_finding(corrupted):
     assert "byte(s) 0-1" in f.title
 
 
+def test_every_mismatch_carries_a_working_why(corrupted):
+    """§11.4 requires a working `[why]` on every row, and a data mismatch has
+    the most obvious question of any finding: where did this value come from.
+
+    The wire is read out of the pack's `[integrity]` declaration, so the two
+    kinds point at two different things on purpose — a read that came back
+    wrong asks about the read data, and bytes dropped along the path ask about
+    the strobe that dropped them.
+    """
+    _store, _clock, _an, report = corrupted
+    assert all(m.why and m.signal for m in report.mismatches)
+
+    scoreboard_m = next(m for m in report.mismatches if m.kind == "scoreboard")
+    assert scoreboard_m.signal.endswith("rdata")
+    assert scoreboard_m.why == f"why({scoreboard_m.signal} @ {scoreboard_m.time})"
+
+    # The injected bug is a byte-enable mask, and this is the wire it is on.
+    path_m = next(m for m in report.mismatches if m.kind == "path")
+    assert path_m.signal.endswith("wstrb")
+
+
+def test_the_why_query_resolves_against_the_design(corrupted):
+    """A `[why]` that parses but names nothing is worse than none at all."""
+    from veritrace.analysis import vtq
+
+    _store, _clock, _an, report = corrupted
+    for m in report.mismatches:
+        parsed = vtq.parse(m.why)
+        assert parsed.signal == m.signal
+        assert parsed.time == m.time
+
+
 def test_the_check_runs_with_everything_else(corrupted):
     """It arrives unasked, next to the stuck signals — §11.4's whole point."""
     store, clock, analysis, report = corrupted

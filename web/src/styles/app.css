@@ -2004,3 +2004,29 @@ select:focus-visible {
 .cov-cond-src li {
   padding-left: 8px;
 }
+
+/* The way back from a click-through (§11.4b). One strip, only present when
+ * there is somewhere to go back to — no permanent chrome for a rare state. */
+.signal-focus {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px var(--gutter);
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  min-width: 0;
+}
+
+.signal-focus-what {
+  color: var(--text-bright);
+  font-family: var(--font-data);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.signal-focus .link {
+  margin-left: auto;
+  white-space: nowrap;
+}

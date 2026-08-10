@@ -19,7 +19,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -33,6 +33,22 @@ from veritrace.api.sessions import Session, SessionRegistry
 #: Emit a progress message every this many signals on a large wave request (P3:
 #: no mute spinner).
 PROGRESS_EVERY = 16
+
+#: Headers for the one URL that serves two things: `/` answers a browser with
+#: the application and everything else with JSON.
+#:
+#: `Vary: Accept` is the whole reason this constant exists. Without it a browser
+#: caches whichever representation it saw first *under the URL alone* and hands
+#: it back to any later request for the same URL — so a navigation to `/` filled
+#: the cache with HTML, and the app's own `fetch("/")` was then answered out of
+#: that cache, with the server never asked. The symptom is
+#: `Unexpected token '<', "<!doctype "...` and no entry in the access log, which
+#: is what makes it so confusing: the request that failed was never made.
+#:
+#: `no-store` on top, because the two representations are cheap to produce and
+#: an index.html cached across a rebuild points at a bundle that no longer
+#: exists. Hashed assets under `/assets/` are immutable and cache normally.
+_NEGOTIATED = {"Vary": "Accept", "Cache-Control": "no-store"}
 
 
 class CreateSession(BaseModel):
@@ -123,9 +139,15 @@ def create_app(
 
         §10.1 fixes the API paths, and a packaged install has to answer a bare
         URL with something a person can use. Content negotiation gives both:
-        a browser navigating here sends `Accept: text/html` and gets the app;
-        `fetch` sends `*/*` and gets the JSON. No path is moved, and no second
-        port or prefix is invented.
+        a browser navigating here gets the app, a client asking for JSON gets
+        the JSON. No path is moved, and no second port or prefix is invented.
+
+        **An explicit `application/json` wins over `text/html`.** A browser
+        navigating here sends both — `text/html` first, `*/*` last — and so does
+        `fetch` on some engines, which is how the app once asked for its own
+        configuration and was handed its own index page back. Ranking the
+        explicit request above the vague one makes the answer depend on what
+        the caller asked for rather than on which browser it is.
         """
         payload = {
             "name": "veritrace",
@@ -134,9 +156,10 @@ def create_app(
             "max_px": MAX_PX,
         }
         index = _ui_dir() / "index.html"
-        if "text/html" in accept and index.is_file():
-            return FileResponse(index)
-        return payload
+        wants_html = "application/json" not in accept and "text/html" in accept
+        if wants_html and index.is_file():
+            return FileResponse(index, headers=_NEGOTIATED)
+        return JSONResponse(payload, headers=_NEGOTIATED)
 
     @api.post("/session")
     def create_session(body: CreateSession) -> dict[str, Any]:
@@ -519,7 +542,11 @@ def _mount_ui(app: FastAPI) -> None:
         candidate = ui / path
         if path and candidate.is_file() and ui in candidate.resolve().parents:
             return FileResponse(candidate)
-        return FileResponse(index)
+        # `no-store` on the shell for the same reason as `/`: it names the
+        # hashed bundle, so a cached copy that survives a rebuild asks for a
+        # file that is no longer there — and a hard reload becomes the only way
+        # to start the app, which nobody should have to know.
+        return FileResponse(index, headers=_NEGOTIATED)
 
 
 async def send(websocket: WebSocket, payload: dict[str, Any]) -> None:

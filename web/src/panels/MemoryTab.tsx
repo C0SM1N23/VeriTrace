@@ -186,7 +186,7 @@ function Violations({ per }: { per: MemoryInterface }) {
                     <button
                       className="link"
                       data-testid="mem-violation-jump"
-                      onClick={() => jumpTo(v.at, wires)}
+                      onClick={() => jumpTo(v.at, wires, `${v.constraint} violation`)}
                     >
                       show
                     </button>
@@ -286,7 +286,7 @@ function BankTimeline({ per }: { per: MemoryInterface }) {
               data-testid={`mem-seg-${s.bank}-${s.state}`}
               data-state={s.state}
               title={`bank ${s.bank} ${s.state}${s.row !== null ? ` row 0x${s.row.toString(16)}` : ""}`}
-              onClick={() => jumpTo(s.t0, wires)}
+              onClick={() => jumpTo(s.t0, wires, `bank ${s.bank}`)}
             >
               {s.row !== null && s.state === "active" && (
                 <span className="mem-seg-row">0x{s.row.toString(16)}</span>
@@ -359,7 +359,7 @@ function CommandStream({ per }: { per: MemoryInterface }) {
             className="mem-cmd"
             key={`${c.time}-${c.name}`}
             data-testid="mem-cmd"
-            onClick={() => jumpTo(c.time, wires)}
+            onClick={() => jumpTo(c.time, wires, c.name)}
           >
             <span className="mem-cmd-t">{at(c.time)}</span>
             <span className="mem-cmd-name">{c.name}</span>

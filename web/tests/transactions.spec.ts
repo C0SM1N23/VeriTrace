@@ -106,6 +106,45 @@ test("clicking a transaction filters Wave to its interface and jumps to it", asy
   expect(rows.some((p) => p.endsWith("awvalid"))).toBeTruthy();
 });
 
+test("the list a click-through replaced can be brought back", async ({ page }) => {
+  // §11.4b's focus is meant to help, not to cost someone the list they spent
+  // ten minutes assembling. Every other move in the app is additive or
+  // reversible; this one used to be a one-way door with no undo, and the
+  // replacement was persisted, so a reload did not recover it either.
+  await open(page);
+  await page.locator('[data-testid="tab-1"]').click();
+  const before = await page.$$eval('[data-testid="signal-row"]', (r) =>
+    r.map((x) => x.getAttribute("data-path") ?? ""),
+  );
+  expect(before.length).toBeGreaterThan(0);
+
+  await page.locator('[data-testid="tab-8"]').click();
+  await page.locator('[data-testid^="txn-band-"]').nth(3).click();
+  await page.locator('[data-testid="tab-1"]').click();
+
+  const focused = await page.$$eval('[data-testid="signal-row"]', (r) =>
+    r.map((x) => x.getAttribute("data-path") ?? ""),
+  );
+  expect(focused).not.toEqual(before);
+
+  // The way back is on screen, not a shortcut nobody would guess.
+  const back = page.locator('[data-testid="signal-focus-back"]');
+  await expect(back).toBeVisible();
+  await back.click();
+  const restored = await page.$$eval('[data-testid="signal-row"]', (r) =>
+    r.map((x) => x.getAttribute("data-path") ?? ""),
+  );
+  expect(restored).toEqual(before);
+
+  // And it is a swap, not an undo: the focused list is one click away again,
+  // so neither list can be lost in either direction.
+  await back.click();
+  const again = await page.$$eval('[data-testid="signal-row"]', (r) =>
+    r.map((x) => x.getAttribute("data-path") ?? ""),
+  );
+  expect(again).toEqual(focused);
+});
+
 test("the field table carries the pack's own fields and metrics", async ({ page }) => {
   await open(page);
   const headers = await page.$$eval('[data-testid="txn-table"] th', (h) =>

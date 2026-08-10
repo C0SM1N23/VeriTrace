@@ -528,6 +528,25 @@ def test_root_negotiates_between_the_app_and_the_api(client, monkeypatch, tmp_pa
     # And a plain fetch still gets the JSON, so the client is unaffected.
     assert client.get("/").json()["name"] == "veritrace"
 
+    # An explicit ask for JSON wins over `text/html`, even when both are
+    # present. A browser navigation sends both, and so does `fetch` on some
+    # engines — which is how the app once requested its own configuration and
+    # was handed its own index page back ("Unexpected token '<'"). The answer
+    # has to depend on what was asked for, not on which browser asked.
+    both = client.get(
+        "/", headers={"Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8"}
+    )
+    assert both.json()["name"] == "veritrace"
+
+    # Two representations behind one URL have to say so, or a browser caches
+    # whichever it saw first *under the URL alone* and answers the app's own
+    # fetch out of that cache — the server never asked, nothing in the access
+    # log, and `Unexpected token '<'` on screen.
+    assert html.headers["vary"] == "Accept"
+    assert both.headers["vary"] == "Accept"
+    assert "no-store" in html.headers["cache-control"]
+    assert "no-store" in both.headers["cache-control"]
+
 
 def test_static_files_never_shadow_an_api_route(vtx, tmp_path):
     """The catch-all is mounted after the router, so §10.1's paths always win."""
