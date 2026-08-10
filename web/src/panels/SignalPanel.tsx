@@ -10,6 +10,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import { shortLabels } from "../lib/names";
 import { RADICES, radixLabel } from "../lib/radix";
 import type { Radix, Row } from "../lib/types";
 import { useWave, visibleRows } from "../state/store";
@@ -50,6 +51,11 @@ export function SignalPanel() {
   const [menuFor, setMenuFor] = useState<number | null>(null);
 
   const shown = visibleRows(rows);
+  // Labels are decided against the rows on screen, so a name is only as
+  // long as it needs to be to be unambiguous *here*.
+  const labels = shortLabels(
+    shown.filter((r) => r.kind === "signal").map((r) => (r as { path: string }).path),
+  );
   // Map a visible index back to its index in the full row array.
   const realIndex = (visIdx: number): number => rows.indexOf(shown[visIdx]);
 
@@ -121,6 +127,7 @@ export function SignalPanel() {
             height={rowH}
             selected={row.kind === "signal" && row.handle === selected}
             radix={row.kind === "signal" ? (radix[row.path] ?? "hex") : "hex"}
+            label={row.kind === "signal" ? (labels.get(row.path) ?? row.path) : row.name}
             width={row.kind === "signal" ? (signalsByHandle.get(row.handle)?.width ?? 1) : 0}
             dragging={dragFrom === i}
             dropTarget={dragOver === i}
@@ -154,6 +161,8 @@ export function SignalPanel() {
 
 interface RowProps {
   row: Row;
+  /** Shortest unambiguous form of the path, for the visible list. */
+  label: string;
   index: number;
   height: number;
   selected: boolean;
@@ -222,7 +231,7 @@ function SignalRow(p: RowProps) {
         ⠿
       </span>
       <span className="sig-name" title={row.path}>
-        {row.path.split(".").pop()}
+        {p.label}
       </span>
       {p.width > 1 && (
         <button
