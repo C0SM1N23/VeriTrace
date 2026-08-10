@@ -64,3 +64,23 @@ designs/*/.veritrace.toml
 
 # TypeScript's incremental build state.
 web/tsconfig.tsbuildinfo
+
+# Scratch output from the self-check job. Those steps `tee` their reports to the
+# repository root so a failing assertion can quote the text it did not find; the
+# files are evidence for one run, not sources.
+/checks.txt
+/corr.txt
+/cov.csv
+/dl.txt
+/dma.txt
+/dmaok.txt
+/fcov.txt
+/holes.txt
+/mem.txt
+/memok.txt
+/ok.txt
+/perf.txt
+/perf2.txt
+/triage.txt
+/txn.txt
+/txnwhy.txt

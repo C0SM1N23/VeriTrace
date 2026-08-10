@@ -1,5 +1,0 @@
-dma.s_axi   [AXI4-Lite]   8 write(s), 8 read(s), 32 byte(s) compared
-mem   [AXI4-Lite]   8 write(s), 8 read(s), 32 byte(s) compared
-    path dma.s_axi -> mem: 8 write(s) matched by address and order
-
-ok  every read matched what was written, on every path compared

@@ -1,9 +1,0 @@
-top = tb_lanes
-96 RTL signals, 94 trace signals
-93/96 signals correlated (96.9%)
-  by method: exact=91, elements=2, not_traced=3
-  2 not dumped but reconstructible from RTL:
-    ~ tb_lanes.dut.g_lane[2].u_fifo.mem
-    ~ tb_lanes.dut.g_lane[3].u_fifo.mem
-  1 not correlated:
-    - tb_lanes.dut.lane_dout

@@ -1,8 +1,0 @@
-1 interface(s) - 24 transactions - 2 protocol violations
-
-cpu   [AXI4-Lite]   tb_axi_lite.cpu
-    also seen as: regs, tb_axi_lite.s_axi
-    clock tb_axi_lite.cpu.aclk   reset tb_axi_lite.cpu.aresetn   123 cycles sampled
-    12 READ, 12 WRITE   (60/60 channel events correlated, 100%)
-    2 protocol violation(s)
-    table: designs\axi_lite\dump.vcd.vtx\txn\cpu.parquet
