@@ -14,12 +14,13 @@ TOP     ?= tb_fifo_buggy
 SOURCES ?= $(notdir $(wildcard $(DESIGN)/*.sv))
 VTX      = $(DESIGN)/dump.vtx
 
-.PHONY: help sim-icarus sim-verilator sim-modelsim sim-xsim \
+.PHONY: help run sim-icarus sim-verilator sim-modelsim sim-xsim \
         convert serve serve-rtl correlate check stuck triage export probes \
         txn txn-why perf deadlock memory sdram track coverage dma \
         web web-build test test-web test-all bench designs clean
 
 help:
+	@echo "Start:     run          (folder of .sv -> findings, one command)"
 	@echo "Simulate:  sim-icarus  sim-verilator  sim-modelsim  sim-xsim"
 	@echo "Analyse:   convert  correlate  check  stuck  triage  export  probes"
 	@echo "Protocol:  txn  txn-why      (§8.13-8.16)"
@@ -88,6 +89,12 @@ sim-xsim:
 	  && xsim $(TOP)_sim -t dump_xsim.tcl | tee sim.log
 
 ## --- analysis -------------------------------------------------------------
+
+## §13.4b: from a folder of SystemVerilog to a verdict, in one command. This is
+## the target to reach for with somebody else's code, before there is any dump
+## or any config — it simulates, converts and checks in one pass.
+run:
+	veritrace run $(DESIGN) $(if $(TOP),--top $(TOP),)
 
 ## Convert the dump to a .vtx store.
 convert:

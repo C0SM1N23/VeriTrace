@@ -68,6 +68,36 @@ build that ends in a wall of Rust output.
 
 ## The first sixty seconds
 
+If you have RTL and no waveform yet — which is where every project starts — one
+command does the whole thing:
+
+```sh
+$ veritrace run rtl/
+  7 source file(s), top module 'tb_cpu'
+  simulated with Icarus Verilog in 1.4 s
+  waveform: .veritrace/dump.vcd (512 signals)
+  correlation: 487/512 signals (95.1%)
+
+  2 stuck · 1 x sources · 4 lint
+    ! top.arb.lock_r  frozen at 1 since c12   arb.sv:88
+
+  Wrote .veritrace.toml - later commands need no arguments.
+  veritrace serve .veritrace/dump.vtx --rtl rtl/
+```
+
+Drop your files in a folder and point at it. It works out the top module,
+simulates, converts, and reports — and **a testbench with no `$dumpfile` still
+produces a waveform**, because a generated module is compiled alongside it
+rather than your sources being edited. Everything lands in `.veritrace/`.
+
+`--fail-on stuck,x,cdc` makes the same command a CI gate, and `--serve` opens
+the interface when it finishes. Only Icarus is driven from here; the other three
+simulators keep their `make sim-<tool>` recipes, where their mandatory flags
+already live.
+
+<details>
+<summary>If a waveform already exists</summary>
+
 ```sh
 $ cd ~/projects/my_cpu
 $ veritrace init
@@ -93,6 +123,7 @@ is the top, the signal in the first `@(posedge X)` is the clock — and writes a
 complete `.veritrace.toml` so you never type the same six arguments twice.
 Then it runs the checks on whatever dump it finds, because the first impression
 should be *"it already knows something I didn't"*, not an empty config file.
+</details>
 
 ## Where the trace comes from
 
@@ -597,6 +628,7 @@ s.value_at(h, 25000), s.value_before(h, 25000), s.deltas_at(h, 25000)
 ## Command reference
 
 ```sh
+veritrace run   rtl/ [--top X]      # simulate + convert + check, in one command
 veritrace init                      # detect everything, write .veritrace.toml
 veritrace serve [trace] --rtl src/  # the interface
 veritrace triage sim.log            # log -> root causes

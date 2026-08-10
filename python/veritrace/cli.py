@@ -714,10 +714,180 @@ def check(trace, rtl, top, as_json, fail_on):
     else:
         click.echo(_format_report(report, ctx.clock))
 
-    gate = checks_mod.expand_checks(fail_on.split(",")) if fail_on else set()
-    hits = [f for f in report if f.check in gate]
-    if hits:
+    _gate(report, fail_on)
+
+
+def _gate(report, fail_on: str) -> None:
+    """§13.9's exit code. Shared by `check` and `run`, so the CI verdict cannot
+    differ depending on which one a project uses."""
+    from veritrace.analysis import checks as checks_mod
+
+    if not fail_on:
+        return
+    wanted = checks_mod.expand_checks(fail_on.split(","))
+    if any(f.check in wanted for f in report):
         raise SystemExit(1)
+
+
+@main.command()
+@click.argument("sources", nargs=-1, type=click.Path(exists=True, path_type=Path))
+@click.option("--top", default=None, help="Top module. Detected when not given.")
+@click.option(
+    "--sim",
+    type=click.Choice(["icarus", "verilator", "modelsim", "xsim"]),
+    default="icarus",
+    help="Simulator. Only Icarus is driven from here; the others print their recipe.",
+)
+@click.option(
+    "--work",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Where the build and the waveform land. Default: .veritrace/ beside the sources.",
+)
+@click.option("--timeout", default=120.0, help="Seconds before the simulation is given up on.")
+@click.option("-D", "--define", "defines", multiple=True, help="Passed to the compiler as -D.")
+@click.option("-I", "--incdir", "incdirs", multiple=True, help="Passed to the compiler as -I.")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+@click.option(
+    "--fail-on",
+    default="",
+    help="Exit non-zero if any of these fire — the same gate `check` uses.",
+)
+@click.option("--serve", "then_serve", is_flag=True, help="Open the interface when it is done.")
+@click.pass_context
+def run(
+    click_ctx, sources, top, sim, work, timeout, defines, incdirs, as_json, fail_on, then_serve
+):
+    """Simulate a folder of SystemVerilog and report what is wrong (§13.4b).
+
+    The whole of the first sixty seconds in one command: find the sources, work
+    out the top module, run the simulation, convert the waveform and print every
+    automatic finding.
+
+    \b
+      veritrace run rtl/
+      veritrace run rtl/ tb/ --top tb_cpu --serve
+      veritrace run . --fail-on stuck,x,cdc          # the CI gate, no Makefile
+
+    A testbench that does not call `$dumpfile` still produces a waveform: a
+    generated module is compiled alongside it, and your sources are never
+    touched.
+    """
+    from veritrace import simulate
+    from veritrace.analysis import checks as checks_mod
+
+    roots = list(sources) or [Path.cwd()]
+    files: list[Path] = []
+    for r in roots:
+        files.extend([r] if r.is_file() else find_rtl_files(r))
+    files = sorted({f.resolve() for f in files})
+    if not files:
+        raise click.ClickException(
+            f"No .sv/.v files under {', '.join(str(r) for r in roots)}."
+        )
+
+    top = top or guess_top_module(files)
+    if not top:
+        raise click.ClickException(
+            "Could not work out the top module — every module here is instantiated "
+            "by another. Name it with --top."
+        )
+
+    if sim != "icarus":
+        # §4.0 holds the flags for the other three and the Makefile implements
+        # them. Printing the recipe beats reimplementing it in a second place
+        # that would then drift.
+        raise click.ClickException(
+            f"`--sim {sim}` is not driven from here; its flags live in §4.0 and in the "
+            f"Makefile, which is where they are kept right:\n"
+            f"    make sim-{sim} convert DESIGN=<dir> TOP={top}\n"
+            f"Then: veritrace check <dir>/dump.vcd --rtl <dir>"
+        )
+
+    base = roots[0] if roots[0].is_dir() else roots[0].parent
+    work = work or base / ".veritrace"
+
+    # `--json` has to be parseable on stdout, so the running commentary is
+    # silenced rather than interleaved with the document.
+    say = (lambda *_a, **_k: None) if as_json else click.echo
+
+    say(f"{len(files)} source file(s), top module {top!r}")
+    try:
+        got = simulate.icarus(files, top, work, list(defines), list(incdirs), timeout)
+    except simulate.SimulationError as e:
+        raise click.ClickException(str(e)) from e
+    say(f"simulated with Icarus Verilog in {got.seconds:.1f} s")
+    if got.injected:
+        say("  no $dumpfile in your sources, so the whole design was dumped")
+    for w in got.warnings[:3]:
+        say(f"  {w.strip()}")
+
+    ctx = _load(got.dump, tuple(roots), top)
+    say(f"waveform: {_rel(got.dump)} ({ctx.store.n_signals} signals)")
+    if ctx.correlation is not None:
+        say(
+            f"correlation: {ctx.correlation.matched}/{ctx.correlation.total} signals "
+            f"({ctx.correlation.percent}%)"
+        )
+    elif ctx.graph is None:
+        say("no RTL graph: causal analysis is off; pass the RTL to enable it")
+
+    report = checks_mod.run_all(
+        ctx.store,
+        ctx.graph,
+        ctx.elaboration,
+        ctx.clock,
+        ctx.config,
+        ctx.transactions(),
+        ctx.measure().liveness,
+        ctx.memory_reports(),
+        ctx.data_integrity(),
+    )
+
+    if as_json:
+        click.echo(json.dumps({"dump": str(got.dump), "top": top, **report.to_dict()}, indent=2))
+    else:
+        click.echo("")
+        click.echo(_format_report(report, ctx.clock))
+        _write_config_if_missing(base, top, files, got)
+        click.echo("")
+        click.echo(f"  veritrace serve {_rel(ctx.trace_path)} --rtl {_rel(base)}")
+
+    _gate(report, fail_on)
+    if then_serve:
+        # The real `serve` command, invoked rather than reimplemented, so the
+        # banner, the browser and the RTL handling stay in one place.
+        click_ctx.invoke(
+            serve, trace=ctx.trace_path, rtl=tuple(roots), top=top, browser=True
+        )
+
+
+def _rel(path: Path) -> str:
+    """A path as short as it can be said from here."""
+    try:
+        return Path(path).resolve().relative_to(Path.cwd()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _write_config_if_missing(base: Path, top: str, files: list[Path], got) -> None:
+    """Keep `init`'s promise without asking for a second command (§13.4b).
+
+    Never overwrites: a project that already configured itself has decided
+    things this cannot re-derive.
+    """
+    out = base / ".veritrace.toml"
+    if out.exists():
+        return
+    clock = guess_clock(files) or "clk"
+    reset = guess_reset(files) or ("rst_n", "low")
+    config = build_config(top, ["**/*.sv", "**/*.v"], clock, reset[0], reset[1], _rel(got.dump))
+    try:
+        with out.open("wb") as fh:
+            tomli_w.dump(config, fh)
+    except OSError:
+        return  # a read-only tree is not a reason to fail a run
+    click.echo(f"\nWrote {_rel(out)} - later commands need no arguments.")
 
 
 @main.command()
