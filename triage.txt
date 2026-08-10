@@ -1,0 +1,8 @@
+19 failure(s) in log -> 1 root cause(s)
+
+[1] 19 failure(s)  -  tb_fifo_buggy.dut.rd_rst_n = 0 [constant] at c27   fifo_buggy.sv:30
+      log:4  ERROR: assertion "p_fifo_drains" failed at time 275ns
+      log:6  ERROR: assertion "p_fifo_drains" failed at time 285ns
+      log:8  ERROR: assertion "p_fifo_drains" failed at time 295ns
+      ... and 16 more
+      why(tb_fifo_buggy.dut.rd_rst_n @ 275000)

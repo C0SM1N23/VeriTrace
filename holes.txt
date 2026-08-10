@@ -1,0 +1,13 @@
+
+code coverage from verilator: 0/1 points 0.0%
+    fifo_buggy.sv                            0/1  0%
+
+1 uncovered point(s), with what would close them (§8.12)
+
+    fifo_buggy.sv:49 [branch] "v_branch"
+        else if (rd_en && !empty) rd_ptr <= rd_ptr + 1'b1;
+        rd_rst_n                           NEVER observed
+            <- rd_rst_n <= 0
+        rd_en                              24/46 cycles
+        !empty                             44/46 cycles
+    functional: no protocol interface was extracted

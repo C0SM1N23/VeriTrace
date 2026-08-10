@@ -1,0 +1,198 @@
+WRITE#0 on m0 was issued at c116; this is why it was not issued earlier, in c0-c116
+
+tb_axi_arb.m0.awvalid = 0   [assigned] at c57   arb_master.sv:68
+     ((state == 3'd1) && !aw_done)
+  -> tb_axi_arb.m0.state = 000   [hold] at c57   arb_master.sv:62
+       held: no driver was enabled
+    -> tb_axi_arb.m0.arready = 0   [assigned] at c57   tb_axi_arb.sv:145
+         m0_arready
+      -> tb_axi_arb.m0_arready = 0   [assigned] at c57   tb_axi_arb.sv:111
+           (sel1 ? 0 : s_arready)
+        -> tb_axi_arb.sel1 = 1   [assigned] at c57   tb_axi_arb.sv:91
+             (grant == 2'd1)
+          -> tb_axi_arb.grant = 01   [assigned] at c57   tb_axi_arb.sv:82
+               grant
+            -> tb_axi_arb.arb.grant = 01   [assigned] at c57   arbiter.sv:38
+                 (lock ? owner : pick)
+              -> tb_axi_arb.arb.owner = 01   [hold] at c57   arbiter.sv:33
+                   held: no driver was enabled
+                -> tb_axi_arb.arb.aresetn = 1   [assigned] at c57   tb_axi_arb.sv:76
+                     aresetn
+                  -> tb_axi_arb.aresetn = 1   [primary_input] at c57   tb_axi_arb.sv:17
+                -> tb_axi_arb.arb.lock = 1   [hold] at c57   arbiter.sv:32
+                     held: no driver was enabled
+                  -> tb_axi_arb.arb.aresetn = 1   [assigned] at c57   (as above)
+                  -> tb_axi_arb.arb.s_bready = 1   [assigned] at c57   tb_axi_arb.sv:81
+                       s_bready
+                    -> tb_axi_arb.s_bready = 1   [assigned] at c57   tb_axi_arb.sv:100
+                         (sel1 ? m1_bready : m0_bready)
+                      -> tb_axi_arb.sel1 = 1   [cycle] at c57
+                      -> tb_axi_arb.m1_bready = 1   [assigned] at c57   tb_axi_arb.sv:172
+                           bready
+                        -> tb_axi_arb.m1.bready = 1   [assigned] at c57   arb_master.sv:70
+                             (state == 3'd2)
+                          -> tb_axi_arb.m1.state = 010   [assigned] at c57   arb_master.sv:101
+                               3'd2   [guard: ((aresetn && (state == 3'd1)) && (aw_ok && w_ok))]
+                            -> tb_axi_arb.m1.aresetn = 1   [assigned] at c57   tb_axi_arb.sv:161
+                                 aresetn
+                              -> tb_axi_arb.aresetn = 1   [primary_input] at c57   (as above)
+                            -> tb_axi_arb.m1.state = 010   [cycle] at c57
+                            -> tb_axi_arb.m1.aw_ok = 0   [assigned] at c57   arb_master.sv:82
+                                 (aw_done || (awvalid && awready))
+                              -> tb_axi_arb.m1.aw_done = 0   [conflict] at c57   arb_master.sv:98
+                                   2 drivers active at once
+                              -> tb_axi_arb.m1.awvalid = 0   [assigned] at c57   arb_master.sv:68
+                                   ((state == 3'd1) && !aw_done)
+                                -> tb_axi_arb.m1.state = 010   [cycle] at c57
+                                -> [txn] m1.WRITE[4]   at c49
+                                     m1: WRITE#4 still in flight here (awaddr=0x0, awprot=0, addr=0x0)
+                                  -> tb_axi_arb.m1.bvalid = 1   [assigned] at c57   tb_axi_arb.sv:171
+                                       m1_bvalid
+                                    -> tb_axi_arb.m1_bvalid = 1   [assigned] at c57   tb_axi_arb.sv:118
+                                         (sel1 ? s_bvalid : 0)
+                                      -> tb_axi_arb.sel1 = 1   [cycle] at c57
+                                      -> tb_axi_arb.s_bvalid = 1   [assigned] at c57   tb_axi_arb.sv:200
+                                           bvalid
+                                        -> tb_axi_arb.slv.bvalid = 1   [assigned] at c57   arb_slave.sv:82
+                                             1   [guard: (((aresetn && (wstate == W_IDLE)) && (awvalid && wvalid)) && (wcnt >= 4'd8))]
+                                          -> tb_axi_arb.slv.W_IDLE = 0   [constant] at c57   arb_slave.sv:56
+                                          -> tb_axi_arb.slv.aresetn = 1   [assigned] at c57   tb_axi_arb.sv:191
+                                               aresetn
+                                            -> tb_axi_arb.aresetn = 1   [primary_input] at c57   (as above)
+                                          -> tb_axi_arb.slv.wstate = 1   [assigned] at c57   arb_slave.sv:91
+                                               W_RESP   [guard: (((aresetn && (wstate == W_IDLE)) && (awvalid && wvalid)) && (wcnt >= 4'd8))]
+                                            -> tb_axi_arb.slv.W_IDLE = 0   [constant] at c57   (as above)
+                                            -> tb_axi_arb.slv.W_RESP = 1   [constant] at c57   arb_slave.sv:56
+                                            -> tb_axi_arb.slv.aresetn = 1   [assigned] at c57   (as above)
+                                            -> tb_axi_arb.slv.wstate = 1   [cycle] at c57
+                                            -> tb_axi_arb.slv.awvalid = 0   [assigned] at c57   tb_axi_arb.sv:192
+                                                 s_awvalid
+                                              -> tb_axi_arb.s_awvalid = 0   [assigned] at c57   tb_axi_arb.sv:94
+                                                   (sel1 ? m1_awvalid : m0_awvalid)
+                                                -> tb_axi_arb.sel1 = 1   [cycle] at c57
+                                                -> tb_axi_arb.m1_awvalid = 0   [assigned] at c57   tb_axi_arb.sv:163
+                                                     awvalid
+                                                  -> tb_axi_arb.m1.awvalid = 0   [cycle] at c57
+                                                -> [txn] slv.WRITE[4]   at c49
+                                                     slv: WRITE#4 still in flight here (awaddr=0x0, awprot=0, addr=0x0)
+                                                  -> tb_axi_arb.slv.bvalid = 1   [cycle] at c57
+                                            -> tb_axi_arb.slv.wvalid = 0   [assigned] at c57   tb_axi_arb.sv:196
+                                                 s_wvalid
+                                              -> tb_axi_arb.s_wvalid = 0   [assigned] at c57   tb_axi_arb.sv:97
+                                                   (sel1 ? m1_wvalid : m0_wvalid)
+                                                -> tb_axi_arb.sel1 = 1   [cycle] at c57
+                                                -> tb_axi_arb.m1_wvalid = 0   [assigned] at c57   tb_axi_arb.sv:167
+                                                     wvalid
+                                                  -> tb_axi_arb.m1.wvalid = 0   [assigned] at c57   arb_master.sv:69
+                                                       ((state == 3'd1) && !w_done)
+                                                    -> tb_axi_arb.m1.state = 010   [cycle] at c57
+                                            -> tb_axi_arb.slv.wcnt = 0000   [assigned] at c57   arb_slave.sv:81
+                                                 4'd0   [guard: (((aresetn && (wstate == W_IDLE)) && (awvalid && wvalid)) && (wcnt >= 4'd8))]
+                                              -> tb_axi_arb.slv.W_IDLE = 0   [constant] at c57   (as above)
+                                              -> tb_axi_arb.slv.aresetn = 1   [assigned] at c57   (as above)
+                                              -> tb_axi_arb.slv.wstate = 1   [cycle] at c57
+                                              -> tb_axi_arb.slv.awvalid = 0   [assigned] at c57   (as above)
+                                              -> tb_axi_arb.slv.wvalid = 0   [assigned] at c57   (as above)
+                                              -> tb_axi_arb.slv.wcnt = 0000   [cycle] at c57
+                                          -> tb_axi_arb.slv.awvalid = 0   [assigned] at c57   (as above)
+                                          -> tb_axi_arb.slv.wvalid = 0   [assigned] at c57   (as above)
+                                          -> tb_axi_arb.slv.wcnt = 0000   [assigned] at c57   (as above)
+                              -> tb_axi_arb.m1.awready = 0   [assigned] at c57   tb_axi_arb.sv:164
+                                   m1_awready
+                                -> tb_axi_arb.m1_awready = 0   [assigned] at c57   tb_axi_arb.sv:116
+                                     (sel1 ? s_awready : 0)
+                                  -> tb_axi_arb.sel1 = 1   [cycle] at c57
+                                  -> tb_axi_arb.s_awready = 0   [assigned] at c57   tb_axi_arb.sv:193
+                                       awready
+                                    -> tb_axi_arb.slv.awready = 0   [assigned] at c57   arb_slave.sv:63
+                                         ((w_settled && awvalid) && wvalid)
+                                      -> tb_axi_arb.slv.awvalid = 0   [assigned] at c57   (as above)
+                                      -> tb_axi_arb.slv.wvalid = 0   [assigned] at c57   (as above)
+                                      -> tb_axi_arb.slv.w_settled = 0   [assigned] at c57   arb_slave.sv:62
+                                           ((wstate == W_IDLE) && (wcnt >= 4'd8))
+                                        -> tb_axi_arb.slv.W_IDLE = 0   [constant] at c57   (as above)
+                                        -> tb_axi_arb.slv.wstate = 1   [assigned] at c57   (as above)
+                                        -> tb_axi_arb.slv.wcnt = 0000   [assigned] at c57   (as above)
+                            -> tb_axi_arb.m1.w_ok = 0   [assigned] at c57   arb_master.sv:83
+                                 (w_done || (wvalid && wready))
+                              -> tb_axi_arb.m1.w_done = 0   [conflict] at c57   arb_master.sv:99
+                                   2 drivers active at once
+                              -> tb_axi_arb.m1.wvalid = 0   [assigned] at c57   (as above)
+                              -> tb_axi_arb.m1.wready = 0   [assigned] at c57   tb_axi_arb.sv:168
+                                   m1_wready
+                                -> tb_axi_arb.m1_wready = 0   [assigned] at c57   tb_axi_arb.sv:117
+                                     (sel1 ? s_wready : 0)
+                                  -> tb_axi_arb.sel1 = 1   [cycle] at c57
+                                  -> tb_axi_arb.s_wready = 0   [assigned] at c57   tb_axi_arb.sv:197
+                                       wready
+                                    -> tb_axi_arb.slv.wready = 0   [assigned] at c57   arb_slave.sv:64
+                                         ((w_settled && awvalid) && wvalid)
+                                      -> tb_axi_arb.slv.awvalid = 0   [assigned] at c57   (as above)
+                                      -> tb_axi_arb.slv.wvalid = 0   [assigned] at c57   (as above)
+                                      -> tb_axi_arb.slv.w_settled = 0   [assigned] at c57   (as above)
+                  -> tb_axi_arb.arb.s_bvalid = 1   [assigned] at c57   tb_axi_arb.sv:80
+                       s_bvalid
+                    -> tb_axi_arb.s_bvalid = 1   [assigned] at c57   (as above)
+                  -> tb_axi_arb.arb.lock = 1   [cycle] at c57
+              -> tb_axi_arb.arb.lock = 1   [hold] at c57   (as above)
+    -> tb_axi_arb.m0.aw_ok = 0   [assigned] at c57   arb_master.sv:82
+         (aw_done || (awvalid && awready))
+      -> tb_axi_arb.m0.aw_done = 0   [hold] at c57   arb_master.sv:64
+           held: no driver was enabled
+        -> tb_axi_arb.m0.aw_ok = 0   [cycle] at c57
+        -> tb_axi_arb.m0.awready = 0   [assigned] at c57   tb_axi_arb.sv:134
+             m0_awready
+          -> tb_axi_arb.m0_awready = 0   [assigned] at c57   tb_axi_arb.sv:107
+               (sel1 ? 0 : s_awready)
+            -> tb_axi_arb.sel1 = 1   [assigned] at c57   (as above)
+        -> tb_axi_arb.m0.awvalid = 0   [cycle] at c57
+        -> tb_axi_arb.m0.state = 000   [cycle] at c57
+        -> tb_axi_arb.m0.w_ok = 0   [assigned] at c57   arb_master.sv:83
+             (w_done || (wvalid && wready))
+          -> tb_axi_arb.m0.w_done = 0   [hold] at c57   arb_master.sv:64
+               held: no driver was enabled
+            -> tb_axi_arb.m0.aw_ok = 0   [cycle] at c57
+            -> tb_axi_arb.m0.state = 000   [cycle] at c57
+            -> tb_axi_arb.m0.w_ok = 0   [cycle] at c57
+            -> tb_axi_arb.m0.wready = 0   [assigned] at c57   tb_axi_arb.sv:138
+                 m0_wready
+              -> tb_axi_arb.m0_wready = 0   [assigned] at c57   tb_axi_arb.sv:108
+                   (sel1 ? 0 : s_wready)
+                -> tb_axi_arb.sel1 = 1   [assigned] at c57   (as above)
+            -> tb_axi_arb.m0.wvalid = 0   [assigned] at c57   arb_master.sv:69
+                 ((state == 3'd1) && !w_done)
+              -> tb_axi_arb.m0.state = 000   [cycle] at c57
+            -> tb_axi_arb.m0.aresetn = 1   [assigned] at c57   tb_axi_arb.sv:131
+                 aresetn
+              -> tb_axi_arb.aresetn = 1   [primary_input] at c57   (as above)
+          -> tb_axi_arb.m0.wready = 0   [assigned] at c57   (as above)
+          -> tb_axi_arb.m0.wvalid = 0   [assigned] at c57   (as above)
+        -> tb_axi_arb.m0.aresetn = 1   [assigned] at c57   (as above)
+      -> tb_axi_arb.m0.awready = 0   [assigned] at c57   (as above)
+      -> tb_axi_arb.m0.awvalid = 0   [cycle] at c57
+    -> tb_axi_arb.m0.bvalid = 0   [assigned] at c57   tb_axi_arb.sv:141
+         m0_bvalid
+      -> tb_axi_arb.m0_bvalid = 0   [assigned] at c57   tb_axi_arb.sv:109
+           (sel1 ? 0 : s_bvalid)
+        -> tb_axi_arb.sel1 = 1   [assigned] at c57   (as above)
+    -> tb_axi_arb.m0.cnt = 00000000   [hold] at c57   arb_master.sv:63
+         held: no driver was enabled
+      -> tb_axi_arb.m0.bvalid = 0   [assigned] at c57   (as above)
+      -> tb_axi_arb.m0.rvalid = 0   [assigned] at c57   tb_axi_arb.sv:148
+           m0_rvalid
+        -> tb_axi_arb.m0_rvalid = 0   [assigned] at c57   tb_axi_arb.sv:112
+             (sel1 ? 0 : s_rvalid)
+          -> tb_axi_arb.sel1 = 1   [assigned] at c57   (as above)
+      -> tb_axi_arb.m0.state = 000   [cycle] at c57
+      -> tb_axi_arb.m0.aresetn = 1   [assigned] at c57   (as above)
+    -> tb_axi_arb.m0.grant_ok = 0   [assigned] at c57   tb_axi_arb.sv:132
+         m0_grant_ok
+      -> tb_axi_arb.m0_grant_ok = 0   [assigned] at c57   tb_axi_arb.sv:88
+           (grant == 2'd0)
+        -> tb_axi_arb.grant = 01   [assigned] at c57   (as above)
+    -> tb_axi_arb.m0.rvalid = 0   [assigned] at c57   (as above)
+    -> tb_axi_arb.m0.state = 000   [cycle] at c57
+    -> tb_axi_arb.m0.w_ok = 0   [assigned] at c57   (as above)
+    -> tb_axi_arb.m0.aresetn = 1   [assigned] at c57   (as above)
+
+92 nodes in 39.2 ms

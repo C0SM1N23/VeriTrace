@@ -1,0 +1,17 @@
+
+cpu   [AXI4-Lite]   24 transactions   47%
+    bresp                  field     2/4
+        never: EXOKAY
+        never: DECERR
+    rresp                  field     2/4
+        never: EXOKAY
+        never: DECERR
+    kind                   sequence  2/4
+        never: READ x READ
+        never: WRITE x WRITE
+    unaligned              corner    0/1
+        never: hit   an address that is not aligned to the bus width
+    partial_write          corner    0/1
+        never: hit   a write that did not enable every byte lane
+    error_response         corner    1/1
+    code: no coverage database found; run verilator --coverage or xcrg, or pass --coverage <file>

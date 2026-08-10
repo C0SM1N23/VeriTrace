@@ -577,6 +577,36 @@ def test_a_write_that_fails_does_not_lose_the_analysis(axi_lite, monkeypatch):
     assert "read-only" in ex.skipped.get("persist", "")
 
 
+def test_a_column_that_mixes_integers_and_x_is_still_written(tmp_path):
+    """A read that came back X part-way through a run is ordinary — the memory
+    was not ready yet — and it must not cost the whole table.
+
+    The column type used to be decided from the *first* value, so a column that
+    started with integers and later carried four-state digits was declared
+    numeric and then failed to write, and §6.3's export was silently skipped for
+    that interface. One four-state value makes the column text; the integers
+    alongside render into it losslessly.
+
+    Found by running on a real CPU: none of the reference designs has a bus that
+    goes unknown mid-run.
+    """
+    from veritrace._native import read_txn_table, write_txn_table
+
+    path = tmp_path / "mixed.parquet"
+    write_txn_table(
+        str(path),
+        [
+            ("index", [0, 1, 2]),
+            ("rdata", [0x1234, "xxxxxxxx", 0x5678]),
+            ("bresp", [0, None, 2]),
+        ],
+    )
+    got = dict(read_txn_table(str(path)))
+    assert got["rdata"] == ["4660", "xxxxxxxx", "22136"]
+    # A column that is genuinely numeric is untouched by the rule.
+    assert got["bresp"] == [0, None, 2]
+
+
 # --- VTQ (§10.1) ------------------------------------------------------------
 
 

@@ -412,10 +412,22 @@ def test_absurd_pixel_width_is_clamped(big_vtx):
 
 
 @pytest.fixture
-def checks_client():
-    """A server on the checks design, with RTL — the real end-to-end shape."""
-    designs = Path(__file__).resolve().parents[1] / "designs" / "checks"
-    app = create_app(designs / "dump.vtx", rtl=[str(designs)])
+def checks_client(tmp_path):
+    """A server on the checks design, with RTL — the real end-to-end shape.
+
+    Converted into a copy rather than pointed at `designs/checks/dump.vtx`: a
+    store is a build product and is not committed, so the old form only ever
+    worked on a machine where an earlier run had left one lying about. It
+    passed locally and could not pass on a clean checkout, which is the worst
+    shape a test can be in.
+
+    The copy also isolates the sidecar these tests write — suppressions and
+    layout — so one of them cannot decide what the next one sees.
+    """
+    design = tmp_path / "checks"
+    shutil.copytree(DESIGNS / "checks", design)
+    convert(str(design / "dump.vcd"), str(design / "dump.vtx"))
+    app = create_app(design / "dump.vtx", rtl=[str(design)])
     with TestClient(app) as c:
         yield c, app.state.default_session_id
 

@@ -1,0 +1,11 @@
+
+ctrl   [mt48lc16m16a2]   4 banks   13 commands
+    ACTIVATE=7  PRECHARGE=3  READ=1  REFRESH=1  WRITE=1
+    ok  tFAW, tRAS, tRC, tRCD, tREFI, tRFC, tRP, tRRD, tRTP, tWR, tWTR: conformant
+    rows  0 hit / 4 miss / 3 conflict  (0% hit)
+    bus utilization 3.2%
+    refresh overhead 10.6%
+    read/write turnaround 23 cycles over 1 switches
+    bank parallelism 1.65 banks active on average
+    not checked: CL - needs a data-bus signal correlated to the command; this pack's [[command]] table declares none, so read/write latency cannot be measured
+    not checked: CWL - needs a data-bus signal correlated to the command; this pack's [[command]] table declares none, so read/write latency cannot be measured

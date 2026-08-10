@@ -122,8 +122,10 @@ jobs:
 
       - name: A protocol violation fails the build when asked
         run: |
-          uv run veritrace check designs/axi_lite/dump.vcd --rtl designs/axi_lite \
-            --fail-on protocol && { echo "the SLVERR responses were not caught"; exit 1; }
+          if uv run veritrace check designs/axi_lite/dump.vcd --rtl designs/axi_lite \
+               --fail-on protocol; then
+            echo "the SLVERR responses were not caught"; exit 1
+          fi
           uv run veritrace check designs/axi_lite/dump.vcd --rtl designs/axi_lite | grep -q PROTOCOL
 
       # §8.17's acceptance criterion. The shares are printed so a reader can
@@ -142,8 +144,9 @@ jobs:
           # `other` is only printed when it is non-zero, and a non-zero `other`
           # means the shipped cascade has a gap. Anchored, so the word appearing
           # in some future message does not fail the build.
-          grep -qE "^      other " perf.txt \
-            && { echo "the cascade left cycles unattributed"; exit 1; }
+          if grep -qE "^      other " perf.txt; then
+            echo "the cascade left cycles unattributed"; exit 1
+          fi
           uv run veritrace perf designs/axi_arb/dump.vcd --rtl designs/axi_arb \
             "stalls(m0)" > /dev/null
 
@@ -161,8 +164,10 @@ jobs:
             | tee ok.txt
           grep -q "no deadlock, livelock or starvation found" ok.txt
           # And it is a finding, not a separate kind of news (§11.4).
-          uv run veritrace check designs/deadlock/dump.vcd --rtl designs/deadlock \
-            --fail-on deadlock && { echo "the deadlock did not fail the build"; exit 1; }
+          if uv run veritrace check designs/deadlock/dump.vcd --rtl designs/deadlock \
+               --fail-on deadlock; then
+            echo "the deadlock did not fail the build"; exit 1
+          fi
 
       # §8.20's acceptance criterion, both halves. Four timing violations, one
       # per category, each with its exact cycle — and none at all on the same
@@ -178,11 +183,14 @@ jobs:
           # Constraints that held are stated, not merely absent.
           grep -q "conformant" mem.txt
           uv run veritrace memory designs/sdram/dump_ok.vcd | tee memok.txt
-          grep -q "violated" memok.txt && { echo "a clean run reported a violation"; exit 1; }
+          if grep -q "violated" memok.txt; then
+            echo "a clean run reported a violation"; exit 1
+          fi
           uv run veritrace memory designs/sdram/dump.vcd "banks(ctrl)" > /dev/null
           # And it fails the build when asked (§13.9).
-          uv run veritrace check designs/sdram/dump.vcd --fail-on memory \
-            && { echo "the timing violations did not fail the build"; exit 1; }
+          if uv run veritrace check designs/sdram/dump.vcd --fail-on memory; then
+            echo "the timing violations did not fail the build"; exit 1
+          fi
 
       # §8.19's acceptance criterion, both halves. The byte-enable bug is a
       # compile-time define, so the two dumps come from one source and "no
@@ -199,10 +207,13 @@ jobs:
           grep -q "path dma.s_axi -> mem: 8 write(s) matched" dma.txt
           uv run veritrace track designs/dma/dump_ok.vcd | tee dmaok.txt
           grep -q "every read matched what was written" dmaok.txt
-          grep -q "mismatch" dmaok.txt && { echo "a clean run reported corruption"; exit 1; }
+          if grep -q "mismatch" dmaok.txt; then
+            echo "a clean run reported corruption"; exit 1
+          fi
           uv run veritrace track designs/dma/dump.vcd "track(addr=0x0)" > /dev/null
-          uv run veritrace check designs/dma/dump.vcd --fail-on integrity \
-            && { echo "the corruption did not fail the build"; exit 1; }
+          if uv run veritrace check designs/dma/dump.vcd --fail-on integrity; then
+            echo "the corruption did not fail the build"; exit 1
+          fi
 
       # §8.21's acceptance criterion: the matrix shows the *right* empty cells.
       # Every one asserted here is a fact about designs/axi_lite's master —
@@ -353,7 +364,7 @@ jobs:
           # The control runs: TAB 9's and TAB 7's tests need the same RTL
           # without the bug, so that "none found" is checkable in the browser
           # too and not only on the command line.
-          for d in deadlock dma; do
+          for d in deadlock sdram dma; do
             uv run veritrace convert designs/$d/dump_ok.vcd -o designs/$d/dump_ok.vtx
           done
 
