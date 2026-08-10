@@ -732,5 +732,5 @@ make bench       # the tier-A budget
 make designs     # re-simulate every reference design
 ```
 
-**686 tests**: 71 Rust, 507 Python, 38 Vitest, 70 Playwright — with the
+**688 tests**: 71 Rust, 509 Python, 38 Vitest, 70 Playwright — with the
 acceptance criterion of each stage tested rather than asserted.

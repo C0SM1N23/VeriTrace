@@ -1,7 +1,7 @@
 # Instalare si prima rulare
 
-De la zero pana la aplicatia pornita pe designul tau. Pentru comenzile de zi cu
-zi, [ruleaza.md](../ruleaza.md).
+De la zero pana la aplicatia pornita pe designul tau. Pentru referinta completa
+de comenzi, [README.md](../README.md).
 
 ---
 
