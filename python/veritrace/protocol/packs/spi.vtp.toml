@@ -1,0 +1,65 @@
+name    = "SPI"
+version = "1.0"
+
+# §8.15's serial row. Like the UART pack, this reads the *word-level* interface
+# a controller exposes rather than reconstructing frames from `sclk`/`mosi`: a
+# tool that re-implements the shift register disagrees with the design on
+# precisely the clock-polarity bugs somebody opened it to find.
+#
+# `cs_n` is carried as payload so a transaction knows which slave it addressed,
+# and the stall cascade can tell a controller waiting for the bus from one that
+# nobody asked anything of.
+
+[detect]
+required_suffixes = ["spi_start", "spi_busy", "spi_tx", "spi_rx"]
+prefix_strip      = ["spi_ctrl_", "spi_", ""]
+clock             = "clk|clock|.*_clk"
+reset             = "rst_n|resetn|rst|reset|.*_rst_n"
+
+[[channel]]
+name  = "W"
+valid = "spi_start"
+ready = "!spi_busy"
+payload = ["spi_tx", "cs_n", "spi_cpol", "spi_cpha"]
+
+[[channel]]
+name  = "R"
+valid = "spi_done"
+payload = ["spi_rx"]
+
+[[transaction]]
+name  = "XFER"
+start = "W"
+end   = { channel = "R" }
+key   = "tx = W.spi_tx"
+
+[metrics]
+latency = "end.cycle - start.cycle"
+
+[perf]
+transfer = ["W"]
+data     = "spi_tx"
+
+[[stall_reason]]
+name = "controller_busy"
+when = "spi_start && spi_busy"
+msg  = "a word was offered while the controller was still shifting the last one"
+
+[[stall_reason]]
+name = "shifting"
+when = "spi_busy"
+msg  = "the controller was shifting a word out"
+
+[[stall_reason]]
+name = "idle"
+when = "!spi_start && !spi_busy"
+msg  = "no transfer was requested"
+
+[integrity]
+write = { kind = "XFER", data = "spi_tx" }
+
+[[rule]]
+id       = "SPI_NO_OVERRUN"
+severity = "error"
+check    = "spi_start |-> !spi_busy"
+msg      = "a word was started while the controller was busy — it will be lost"

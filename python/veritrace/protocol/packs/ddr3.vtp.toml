@@ -1,0 +1,72 @@
+name    = "DDR3"
+version = "1.0"
+
+# §8.15: "DDR3 command bus + timing". Same shape as `sdram.vtp` — a command bus
+# has no backpressure, so `[[channel]]` and `[[transaction]]` do not apply and
+# `[[command]]` is the whole vocabulary — with the three differences DDR3
+# actually has:
+#
+#   * **CKE gates everything.** With CKE low the part is in power-down and the
+#     command pins mean nothing. It is in every `encode` below, so a controller
+#     that parks the bus does not read as a stream of phantom commands.
+#   * **RESET# exists**, unlike SDR SDRAM, and is a real pin rather than a
+#     convention.
+#   * **Three bank bits** (eight banks) and a wider row address.
+#
+# The command truth table is JEDEC JESD79-3, and the encodings are identical to
+# SDR's for the four commands they share — which is why the two packs look alike
+# and why a controller written for one is usually debugged against the other.
+
+[detect]
+required_suffixes = ["cs_n", "ras_n", "cas_n", "we_n", "cke", "ba", "a"]
+prefix_strip      = ["*", "ddr3_", "ddr_", ""]
+clock             = "clk|ck|clock|.*_clk"
+reset             = "reset_n|rst_n|resetn|.*_reset_n"
+
+[[command]]
+name   = "ACTIVATE"
+encode = { cke = 1, cs_n = 0, ras_n = 0, cas_n = 1, we_n = 1 }
+args   = { bank = "ba", row = "a" }
+
+[[command]]
+name   = "READ"
+# a[10] is auto-precharge, the same bit position every generation has used.
+encode = { cke = 1, cs_n = 0, ras_n = 1, cas_n = 0, we_n = 1 }
+args   = { bank = "ba", col = "a[9:0]", ap = "a[10]" }
+
+[[command]]
+name   = "WRITE"
+encode = { cke = 1, cs_n = 0, ras_n = 1, cas_n = 0, we_n = 0 }
+args   = { bank = "ba", col = "a[9:0]", ap = "a[10]" }
+
+[[command]]
+name   = "PRECHARGE"
+# a[10] set means all banks, not auto-precharge — the datasheet reuses the bit.
+encode = { cke = 1, cs_n = 0, ras_n = 0, cas_n = 1, we_n = 0 }
+args   = { bank = "ba", all = "a[10]" }
+
+[[command]]
+name   = "REFRESH"
+encode = { cke = 1, cs_n = 0, ras_n = 0, cas_n = 0, we_n = 1 }
+
+[[command]]
+name   = "LOAD_MODE"
+encode = { cke = 1, cs_n = 0, ras_n = 0, cas_n = 0, we_n = 0 }
+args   = { reg = "ba", value = "a" }
+
+# ZQ calibration: DDR3 only, and distinguishable from PRECHARGE by a[10] — the
+# same pin the two PRECHARGE forms use. Listed after PRECHARGE deliberately;
+# the cascade takes the first match and this is the more specific reading.
+[[command]]
+name   = "ZQ_CALIBRATE"
+encode = { cke = 1, cs_n = 0, ras_n = 1, cas_n = 1, we_n = 0 }
+args   = { long = "a[10]" }
+
+# How a linear address is split. The usual bank-interleaved map for a 1 Gbit
+# x16 part: 3 bank bits, 13 row bits, 10 column bits. A project whose controller
+# maps differently drops its own pack in `packs/` — §13.7's first extension
+# point, and one file.
+[address_map]
+col  = "addr[9:0]"
+bank = "addr[12:10]"
+row   = "addr[25:13]"

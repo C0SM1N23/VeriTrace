@@ -177,7 +177,7 @@ def icarus(
     # The run directory and every directory a source came from, as include
     # paths. A `.vh` next to the file that includes it is the overwhelmingly
     # common case, and `+incdir+.` is what every hand-written flow adds anyway.
-    for d in _include_path(here, verilog, incdirs or []):
+    for d in include_path(here, verilog, incdirs or []):
         build += ["-I", str(d)]
     for d in defines or []:
         build += [f"-D{d}"]
@@ -274,8 +274,13 @@ def read_filelist(path: Path, seen: set[Path] | None = None) -> tuple[list[Path]
     return files, incdirs, defines
 
 
-def _include_path(here: Path, sources: list[Path], extra: list[str]) -> list[Path]:
-    """Where to look for ``include`, nearest first and without duplicates."""
+def include_path(here: Path, sources: list[Path], extra: list[str]) -> list[Path]:
+    """Where to look for ``include`, nearest first and without duplicates.
+
+    Public because §8.3's generated testbench is compiled against the same
+    sources by the same rules; two answers to "where are the headers" is how a
+    repro fails to build on a design that simulates fine.
+    """
     out: list[Path] = [Path(d).resolve() for d in extra]
     for d in [here] + [s.parent for s in sources]:
         if d not in out:

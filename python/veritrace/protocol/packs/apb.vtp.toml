@@ -1,0 +1,114 @@
+name    = "APB"
+version = "1.0"
+
+# §8.15: "periferice". APB is the simplest bus in the table and the one where
+# the generic engine has to be read carefully, because **APB has no
+# valid/ready pair**. Its handshake is two phases:
+#
+#   SETUP  psel &&  penable==0    address and control presented
+#   ACCESS psel &&  penable==1    held until pready goes high
+#
+# The engine's `[[channel]]` is "an event happens when `valid && ready`", so the
+# mapping is: `valid = psel && penable`, `ready = pready`. That is exactly the
+# cycle the transfer completes on, which is what a transaction needs. The setup
+# phase is not lost — `psel && !penable` is where the address is sampled, and
+# the stall cascade below names it, so a slave that is slow to answer and a
+# master that is slow to ask are still different findings.
+#
+# APB3 added `pready` and `pslverr`; APB2 has neither. Both are required here on
+# purpose: without `pready` there is no completion event to key a transaction
+# on, and a pack that pretended otherwise would report every access as taking
+# exactly one cycle.
+
+[detect]
+required_suffixes = ["psel", "penable", "pwrite", "paddr", "pready"]
+prefix_strip      = ["m_apb_", "s_apb_", "apb_", "m_", "s_", ""]
+clock             = "pclk|clk|.*_pclk|.*_clk"
+reset             = "presetn|preset_n|rst_n|resetn|.*_presetn|.*_rst_n"
+
+[[channel]]
+name  = "P"
+# The access phase, completed. `psel && penable` is the master saying "still
+# asking"; `pready` is the slave saying "answered".
+valid = "psel && penable"
+ready = "pready"
+payload = ["paddr", "pwrite", "pwdata", "prdata", "pstrb", "pprot", "pslverr"]
+
+# One transaction per completed access. APB is strictly one transfer at a time —
+# no ids, no outstanding, no bursts — so there is nothing to match on.
+[[transaction]]
+name  = "WRITE"
+start = "P"
+key   = "addr = P.paddr"
+
+[metrics]
+latency      = "end.cycle - start.cycle"
+wait_states  = "sum(stall)"
+
+[perf]
+transfer = ["P"]
+data     = "pwdata"
+strobe   = "pstrb"
+
+# Priority order. Setup first, because a bus sitting in setup is a master that
+# has not committed yet, and that is a different problem from a slave that will
+# not answer.
+[[stall_reason]]
+name = "setup_phase"
+when = "psel && !penable"
+msg  = "the access was in its setup phase: the address was presented, penable not yet asserted"
+
+[[stall_reason]]
+name = "wait_states"
+when = "psel && penable && !pready"
+msg  = "the slave was inserting wait states"
+
+[[stall_reason]]
+name = "idle"
+when = "!psel"
+msg  = "no peripheral was selected"
+
+[integrity]
+addr  = "addr"
+write = { kind = "WRITE", data = "pwdata", strobe = "pstrb" }
+
+[[cover]]
+field = "pwrite"
+bins  = { READ = 0, WRITE = 1 }
+
+[[cover]]
+field = "pslverr"
+bins  = { OKAY = 0, ERROR = 1 }
+
+[[cover]]
+corner = "zero_wait"
+when   = "wait_states == 0"
+msg    = "an access the slave answered with no wait states"
+
+[[cover]]
+sequence = "kind"
+
+# What the APB specification actually mandates during ACCESS.
+[[rule]]
+id       = "APB_ADDR_STABLE"
+severity = "error"
+check    = "psel && penable && !pready |=> $stable(paddr)"
+msg      = "paddr changed during the access phase, before pready"
+
+[[rule]]
+id       = "APB_WRITE_STABLE"
+severity = "error"
+check    = "psel && penable && !pready |=> $stable(pwrite)"
+msg      = "pwrite changed during the access phase, before pready"
+
+[[rule]]
+id       = "APB_ENABLE_HELD"
+severity = "error"
+check    = "psel && penable && !pready |=> penable"
+msg      = "penable was withdrawn before the slave asserted pready"
+
+[[rule]]
+id       = "APB_SLVERR"
+severity = "warn"
+check    = "pslverr == 0"
+msg      = "the peripheral answered with pslverr"

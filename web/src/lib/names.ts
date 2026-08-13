@@ -12,14 +12,19 @@
  * anything that collides grows leftwards, one scope at a time, until it is not
  * ambiguous any more. A single-interface design is unaffected; a design where
  * the distinction matters gets exactly as much path as the distinction needs.
+ *
+ * The separator is a parameter because the same problem turns up with file
+ * paths: every design in a project dumps to `dump.vtx`, so the Diff tab's trace
+ * picker offers a column of identical labels for completely different runs. Same
+ * question, same answer — grow the path until it distinguishes.
  */
 
 /** How many segments a label may grow to before it is elided in the middle. */
 const MAX_SEGMENTS = 3;
 
-function tail(path: string, n: number): string {
-  const parts = path.split(".");
-  return parts.slice(Math.max(0, parts.length - n)).join(".");
+function tail(path: string, n: number, sep: string): string {
+  const parts = path.split(sep);
+  return parts.slice(Math.max(0, parts.length - n)).join(sep);
 }
 
 /**
@@ -28,21 +33,21 @@ function tail(path: string, n: number): string {
  * Paths that are genuinely equal share a label: they are the same signal listed
  * twice, and inventing a difference would be a lie about the design.
  */
-export function shortLabels(paths: string[]): Map<string, string> {
+export function shortLabels(paths: string[], sep = "."): Map<string, string> {
   const out = new Map<string, string>();
   const unique = [...new Set(paths)];
 
   for (const path of unique) {
-    const depth = path.split(".").length;
-    let label = tail(path, 1);
+    const depth = path.split(sep).length;
+    let label = tail(path, 1, sep);
     // Grow only against the paths it actually collides with, so one deep
     // hierarchy elsewhere in the list cannot lengthen everything.
     for (let n = 1; n <= depth; n++) {
-      label = tail(path, n);
-      const clashes = unique.some((other) => other !== path && tail(other, n) === label);
+      label = tail(path, n, sep);
+      const clashes = unique.some((other) => other !== path && tail(other, n, sep) === label);
       if (!clashes) break;
     }
-    out.set(path, elide(label));
+    out.set(path, elide(label, sep));
   }
   return out;
 }
@@ -53,8 +58,8 @@ export function shortLabels(paths: string[]): Map<string, string> {
  * signal is and the first segment says which block it is in, and those are the
  * two parts a reader is using it for.
  */
-function elide(label: string): string {
-  const parts = label.split(".");
+function elide(label: string, sep = "."): string {
+  const parts = label.split(sep);
   if (parts.length <= MAX_SEGMENTS) return label;
-  return [parts[0], "…", ...parts.slice(-(MAX_SEGMENTS - 1))].join(".");
+  return [parts[0], "…", ...parts.slice(-(MAX_SEGMENTS - 1))].join(sep);
 }

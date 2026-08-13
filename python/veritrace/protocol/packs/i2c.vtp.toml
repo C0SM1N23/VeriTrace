@@ -1,0 +1,64 @@
+name    = "I2C"
+version = "1.0"
+
+# §8.15's serial row. Same decision as `uart.vtp` and `spi.vtp`: this reads the
+# controller's byte interface, not `scl`/`sda`. Recovering I2C from the two
+# open-drain lines means re-implementing arbitration, clock stretching and
+# start/stop detection — a second I2C controller, inside a debugger, disagreeing
+# with the first one on exactly the timing a bring-up session is about.
+#
+# What the pack does add, and what a scope cannot tell you at a glance: whether
+# each byte was acknowledged, and how long the slave stretched the clock.
+
+[detect]
+required_suffixes = ["i2c_start", "i2c_busy", "i2c_data", "i2c_ack"]
+prefix_strip      = ["i2c_ctrl_", "i2c_master_", "i2c_", ""]
+clock             = "clk|clock|.*_clk"
+reset             = "rst_n|resetn|rst|reset|.*_rst_n"
+
+[[channel]]
+name  = "B"
+valid = "i2c_start"
+ready = "!i2c_busy"
+payload = ["i2c_data", "i2c_addr", "i2c_rw", "i2c_ack"]
+
+[[transaction]]
+name  = "BYTE"
+start = "B"
+key   = "addr = B.i2c_addr"
+
+[metrics]
+latency = "end.cycle - start.cycle"
+
+[perf]
+transfer = ["B"]
+data     = "i2c_data"
+
+[[stall_reason]]
+name = "controller_busy"
+when = "i2c_start && i2c_busy"
+msg  = "a byte was offered while the controller was still on the bus"
+
+[[stall_reason]]
+name = "on_the_bus"
+when = "i2c_busy"
+msg  = "a byte was being clocked out, or the slave was stretching the clock"
+
+[[stall_reason]]
+name = "idle"
+when = "!i2c_start && !i2c_busy"
+msg  = "no transfer was requested"
+
+[[cover]]
+field = "i2c_rw"
+bins  = { WRITE = 0, READ = 1 }
+
+[[cover]]
+field = "i2c_ack"
+bins  = { NACK = 0, ACK = 1 }
+
+[[rule]]
+id       = "I2C_ACK"
+severity = "warn"
+check    = "i2c_ack == 1"
+msg      = "a byte was not acknowledged by the slave"

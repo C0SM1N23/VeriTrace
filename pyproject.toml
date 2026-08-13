@@ -23,6 +23,13 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "websockets>=12",
     "msgpack>=1.0",
+    # §12's bug report. A template engine rather than string concatenation
+    # because the report interleaves user data — signal names, source lines,
+    # simulator output — with markup, and Jinja2 escapes it by default. Hand-
+    # rolled f-strings would put an unescaped `<` from a `<=` in the RTL into
+    # the page and silently break every report that quotes a non-blocking
+    # assignment.
+    "jinja2>=3.1",
     # SystemVerilog front end. Needed for the *elaborated* AST — generate blocks
     # expanded and parameters resolved — which is what makes correlation
     # tractable (§4.1).
@@ -51,8 +58,13 @@ features = ["extension-module"]
 # their own line because the glob above does not recurse: without it a wheel
 # install would detect a memory interface and then refuse to check a single
 # timing constraint against it.
+#
+# `export/templates/*.j2` is §12's bug report. Without it `veritrace export`
+# raises TemplateNotFound on an installed wheel while working perfectly from a
+# checkout — the failure mode that only ever shows up for other people.
 include = [
     { path = "python/veritrace/web/**/*", format = "wheel" },
+    { path = "python/veritrace/export/templates/*.j2", format = "wheel" },
     { path = "python/veritrace/protocol/packs/*.toml", format = "wheel" },
     { path = "python/veritrace/protocol/packs/timing/*.toml", format = "wheel" },
 ]

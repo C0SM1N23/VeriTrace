@@ -11,19 +11,28 @@
 
 import { create } from "zustand";
 import {
+  // Aliased: the store exposes an action of the same name, and a function that
+  // shadows its own caller is a five-minute puzzle for no reason.
+  buildRepro as requestRepro,
+  downloadReport,
   fetchChecks,
+  fetchCommands,
+  fetchCoverage,
   fetchLayout,
+  fetchMachines,
+  fetchMemory,
+  fetchPerformance,
   fetchRoot,
+  fetchSessions,
   fetchSignals,
   fetchSource,
   fetchStatus,
+  fetchSubtrace,
   fetchTransactions,
   putLayout,
   runQuery,
-  fetchCommands,
-  fetchCoverage,
-  fetchMemory,
-  fetchPerformance,
+  // Same reason as `requestRepro`: the store action owns the name.
+  runDiff as runDiffRequest,
   runTxnQuery,
   suppressFinding,
   unsuppressFinding,
@@ -31,17 +40,22 @@ import {
 import type {
   CausalNode,
   ChecksReport,
+  CmdEvent,
+  CoverageReport,
+  DiffReport,
   Layout,
+  Machine,
+  MemoryReport,
+  OpenSession,
+  PerfReport,
   Radix,
+  Repro,
   Row,
   SessionStatus,
   SignalMeta,
   SourceFile,
+  SubtraceResult,
   Transaction,
-  CmdEvent,
-  CoverageReport,
-  MemoryReport,
-  PerfReport,
   TxnReport,
   WhyResult,
 } from "../lib/types";
@@ -90,6 +104,18 @@ export interface WaveState {
   causalError: string | null;
   causalBusy: boolean;
   activeNode: string | null;
+  // §8.2, §8.3, §11.5 — the minimised chain, the testbench, and the replay.
+  subtrace: SubtraceResult | null;
+  subtraceBusy: boolean;
+  subtraceError: string | null;
+  /** §11.5 is a mode, not a tab: it takes the screen or it is not there. */
+  replay: boolean;
+  /** 0-based index into `subtrace.steps`. */
+  replayStep: number;
+  replayPlaying: boolean;
+  repro: Repro | null;
+  reproBusy: boolean;
+  reproError: string | null;
   source: SourceFile | null;
   sourceBusy: boolean;
   checks: ChecksReport | null;
@@ -141,6 +167,29 @@ export interface WaveState {
   stashedLabel: string;
   /** What the current list is, when a click-through chose it. */
   focusLabel: string;
+  // §8.8 — a mode of Source, not a tab.
+  machines: Machine[];
+  fsmBusy: boolean;
+  fsmError: string | null;
+  /** True while the diagram has the Source tab. */
+  fsmOpen: boolean;
+  /** Which machine is on screen. */
+  fsmSignal: string | null;
+  /** Cycle the playback scrubber sits on, or `null` to follow the main cursor. */
+  fsmScrub: number | null;
+  // §8.7, TAB 5.
+  diff: DiffReport | null;
+  diffBusy: boolean;
+  diffError: string | null;
+  /** Traces this server has open, for the second-trace selector. */
+  diffSessions: OpenSession[];
+  /** Path of the run being compared against. */
+  diffOther: string;
+  diffStrategy: string;
+  /** §11.4: "ignore this signal" — globs excluded from the comparison. */
+  diffIgnore: string[];
+  /** Which divergence `n`/`p` are on. */
+  diffIndex: number;
   // §8.21 + §8.12, TAB 7.
   coverage: CoverageReport | null;
   coverageBusy: boolean;
@@ -186,6 +235,13 @@ export interface WaveState {
   openSource: (file: string, line?: number) => Promise<void>;
   selectCausal: (node: CausalNode) => void;
   clearCausal: () => void;
+  loadSubtrace: () => Promise<void>;
+  setReplay: (on: boolean) => void;
+  stepReplay: (delta: number) => void;
+  gotoReplay: (index: number) => void;
+  toggleReplayPlay: () => void;
+  buildRepro: (opts?: { mode?: string; validate?: boolean }) => Promise<void>;
+  exportReport: () => Promise<void>;
   loadChecks: () => Promise<void>;
   loadTransactions: () => Promise<void>;
   selectIface: (name: string) => Promise<void>;
@@ -202,6 +258,17 @@ export interface WaveState {
   focusRows: (rows: Row[], label: string) => void;
   /** Swap the current list with the one a click-through replaced. */
   swapRows: () => void;
+  loadMachines: () => Promise<void>;
+  setFsmOpen: (open: boolean) => void;
+  selectMachine: (signal: string) => void;
+  setFsmScrub: (cycle: number | null) => void;
+  loadDiffSessions: () => Promise<void>;
+  setDiffOther: (trace: string) => void;
+  setDiffStrategy: (s: string) => void;
+  runDiff: () => Promise<void>;
+  ignoreSignal: (path: string) => Promise<void>;
+  stepDivergence: (delta: number) => void;
+  gotoDivergence: (index: number) => void;
   loadCoverage: () => Promise<void>;
   selectCovIface: (name: string) => void;
   selectHole: (key: string | null) => void;
@@ -256,6 +323,26 @@ export async function flushPersist(): Promise<void> {
   await putLayout(s.session, layoutFrom(s)).catch(() => {});
 }
 
+/**
+ * State to clear when a new question is asked.
+ *
+ * The subtrace, the testbench and the replay position are all *answers to the
+ * previous question*. Leaving them on screen while a new chain loads is how a
+ * user ends up reading a repro for a bug they stopped looking at.
+ */
+function askingAgain(): Partial<WaveState> {
+  return {
+    causalError: null,
+    subtrace: null,
+    subtraceError: null,
+    repro: null,
+    reproError: null,
+    replay: false,
+    replayStep: 0,
+    replayPlaying: false,
+  };
+}
+
 function seedRows(signals: SignalMeta[]): Row[] {
   return signals
     .slice(0, SEED_ROWS)
@@ -293,6 +380,15 @@ export const useWave = create<WaveState>((set, get) => ({
   causalError: null,
   causalBusy: false,
   activeNode: null,
+  subtrace: null,
+  subtraceBusy: false,
+  subtraceError: null,
+  replay: false,
+  replayStep: 0,
+  replayPlaying: false,
+  repro: null,
+  reproBusy: false,
+  reproError: null,
   source: null,
   sourceBusy: false,
   checks: null,
@@ -317,6 +413,20 @@ export const useWave = create<WaveState>((set, get) => ({
   stashedRows: null,
   stashedLabel: "",
   focusLabel: "",
+  machines: [],
+  fsmBusy: false,
+  fsmError: null,
+  fsmOpen: false,
+  fsmSignal: null,
+  fsmScrub: null,
+  diff: null,
+  diffBusy: false,
+  diffError: null,
+  diffSessions: [],
+  diffOther: "",
+  diffStrategy: "cycle",
+  diffIgnore: [],
+  diffIndex: 0,
   coverage: null,
   coverageBusy: false,
   coverageError: null,
@@ -382,7 +492,10 @@ export const useWave = create<WaveState>((set, get) => ({
         ready: true,
         error: null,
       });
-      if (status.default_tab === "checks") void get().loadChecks();
+      // Always, not only on the Checks tab: §13.7's plugin tables arrive with
+      // the checks, and the tab strip cannot show them before they are here.
+      // The report is computed when the session opens, so this is one read.
+      void get().loadChecks();
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e), ready: false });
     }
@@ -506,7 +619,7 @@ export const useWave = create<WaveState>((set, get) => ({
   runWhy: async (signalPath, t) => {
     const s = get();
     if (!s.session) return;
-    set({ causalBusy: true, causalError: null, activeTab: 2, cursor: Math.round(t) });
+    set({ ...askingAgain(), causalBusy: true, activeTab: 2, cursor: Math.round(t) });
     try {
       const res = await runQuery(s.session, `why(${signalPath} @ ${Math.round(t)})`);
       set({ causal: res, causalBusy: false, activeNode: nodeId(res.root) });
@@ -562,7 +675,7 @@ export const useWave = create<WaveState>((set, get) => ({
   runQueryText: async (text) => {
     const s = get();
     if (!s.session) return;
-    set({ causalBusy: true, causalError: null, activeTab: 2 });
+    set({ ...askingAgain(), causalBusy: true, activeTab: 2 });
     try {
       const res = await runQuery(s.session, text);
       set({ causal: res, causalBusy: false, activeNode: nodeId(res.root), cursor: res.time });
@@ -576,7 +689,86 @@ export const useWave = create<WaveState>((set, get) => ({
     }
   },
 
-  clearCausal: () => set({ causal: null, causalError: null, activeNode: null }),
+  clearCausal: () =>
+    set({
+      causal: null,
+      causalError: null,
+      activeNode: null,
+      subtrace: null,
+      repro: null,
+      replay: false,
+    }),
+
+  // --- §8.2, §8.3, §11.5 — subtrace, repro, replay ---------------------
+
+  loadSubtrace: async () => {
+    const s = get();
+    if (!s.session || !s.causal || s.subtraceBusy) return;
+    set({ subtraceBusy: true, subtraceError: null });
+    try {
+      const got = await fetchSubtrace(s.session, s.causal.query);
+      set({ subtrace: got, subtraceBusy: false, replayStep: 0 });
+    } catch (e) {
+      set({ subtraceBusy: false, subtraceError: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  /**
+   * §11.5: entering replay parks the cursor on the first step, which is the
+   * root cause — the story runs forwards even though the chain was built
+   * backwards.
+   */
+  setReplay: (on) => {
+    set({ replay: on, replayPlaying: false });
+    if (on) {
+      if (!get().subtrace) void get().loadSubtrace();
+      else get().gotoReplay(0);
+    }
+  },
+
+  gotoReplay: (index) => {
+    const s = get();
+    const steps = s.subtrace?.steps ?? [];
+    if (!steps.length) return;
+    const i = Math.max(0, Math.min(index, steps.length - 1));
+    const step = steps[i];
+    set({ replayStep: i });
+    // §11.5: the waveform auto-windows around the event, ±8 cycles.
+    const span = (s.clockPeriod ?? Math.max(1, (s.bounds.t1 - s.bounds.t0) / 200)) * 8;
+    set({
+      cursor: step.time,
+      view: clampView({ t0: step.time - span, t1: step.time + span }, s.bounds),
+      sourceLoc: step.loc ? { file: step.loc.file, line: step.loc.line } : s.sourceLoc,
+      selected: s.signals.find((x) => x.path === step.signal)?.handle ?? s.selected,
+    });
+    if (step.loc) void get().openSource(step.loc.file, step.loc.line);
+  },
+
+  stepReplay: (delta) => get().gotoReplay(get().replayStep + delta),
+
+  toggleReplayPlay: () => set({ replayPlaying: !get().replayPlaying }),
+
+  buildRepro: async (opts = {}) => {
+    const s = get();
+    if (!s.session || !s.causal || s.reproBusy) return;
+    set({ reproBusy: true, reproError: null });
+    try {
+      const got = await requestRepro(s.session, s.causal.query, opts);
+      set({ repro: got, reproBusy: false });
+    } catch (e) {
+      set({ reproBusy: false, reproError: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  exportReport: async () => {
+    const s = get();
+    if (!s.session || !s.causal) return;
+    try {
+      await downloadReport(s.session, s.causal.query);
+    } catch (e) {
+      set({ reproError: e instanceof Error ? e.message : String(e) });
+    }
+  },
 
   // --- TAB 6, Checks (§11.4) ------------------------------------------
 
@@ -746,6 +938,116 @@ export const useWave = create<WaveState>((set, get) => ({
     });
     schedulePersist(get);
   },
+
+  // --- FSM mode (§8.8) — a mode of Source, not a tab -------------------
+
+  loadMachines: async () => {
+    const s = get();
+    if (!s.session || s.fsmBusy || s.machines.length) return;
+    set({ fsmBusy: true, fsmError: null });
+    try {
+      const machines = await fetchMachines(s.session);
+      set({
+        machines,
+        fsmBusy: false,
+        // Prefer the machine whose file is already open: the mode is entered
+        // from the source, so it should open on what is being read.
+        fsmSignal:
+          get().fsmSignal ??
+          machines.find((m) => m.loc?.file === get().source?.file)?.signal ??
+          machines[0]?.signal ??
+          null,
+      });
+    } catch (e) {
+      set({ fsmBusy: false, fsmError: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  setFsmOpen: (open) => {
+    set({ fsmOpen: open, activeTab: open ? 3 : get().activeTab });
+    if (open) void get().loadMachines();
+  },
+
+  selectMachine: (signal) => {
+    set({ fsmSignal: signal });
+    // §11.6: choosing a machine opens its declaration, like any other selection.
+    const m = get().machines.find((x) => x.signal === signal);
+    if (m?.loc) void get().openSource(m.loc.file, m.loc.line);
+  },
+
+  setFsmScrub: (cycle) => {
+    const s = get();
+    set({ fsmScrub: cycle });
+    if (cycle !== null && s.clockPeriod) {
+      // §8.8 step 6: scrubbing moves the shared cursor, so Wave and Source
+      // follow the state the diagram is lighting up.
+      set({ cursor: Math.round(s.clockOrigin + cycle * s.clockPeriod) });
+    }
+  },
+
+  // --- TAB 5, Diff (§8.7) ---------------------------------------------
+
+  loadDiffSessions: async () => {
+    try {
+      const open = await fetchSessions();
+      const s = get();
+      set({
+        diffSessions: open,
+        // Preselect the other trace the server already has open, when there is
+        // exactly one — the common case is `serve a.vtx` plus one more.
+        diffOther:
+          s.diffOther || open.find((x) => x.session_id !== s.session)?.trace || "",
+      });
+    } catch (e) {
+      set({ diffError: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  setDiffOther: (trace) => set({ diffOther: trace, diff: null, diffIndex: 0 }),
+  setDiffStrategy: (strategy) => set({ diffStrategy: strategy, diff: null, diffIndex: 0 }),
+
+  runDiff: async () => {
+    const s = get();
+    if (!s.session || !s.diffOther || s.diffBusy) return;
+    set({ diffBusy: true, diffError: null });
+    try {
+      const got = await runDiffRequest(s.session, s.diffOther, {
+        strategy: s.diffStrategy,
+        ignore: s.diffIgnore,
+      });
+      set({ diff: got, diffBusy: false, diffIndex: 0 });
+      if (got.divergences.length) get().gotoDivergence(0);
+    } catch (e) {
+      set({ diffBusy: false, diffError: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  /** §11.4: drop a signal that legitimately differs, and compare again. */
+  ignoreSignal: async (path) => {
+    if (get().diffIgnore.includes(path)) return;
+    set({ diffIgnore: [...get().diffIgnore, path] });
+    await get().runDiff();
+  },
+
+  gotoDivergence: (index) => {
+    const s = get();
+    const list = s.diff?.divergences ?? [];
+    if (!list.length) return;
+    const i = Math.max(0, Math.min(index, list.length - 1));
+    const d = list[i];
+    set({ diffIndex: i });
+    // §11.6: choosing a divergence moves every other panel to it, in *this*
+    // trace's own time — the shared axis is for comparing, not for navigating.
+    const span = (s.clockPeriod ?? Math.max(1, (s.bounds.t1 - s.bounds.t0) / 200)) * 8;
+    set({
+      cursor: d.time_a,
+      view: clampView({ t0: d.time_a - span, t1: d.time_a + span }, s.bounds),
+    });
+    const sig = s.signals.find((x) => x.path.endsWith(d.signal));
+    if (sig) set({ selected: sig.handle });
+  },
+
+  stepDivergence: (delta) => get().gotoDivergence(get().diffIndex + delta),
 
   // --- TAB 7, Coverage (§8.21, §8.12) ---------------------------------
 

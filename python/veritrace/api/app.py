@@ -6,6 +6,7 @@ message framing; it asks the trace store for values and never interprets them.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -19,16 +20,19 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from veritrace import __version__
 from veritrace._native import MAX_PX
 from veritrace.analysis import cone, params, vtq
-from veritrace.analysis.whytrace import WhyTracer
 from veritrace.api.search import hierarchy_level, search_signals, signal_json
 from veritrace.api.sessions import Session, SessionRegistry
+from veritrace.config import WORK_DIR
+
+#: Anything not safe in a downloaded filename.
+_IDENT = re.compile(r"[^A-Za-z0-9_.-]+")
 
 #: Emit a progress message every this many signals on a large wave request (P3:
 #: no mute spinner).
@@ -67,16 +71,6 @@ class SuppressBody(BaseModel):
     reason: str = Field(min_length=1)
 
 
-def _rtl_files(session: Session) -> list[str]:
-    """Every RTL file behind a session, expanded from what was passed in."""
-    from veritrace.graph.elaborate import discover
-
-    out: list[str] = []
-    for p in session.rtl_paths:
-        out.extend(str(f) for f in discover(p))
-    return out
-
-
 def _resolve_time(session: Session, q: "vtq.WhyQuery") -> int:
     """`@1247` is a timestamp; `@c1247` is the 1247th edge of the primary clock.
 
@@ -98,6 +92,76 @@ def _resolve_time(session: Session, q: "vtq.WhyQuery") -> int:
     if at is None:
         raise HTTPException(status_code=400, detail="the primary clock never rises")
     return at
+
+
+def _question(session: Session, text: str) -> tuple[str, int, str]:
+    """Reduce a query to `(signal, time, headline)` — §8.16's hop included.
+
+    `/query`, `/subtrace`, `/repro` and `/export` all ask the same thing of the
+    same session, and a second copy of this would be a second opinion about what
+    `@c1247` means or which signal a transaction question is really about.
+    """
+    if session.graph is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No RTL loaded. why() needs the design graph — start with --rtl.",
+        )
+    try:
+        q = vtq.parse(text)
+    except vtq.QueryError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    if q.txn is not None:
+        from veritrace.protocol import link as txn_link
+
+        if session.protocol is None or not session.protocol.extractions:
+            raise HTTPException(
+                status_code=409, detail="No protocol interfaces were detected in this trace."
+            )
+        try:
+            question = txn_link.question(
+                session.protocol, session.txn_index, session.store, session.clock, q.txn
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        return question.signal, question.time, question.headline
+
+    if session.graph.get(q.signal) is None:
+        raise HTTPException(status_code=404, detail=f"unknown signal: {q.signal}")
+    return q.signal, _resolve_time(session, q), ""
+
+
+def _subtrace_of(session: Session, text: str):
+    """§8.2's minimised, narrated chain for a question — the input to §11.5 and §12."""
+    from veritrace.repro import narrate, subtrace
+
+    signal, t, headline = _question(session, text)
+    result = session.why(signal, t)
+    sub = narrate.narrate(subtrace.minimise(result.root, session.store, session.clock))
+    return signal, t, headline, result, sub
+
+
+class ReproBody(BaseModel):
+    # `validate` is the word the API wants and a method pydantic already owns on
+    # BaseModel, so the field is named apart and aliased back.
+    model_config = {"populate_by_name": True}
+
+    vtq: str
+    #: `auto` lets §8.3's table decide, which is what the button does.
+    mode: str = Field(default="auto", pattern="^(auto|minimal|focused)$")
+    #: Compiling and running takes seconds, so the UI asks for it explicitly.
+    run_validation: bool = Field(default=True, alias="validate")
+
+
+class DiffBody(BaseModel):
+    """§8.7. The second trace is named by path; the first is the session's own."""
+
+    trace: str
+    strategy: str = Field(default="cycle", pattern="^(cycle|handshake|retire|manual)$")
+    anchor: str | None = None
+    #: §11.4's "ignore this signal", as globs. Counters and timestamps
+    #: legitimately differ between two runs.
+    ignore: list[str] = Field(default_factory=list)
 
 
 class LayoutBody(BaseModel):
@@ -171,9 +235,78 @@ def create_app(
             raise HTTPException(status_code=400, detail=f"cannot open trace: {e}") from e
         return {"session_id": session.session_id, **session.status()}
 
+    @api.get("/sessions")
+    def sessions() -> dict[str, Any]:
+        """Every trace this server has open — the trace picker of TAB 5 (§11.4).
+
+        One server can hold several sessions (§10.1); without a way to list them
+        the Diff tab would have no way to offer the second run except by making
+        the user retype a path they already opened.
+        """
+        return {
+            "sessions": [
+                {
+                    "session_id": s.session_id,
+                    "trace": str(s.trace_path),
+                    "name": s.trace_path.name,
+                    "has_rtl": s.graph is not None,
+                    "n_signals": s.store.n_signals,
+                    "default": s.session_id == app.state.default_session_id,
+                }
+                for s in registry.all()
+            ]
+        }
+
     @api.get("/session/{session_id}/status")
     def status(session_id: str) -> dict[str, Any]:
         return require(session_id).status()
+
+    @api.post("/session/{session_id}/diff")
+    def diff_route(session_id: str, body: DiffBody) -> dict[str, Any]:
+        """§8.7 — first divergence against another run, from this one's point of view.
+
+        The other trace is opened as a session of its own, so it is analysed by
+        exactly the same code as the first and stays open for the next question
+        about it. It inherits this session's RTL: two runs of one design are the
+        case §8.7 is for, and asking the user to name the sources twice would be
+        asking them to get it wrong once.
+        """
+        from veritrace import diff as diff_mod
+
+        session = require(session_id)
+        try:
+            other = registry.open(body.trace, session.rtl_paths, session.top)
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        except (ValueError, OSError) as e:
+            raise HTTPException(status_code=400, detail=f"cannot open trace: {e}") from e
+        if other.session_id == session.session_id:
+            raise HTTPException(status_code=400, detail="that is the same trace")
+
+        try:
+            alignment = diff_mod.align(
+                diff_mod.side(session.trace_path.name, session.store, session.clock),
+                diff_mod.side(other.trace_path.name, other.store, other.clock),
+                body.strategy,
+                protocol_a=session.protocol,
+                protocol_b=other.protocol,
+                signal=body.anchor,
+            )
+        except diff_mod.AlignError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+
+        patterns = list(body.ignore) + list(getattr(session.config, "ignore", []) or [])
+        report = diff_mod.compare(alignment, patterns)
+        report.txn_divergences = diff_mod.compare_transactions(
+            alignment, session.protocol, other.protocol
+        )
+        if report.first is not None and session.graph is not None:
+            diff_mod.explain(report, session.graph, other.graph)
+        return {
+            "a": {"session_id": session.session_id, "name": session.trace_path.name},
+            "b": {"session_id": other.session_id, "name": other.trace_path.name},
+            **report.to_dict(),
+        }
 
     @api.get("/session/{session_id}/hierarchy")
     def hierarchy(session_id: str, path: str | None = None) -> dict[str, Any]:
@@ -207,7 +340,7 @@ def create_app(
                 detail="No RTL loaded. Start the server with --rtl to read source.",
             )
         target = Path(file).name
-        match = next((Path(p) for p in _rtl_files(session) if Path(p).name == target), None)
+        match = next((p for p in session.rtl_files() if p.name == target), None)
         if match is None or not match.is_file():
             raise HTTPException(status_code=404, detail=f"no RTL file named {target!r}")
 
@@ -228,47 +361,109 @@ def create_app(
     def query(session_id: str, body: QueryBody) -> dict[str, Any]:
         """§10.1: `why(...)`, at signal or transaction level (§8.16)."""
         session = require(session_id)
-        if session.graph is None:
-            raise HTTPException(
-                status_code=409,
-                detail="No RTL loaded. why() needs the design graph — start with --rtl.",
-            )
-        try:
-            q = vtq.parse(body.vtq)
-        except vtq.QueryError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-
-        headline = ""
-        if q.txn is not None:
-            from veritrace.protocol import link as txn_link
-
-            if session.protocol is None or not session.protocol.extractions:
-                raise HTTPException(
-                    status_code=409,
-                    detail="No protocol interfaces were detected in this trace.",
-                )
-            try:
-                question = txn_link.question(
-                    session.protocol, session.txn_index, session.store, session.clock, q.txn
-                )
-            except ValueError as e:
-                raise HTTPException(status_code=404, detail=str(e)) from e
-            signal, t, headline = question.signal, question.time, question.headline
-        else:
-            signal = q.signal
-            if session.graph.get(signal) is None:
-                raise HTTPException(status_code=404, detail=f"unknown signal: {signal}")
-            t = _resolve_time(session, q)
-
-        tracer = WhyTracer(session.graph, session.store, txn_index=session.txn_index)
-        result = tracer.why(signal, t)
+        signal, t, headline = _question(session, body.vtq)
         return {
             "query": body.vtq,
             "signal": signal,
             "time": t,
             "headline": headline,
-            **result.to_dict(),
+            **session.why(signal, t).to_dict(),
         }
+
+    @api.post("/session/{session_id}/subtrace")
+    def subtrace_route(session_id: str, body: QueryBody) -> dict[str, Any]:
+        """§8.2's minimal subtrace, narrated — the steps Replay mode walks (§11.5).
+
+        Separate from `/query` rather than folded into it: the tree is what the
+        Causal tab draws and the subtrace is what the story is told from, and
+        most `why()` calls never ask for the second.
+        """
+        from veritrace.repro import narrate
+
+        session = require(session_id)
+        signal, t, headline, _result, sub = _subtrace_of(session, body.vtq)
+        return {
+            "query": body.vtq,
+            "signal": signal,
+            "time": t,
+            "headline": headline,
+            "title": narrate.headline(sub),
+            "symptom": narrate.symptom_paragraph(sub, body.vtq),
+            "steps": narrate.steps(sub),
+            **sub.to_dict(),
+        }
+
+    @api.post("/session/{session_id}/repro")
+    def repro_route(session_id: str, body: ReproBody) -> dict[str, Any]:
+        """§8.3's testbench, and — unless asked not to — the run that proves it."""
+        from veritrace.repro import testbench
+
+        session = require(session_id)
+        _signal, _t, _headline, result, sub = _subtrace_of(session, body.vtq)
+        sources = session.rtl_files()
+        try:
+            built = testbench.build(
+                sub,
+                session.graph,
+                session.store,
+                session.clock,
+                session.elaboration,
+                root=result.root,
+                sources=sources,
+                work=session.trace_path.parent / WORK_DIR / "repro",
+                validate_it=body.run_validation and bool(sources),
+                mode=None if body.mode == "auto" else body.mode,
+            )
+        except testbench.ReproError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        return {"query": body.vtq, **built.to_dict()}
+
+    @api.post("/session/{session_id}/export")
+    def export_route(session_id: str, body: ReproBody) -> HTMLResponse:
+        """§12's report, which §11.5 makes the export button of Replay mode."""
+        from veritrace.api.sessions import sha256_files
+        from veritrace.export import report as report_mod
+        from veritrace.repro import testbench
+
+        session = require(session_id)
+        _signal, _t, headline, result, sub = _subtrace_of(session, body.vtq)
+        sources = session.rtl_files()
+        built = None
+        try:
+            built = testbench.build(
+                sub,
+                session.graph,
+                session.store,
+                session.clock,
+                session.elaboration,
+                root=result.root,
+                sources=sources,
+                work=session.trace_path.parent / WORK_DIR / "repro",
+                validate_it=body.run_validation and bool(sources),
+                mode=None if body.mode == "auto" else body.mode,
+            )
+        except testbench.ReproError:
+            # One of §12's seven sections. The other six still stand.
+            pass
+
+        page = report_mod.build(
+            result.root,
+            sub,
+            session.store,
+            session.clock,
+            query=headline or body.vtq,
+            sources={p.name: p for p in sources},
+            repro=built,
+            findings=session.report,
+            trace_path=session.trace_path,
+            rtl_sha256=session.rtl_sha256 or (sha256_files(sources) if sources else None),
+            top=getattr(session.graph, "top", "") or "",
+        )
+        name = _IDENT.sub("_", page.title) or "bug_report"
+        return HTMLResponse(
+            page.html,
+            headers={"Content-Disposition": f'attachment; filename="{name}.html"'},
+        )
 
     @api.get("/session/{session_id}/transactions")
     def transactions(session_id: str) -> dict[str, Any]:
@@ -441,6 +636,48 @@ def create_app(
     @api.delete("/session/{session_id}/checks/{finding_id}/suppress")
     def unsuppress(session_id: str, finding_id: str) -> dict[str, Any]:
         return {"suppressed": require(session_id).unsuppress(finding_id)}
+
+    @api.get("/session/{session_id}/fsm")
+    def fsm_route(session_id: str) -> dict[str, Any]:
+        """§8.8's machines, with the overlay when there is a trace — the FSM mode.
+
+        A mode of the Source tab (§11.4), not a tab: the diagram is a view of the
+        structure of the code, so it is served beside the code rather than as a
+        domain of its own.
+        """
+        from veritrace.analysis import fsm as fsm_mod
+
+        session = require(session_id)
+        if session.graph is None:
+            raise HTTPException(
+                status_code=409,
+                detail="No RTL loaded. FSM extraction reads the design graph — start with --rtl.",
+            )
+        machines = fsm_mod.extract(session.graph, session.elaboration, session.store)
+        for m in machines:
+            fsm_mod.overlay(m, session.store, session.graph, session.clock)
+        return {"machines": [m.to_dict() for m in machines]}
+
+    @api.get("/session/{session_id}/fsm/{signal}/svg")
+    def fsm_svg(session_id: str, signal: str) -> HTMLResponse:
+        """"Export SVG" from the FSM mode (§8.8) — for documentation and READMEs."""
+        from veritrace.analysis import fsm as fsm_mod
+        from veritrace.export import fsmsvg
+
+        session = require(session_id)
+        if session.graph is None:
+            raise HTTPException(status_code=409, detail="No RTL loaded.")
+        machines = fsm_mod.extract(session.graph, session.elaboration, session.store)
+        machine = fsm_mod.find(machines, signal)
+        if machine is None:
+            raise HTTPException(status_code=404, detail=f"no state machine on {signal}")
+        fsm_mod.overlay(machine, session.store, session.graph, session.clock)
+        name = _IDENT.sub("_", machine.signal)
+        return HTMLResponse(
+            fsmsvg.render(machine),
+            media_type="image/svg+xml",
+            headers={"Content-Disposition": f'attachment; filename="{name}.svg"'},
+        )
 
     @api.get("/session/{session_id}/cone")
     def cone_route(

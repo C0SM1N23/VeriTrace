@@ -32,6 +32,7 @@ from typing import Any, Sequence
 from veritrace.perf.model import OTHER, OUTSTANDING_CAP, RESET, TRANSFER, CyclePerf
 from veritrace.protocol import expr
 from veritrace.protocol.assemble import CycleEnv
+from veritrace.protocol import channels
 from veritrace.protocol.channels import ChannelScan, Sampler
 from veritrace.protocol.model import Interface, Transaction
 
@@ -84,8 +85,12 @@ def _aggregate(
         cols.append(
             (
                 name in useful,
-                sampler.column(iface.signals.get(ch.valid)),
-                sampler.column(iface.signals.get(ch.ready)) if ch.ready else None,
+                # `gate`, not `column`: a protocol with no valid/ready pair
+                # spells its handshake as an expression, and the cascade has to
+                # read it the same way the channel scan does or the two disagree
+                # about which cycles transferred.
+                channels.gate(iface, ch.valid, sampler),
+                channels.gate(iface, ch.ready, sampler) if ch.ready else None,
             )
         )
     for i in range(n):

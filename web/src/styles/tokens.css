@@ -47,6 +47,10 @@
   --fs-chrome: 12px;
   --lh-data: 1.35;
 
+  /* §11.5: how much of the waveform stays visible under Replay mode. Enough to
+   * read the ±8-cycle window the step auto-scrolls to, not enough to browse. */
+  --replay-wave-h: 220px;
+
   --hierarchy-w: 240px;
   --inspector-w: 300px;
 }

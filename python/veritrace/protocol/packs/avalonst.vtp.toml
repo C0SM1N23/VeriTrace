@@ -1,0 +1,88 @@
+name    = "Avalon-ST"
+version = "1.0"
+
+# The streaming half of §8.15's Avalon row. Same relationship to Avalon-MM as
+# AXI4-Stream has to AXI4: one direction, no addresses, and `startofpacket` /
+# `endofpacket` marking where a packet begins and ends.
+#
+# Avalon-ST's backpressure *is* a ready signal — unlike Avalon-MM's inverted
+# `waitrequest` — so this pack needs no expression at all.
+
+[detect]
+required_suffixes = ["valid", "ready", "data"]
+# Anchored on `startofpacket`/`endofpacket` through `prefix_strip = ["*"]` would
+# be wrong: those are optional. Instead the pack is ranked below the more
+# specific ones by the usual specificity rule, and above bare handshake.vtp
+# because it asks for `data` as well.
+prefix_strip      = ["aso_", "asi_", "st_", "avalon_st_", "*", ""]
+clock             = "clk|clock|.*_clk"
+reset             = "reset_n|resetn|rst_n|reset|.*_reset_n|.*_rst_n"
+
+[[channel]]
+name    = "ST"
+valid   = "valid"
+ready   = "ready"
+payload = ["data", "startofpacket", "endofpacket", "empty", "channel", "error"]
+
+[[transaction]]
+name  = "PACKET"
+start = "ST"
+body  = { channel = "ST", terminator = "endofpacket" }
+key   = "channel = ST.channel"
+
+[[transaction]]
+name  = "BEAT"
+start = "ST"
+
+[metrics]
+latency      = "end.cycle - start.cycle"
+beats        = "count(ST)"
+stall_cycles = "sum(stall)"
+
+[perf]
+transfer = ["ST"]
+data     = "data"
+
+[[stall_reason]]
+name = "backpressure"
+when = "valid && !ready"
+msg  = "the sink was not accepting"
+
+[[stall_reason]]
+name = "starvation"
+when = "!valid && ready"
+msg  = "the sink was ready and the source had nothing to send"
+
+[[stall_reason]]
+name = "idle"
+when = "!valid && !ready"
+msg  = "no beat was offered and no sink was ready"
+
+[integrity]
+write = { kind = "BEAT", data = "data" }
+
+[[cover]]
+field = "endofpacket"
+bins  = { CONTINUE = 0, END = 1 }
+
+[[cover]]
+corner = "single_beat_packet"
+when   = "beats == 1"
+msg    = "a packet that was one beat long"
+
+[[cover]]
+corner = "error_flagged"
+when   = "error != 0"
+msg    = "a beat the source marked as an error"
+
+[[rule]]
+id       = "AVST_NODROP"
+severity = "error"
+check    = "valid && !ready |=> valid"
+msg      = "valid was withdrawn before ready"
+
+[[rule]]
+id       = "AVST_DATA_STABLE"
+severity = "error"
+check    = "valid && !ready |=> $stable(data)"
+msg      = "the payload changed while the beat was waiting to be accepted"

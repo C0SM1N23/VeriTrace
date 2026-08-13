@@ -609,9 +609,14 @@ select:focus-visible {
   font-size: 11px;
 }
 
-.spine {
-  padding: 12px 16px 40px;
+.causal-body {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
+}
+
+.spine {
+  padding: 12px 16px 24px;
 }
 
 .card-wrap {
@@ -1182,6 +1187,653 @@ select:focus-visible {
 }
 
 /* §8.16: the node in a causal chain that is about a transaction, not a signal. */
+/* --- FSM mode (§8.8, a mode of the Source tab per §11.4) ----------------- */
+
+.fsm {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.fsm-head {
+  display: flex;
+  align-items: center;
+  gap: var(--gutter);
+  padding: 6px var(--gutter);
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+
+.fsm-head .chip {
+  text-decoration: none;
+}
+
+.fsm-canvas {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+}
+
+.fsm-svg {
+  width: 100%;
+  height: 100%;
+  min-height: 320px;
+}
+
+.fsm-node rect {
+  fill: var(--bg-raised);
+  stroke: var(--text-dim);
+  stroke-width: 1.5;
+}
+
+.fsm-node.reset rect {
+  stroke: var(--text-bright);
+  stroke-width: 2.5;
+}
+
+/* §8.8: a state the run never entered, as a dotted red outline. Red is a logic
+ * state elsewhere in the palette (§11.2) and means "wrong" here too. */
+.fsm-node.unvisited rect {
+  fill: none;
+  stroke: var(--sig-x);
+  stroke-dasharray: 4 3;
+}
+
+/* Amber for the state the scrubber is on: it is the causal reading of the
+ * timeline — "this is where the machine was then". */
+.fsm-node.current rect {
+  stroke: var(--causal);
+  stroke-width: 2.5;
+}
+
+.fsm-node-name {
+  fill: var(--text-bright);
+  font-family: var(--font-data);
+  font-size: 12px;
+  font-weight: 600;
+  text-anchor: middle;
+}
+
+.fsm-node-sub {
+  fill: var(--text-dim);
+  font-family: var(--font-data);
+  font-size: 9px;
+  text-anchor: middle;
+}
+
+.fsm-edge path {
+  fill: none;
+  stroke: var(--text-dim);
+  stroke-width: 1.4;
+  marker-end: url(#fsm-arrow);
+}
+
+.fsm-edge text {
+  fill: var(--text-dim);
+  font-family: var(--font-data);
+  font-size: 10px;
+}
+
+.fsm-edge.untaken path {
+  stroke: var(--line);
+  stroke-dasharray: 4 3;
+  stroke-width: 1;
+}
+
+#fsm-arrow path {
+  fill: var(--text-dim);
+}
+
+.fsm-timeline {
+  border-top: 1px solid var(--line);
+  padding: 8px var(--gutter);
+}
+
+.fsm-track {
+  position: relative;
+  height: 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  cursor: ew-resize;
+}
+
+.fsm-seg {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+}
+
+.fsm-cursor {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--causal);
+}
+
+.fsm-legend {
+  display: flex;
+  align-items: center;
+  gap: var(--gutter);
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--text-dim);
+  font-family: var(--font-data);
+  flex-wrap: wrap;
+}
+
+.fsm-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.fsm-key i {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  display: inline-block;
+}
+
+.fsm-why {
+  padding: 0 var(--gutter) 8px;
+}
+
+/* --- diff tab (§11.4 TAB 5, §8.7) --------------------------------------- */
+
+.diff {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.diff-head {
+  display: flex;
+  align-items: center;
+  gap: var(--gutter);
+  padding: 6px var(--gutter);
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--text);
+}
+
+.diff-select {
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  color: var(--text-bright);
+  font-family: var(--font-chrome);
+  font-size: 11px;
+  border-radius: var(--radius);
+  padding: 1px 4px;
+}
+
+.diff-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px 16px 40px;
+}
+
+.diff-align {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  font-size: 11px;
+  color: var(--text);
+  margin-bottom: 12px;
+}
+
+.diff-align .dim {
+  color: var(--text-dim);
+}
+
+/* The one card §11.4 asks for: the answer, before anything else. */
+.diff-card {
+  border: 1px solid var(--diff);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  background: var(--bg-panel);
+}
+
+.diff-card-head {
+  display: flex;
+  align-items: center;
+  gap: var(--gutter);
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.diff-card-title {
+  color: var(--diff);
+  font-family: var(--font-chrome);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+.diff-card-sig {
+  font-size: 14px;
+  color: var(--text-bright);
+}
+
+.diff-card-values {
+  display: flex;
+  gap: var(--gutter);
+  align-items: baseline;
+  margin-top: 4px;
+  font-size: 13px;
+}
+
+.diff-va {
+  color: var(--sig-1);
+}
+
+.diff-vb {
+  color: var(--diff);
+}
+
+.diff-section {
+  margin-top: 20px;
+}
+
+.diff-section h3 {
+  margin: 0 0 6px;
+  font-family: var(--font-chrome);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.diff-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 12px;
+}
+
+.diff-row {
+  display: grid;
+  grid-template-columns: 5em 1fr 8em 8em auto;
+  gap: var(--gutter);
+  align-items: baseline;
+  padding: 2px 6px;
+  cursor: pointer;
+  border-left: 2px solid transparent;
+}
+
+.diff-row:hover {
+  background: var(--bg-raised);
+}
+
+.diff-row.on {
+  border-left-color: var(--diff);
+  background: var(--bg-raised);
+}
+
+.diff-at {
+  color: var(--text-dim);
+}
+
+.diff-sig {
+  color: var(--text-bright);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diff-row .chip {
+  opacity: 0;
+}
+
+.diff-row:hover .chip {
+  opacity: 1;
+}
+
+.diff-txn {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gutter);
+  align-items: baseline;
+  font-size: 12px;
+  padding: 2px 6px;
+}
+
+.diff-chains {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--gutter);
+}
+
+.diff-chain {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.diff-chain-head {
+  padding: 3px 8px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.diff-node {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.diff-node:hover {
+  background: var(--bg-raised);
+}
+
+/* Magenta, and only here: the line where the two runs stop agreeing (§11.2). */
+.diff-node.parted {
+  border-left: 2px solid var(--diff);
+  background: color-mix(in srgb, var(--diff) 8%, transparent);
+}
+
+.diff-node-reason {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+/* --- §11.4 (b) subtrace and (c) repro, §11.5 replay ---------------------- */
+
+.causal-section {
+  border-top: 1px solid var(--line);
+  padding: 10px 16px 16px;
+}
+
+.causal-section-head {
+  display: flex;
+  align-items: center;
+  gap: var(--gutter);
+  margin-bottom: 8px;
+}
+
+.causal-section-head h3 {
+  margin: 0;
+  font-family: var(--font-chrome);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.causal-section-head kbd,
+.replay kbd {
+  font-family: var(--font-data);
+  font-size: 9px;
+  opacity: 0.6;
+}
+
+.chip.primary {
+  color: var(--causal);
+  border-color: var(--causal-dim);
+}
+
+.chip.primary:hover {
+  border-color: var(--causal);
+}
+
+.subtrace {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 12px;
+}
+
+.sub-row {
+  display: grid;
+  grid-template-columns: 4.5em minmax(8em, 22em) 6em 1fr;
+  gap: var(--gutter);
+  padding: 3px 6px;
+  border-left: 2px solid transparent;
+  cursor: pointer;
+  align-items: baseline;
+}
+
+.sub-row:hover {
+  background: var(--bg-raised);
+}
+
+/* Amber marks causality and nothing else (§11.1): here, the root cause row. */
+.sub-row.root {
+  border-left-color: var(--causal);
+}
+
+.sub-at {
+  color: var(--text-dim);
+}
+
+.sub-sig {
+  color: var(--text-bright);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sub-val {
+  color: var(--sig-bus);
+}
+
+.sub-text {
+  color: var(--text);
+}
+
+.repro-head {
+  display: flex;
+  align-items: center;
+  gap: var(--gutter);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.verdict {
+  font-family: var(--font-data);
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+}
+
+.verdict.ok {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.verdict.no {
+  color: var(--sig-x);
+  border-color: var(--sig-x);
+}
+
+.repro-code {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  max-height: 22em;
+  overflow: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-family: var(--font-data);
+  font-size: 11px;
+  line-height: var(--lh-data);
+  color: var(--text);
+  white-space: pre;
+}
+
+/* §11.5 is a mode: it takes the screen, leaving only the waveform strip it is
+ * narrating. The chrome that would let you wander off is hidden with it. */
+.app.replaying .signal-panel,
+.app.replaying .query-bar,
+.app.replaying .tab-strip {
+  display: none;
+}
+
+.replay {
+  position: absolute;
+  inset: 0 0 var(--replay-wave-h) 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-deep);
+  border-bottom: 1px solid var(--line);
+}
+
+.replay-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--gutter);
+  padding: 6px var(--gutter);
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--text-bright);
+}
+
+.replay-count {
+  font-family: var(--font-chrome);
+  letter-spacing: 0.04em;
+}
+
+.replay-controls {
+  display: flex;
+  gap: 4px;
+}
+
+.replay-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.replay-step {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 28px 32px;
+  max-width: 62em;
+}
+
+.replay-when {
+  font-size: 15px;
+  color: var(--text-bright);
+}
+
+.replay-when .dim {
+  color: var(--text-dim);
+}
+
+.replay-tag {
+  margin-left: 8px;
+  font-family: var(--font-chrome);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--causal);
+  border: 1px solid var(--causal-dim);
+  border-radius: var(--radius);
+  padding: 0 5px;
+}
+
+.replay-text {
+  margin: 12px 0 20px;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text);
+}
+
+.replay-loc {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+.replay-snippet {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  padding: 6px 0;
+  font-size: 12px;
+  line-height: var(--lh-data);
+}
+
+.replay-snippet.dim {
+  color: var(--text-dim);
+  padding: 6px 10px;
+}
+
+.replay-line {
+  display: flex;
+  gap: 10px;
+  padding: 0 10px;
+  white-space: pre;
+}
+
+.replay-line.hit {
+  background: var(--bg-raised);
+  border-left: 2px solid var(--causal);
+  padding-left: 8px;
+}
+
+.replay-ln {
+  width: 3.5em;
+  text-align: right;
+  color: var(--text-dim);
+  font-family: var(--font-data);
+  user-select: none;
+}
+
+.replay-track {
+  display: flex;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 8px var(--gutter);
+  border-top: 1px solid var(--line);
+  overflow-x: auto;
+}
+
+.replay-dot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px 6px;
+  color: var(--text-dim);
+  font-family: var(--font-data);
+  font-size: 9px;
+}
+
+.replay-dot-mark {
+  font-size: 11px;
+  line-height: 1;
+}
+
+.replay-dot.done .replay-dot-mark {
+  color: var(--causal-dim);
+}
+
+.replay-dot.on {
+  color: var(--causal);
+}
+
+.replay-dot.on .replay-dot-mark {
+  color: var(--causal);
+}
+
 .causal-txn {
   color: var(--causal);
 }

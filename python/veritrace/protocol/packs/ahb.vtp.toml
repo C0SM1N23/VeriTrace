@@ -1,0 +1,118 @@
+name    = "AHB-Lite"
+version = "1.0"
+
+# §8.15: "designuri mai vechi". AHB is where the generic engine earns its keep,
+# because **AHB has no valid/ready pair**. Its handshake is:
+#
+#   address phase   htrans != IDLE/BUSY, held until hready
+#   data phase      completes on hready, with hresp saying OKAY or ERROR
+#
+# `htrans` is two bits — IDLE=0, BUSY=1, NONSEQ=2, SEQ=3 — so "the master is
+# asking" is `htrans[1]`, and that is what goes in `valid`. The engine parses a
+# `valid` that is not a signal of the interface as an expression over ones that
+# are, which is the whole reason this pack is three dozen lines rather than a
+# special case in the extraction code.
+#
+# BUSY (1) is deliberately *not* a request: it is a master in the middle of a
+# burst saying "not this cycle". Counting it would inflate every burst's beat
+# count by however long the master hesitated.
+
+[detect]
+required_suffixes = ["htrans", "hready", "haddr", "hwrite", "hwdata", "hrdata"]
+prefix_strip      = ["m_ahb_", "s_ahb_", "ahb_", "m_", "s_", ""]
+clock             = "hclk|clk|.*_hclk|.*_clk"
+reset             = "hresetn|hreset_n|rst_n|resetn|.*_hresetn|.*_rst_n"
+
+[[channel]]
+name  = "A"
+# NONSEQ or SEQ. Bit 1 of htrans is exactly "this is a real transfer".
+valid = "htrans[1]"
+ready = "hready"
+payload = ["haddr", "hwrite", "hsize", "hburst", "hprot", "hmastlock", "htrans"]
+
+[[channel]]
+name  = "D"
+# The data phase of the transfer whose address phase completed last cycle.
+# There is no separate request wire: hready is both "the slave is done" and
+# "the pipeline may advance", which is the part of AHB people get wrong.
+valid = "hready"
+ready = "hready"
+payload = ["hwdata", "hrdata", "hresp", "hexokay"]
+
+# A burst: address beats until the burst length runs out. AHB-Lite has no ids
+# and exactly one outstanding transfer, so age is the only matching there is —
+# which is also what the protocol mandates.
+[[transaction]]
+name  = "WRITE"
+start = "A"
+end   = { channel = "D" }
+key   = "addr = A.haddr"
+
+[metrics]
+latency     = "end.cycle - start.cycle"
+wait_states = "sum(stall)"
+
+[perf]
+transfer = ["A"]
+data     = "hwdata"
+
+[[stall_reason]]
+name = "wait_states"
+when = "htrans[1] && !hready"
+msg  = "the slave was extending the transfer with wait states"
+
+[[stall_reason]]
+name = "burst_pause"
+# htrans == BUSY: the master owns the bus and is not using it.
+when = "htrans == 1"
+msg  = "the master inserted BUSY in the middle of its own burst"
+
+[[stall_reason]]
+name = "idle"
+when = "htrans == 0"
+msg  = "the master drove IDLE: nobody wanted the bus"
+
+[integrity]
+addr  = "addr"
+write = { kind = "WRITE", data = "hwdata" }
+
+[[cover]]
+field = "htrans"
+bins  = { IDLE = 0, BUSY = 1, NONSEQ = 2, SEQ = 3 }
+
+[[cover]]
+field = "hburst"
+bins  = { SINGLE = 0, INCR = 1, WRAP4 = 2, INCR4 = 3, WRAP8 = 4, INCR8 = 5, WRAP16 = 6, INCR16 = 7 }
+
+[[cover]]
+field = "hresp"
+bins  = { OKAY = 0, ERROR = 1 }
+
+[[cover]]
+corner = "zero_wait"
+when   = "wait_states == 0"
+msg    = "a transfer the slave answered without a wait state"
+
+[[rule]]
+id       = "AHB_ADDR_STABLE"
+severity = "error"
+check    = "htrans[1] && !hready |=> $stable(haddr)"
+msg      = "haddr changed during the address phase, before hready"
+
+[[rule]]
+id       = "AHB_TRANS_STABLE"
+severity = "error"
+check    = "htrans[1] && !hready |=> $stable(htrans)"
+msg      = "htrans changed while the slave was still extending the transfer"
+
+[[rule]]
+id       = "AHB_WRITE_STABLE"
+severity = "error"
+check    = "htrans[1] && !hready |=> $stable(hwrite)"
+msg      = "hwrite changed during the address phase, before hready"
+
+[[rule]]
+id       = "AHB_ERROR_RESP"
+severity = "warn"
+check    = "hresp == 0"
+msg      = "the slave answered with ERROR"

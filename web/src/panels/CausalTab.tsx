@@ -81,10 +81,173 @@ export function CausalTab() {
           {causal.headline}
         </div>
       )}
-      <div className="spine">
-        <Card node={causal.root} depth={0} />
+      {/* One scroller for all three sections of §11.4: the spine, the subtrace
+          and the repro are one document, not three panes that scroll apart. */}
+      <div className="causal-body">
+        <div className="spine">
+          <Card node={causal.root} depth={0} />
+        </div>
+        <SubtraceSection />
+        <ReproSection />
       </div>
     </div>
+  );
+}
+
+/**
+ * §11.4 section (b) — the minimal subtrace, as a compact timeline.
+ *
+ * Loaded on demand rather than with the chain: §8.2's minimality check is
+ * quadratic in the events, and most questions are answered by reading the spine
+ * above without ever needing the five-line version.
+ */
+function SubtraceSection() {
+  const sub = useWave((s) => s.subtrace);
+  const busy = useWave((s) => s.subtraceBusy);
+  const error = useWave((s) => s.subtraceError);
+  const load = useWave((s) => s.loadSubtrace);
+  const setReplay = useWave((s) => s.setReplay);
+
+  return (
+    <section className="causal-section" data-testid="subtrace-section">
+      <div className="causal-section-head">
+        <h3>Minimal subtrace</h3>
+        <span className="spacer" />
+        {sub && (
+          <span className="dim">
+            {sub.considered} event{sub.considered === 1 ? "" : "s"} · {sub.dropped} redundant
+          </span>
+        )}
+        <button className="chip" onClick={() => void load()} disabled={busy}>
+          {sub ? "recompute" : "minimise"} <kbd>s</kbd>
+        </button>
+        <button
+          className="chip primary"
+          onClick={() => setReplay(true)}
+          data-testid="replay-open"
+          title="Walk the chain forwards, one step at a time (§11.5)"
+        >
+          ▶ Replay <kbd>r</kbd>
+        </button>
+      </div>
+
+      {busy && <div className="pane-note">Minimising…</div>}
+      {error && <div className="pane-note error">{error}</div>}
+      {sub && !busy && (
+        <>
+          {!sub.reached_root_cause && (
+            <div className="pane-hint">
+              The walk did not reach a terminal that explains the value, so the last
+              line is where it stopped rather than the cause.
+            </div>
+          )}
+          <ol className="subtrace">
+            {sub.steps.map((e) => (
+              <li
+                key={`${e.signal}@${e.time}`}
+                className={e.is_root_cause ? "sub-row root" : "sub-row"}
+                onClick={() => useWave.getState().gotoReplay(e.step - 1)}
+              >
+                <span className="sub-at mono">{e.cycle !== null ? `c${e.cycle}` : e.time}</span>
+                <span className="sub-sig mono">{e.signal}</span>
+                <span className="sub-val mono">{e.value}</span>
+                <span className="sub-text">{e.text}</span>
+              </li>
+            ))}
+          </ol>
+        </>
+      )}
+    </section>
+  );
+}
+
+/**
+ * §11.4 section (c) — the repro, and the verdict from actually running it.
+ *
+ * The button says what it will produce. §8.3 is explicit that a window cut must
+ * not be called minimal, so the label follows the server's answer rather than
+ * being decided here.
+ */
+function ReproSection() {
+  const repro = useWave((s) => s.repro);
+  const busy = useWave((s) => s.reproBusy);
+  const error = useWave((s) => s.reproError);
+  const build = useWave((s) => s.buildRepro);
+  const [copied, setCopied] = useState(false);
+
+  const v = repro?.validation;
+  return (
+    <section className="causal-section" data-testid="repro-section">
+      <div className="causal-section-head">
+        <h3>Repro</h3>
+        <span className="spacer" />
+        <button
+          className="chip"
+          onClick={() => void build({ validate: false })}
+          disabled={busy}
+          title="Write the testbench without compiling it"
+        >
+          generate
+        </button>
+        <button
+          className="chip primary"
+          onClick={() => void build({ validate: true })}
+          disabled={busy}
+          data-testid="repro-validate"
+          title="Generate, compile and run it — §8.3's loop"
+        >
+          generate &amp; verify
+        </button>
+      </div>
+
+      {busy && <div className="pane-note">Generating, compiling and running…</div>}
+      {error && <div className="pane-note error">{error}</div>}
+
+      {repro && !busy && (
+        <>
+          <div className="repro-head">
+            <span className={`verdict ${v?.reproduced ? "ok" : v?.ran ? "no" : "unknown"}`}>
+              {v?.reproduced
+                ? `verified with ${v.tool}`
+                : v?.ran
+                  ? "did not reproduce"
+                  : "not run"}
+            </span>
+            <span className="dim">
+              {repro.mode === "minimal" ? "minimal repro" : "focused testbench"} ·{" "}
+              {repro.module} · {repro.cycles} cycles · {repro.events} stimulus event
+              {repro.events === 1 ? "" : "s"}
+            </span>
+            <span className="spacer" />
+            <button
+              className="chip"
+              onClick={() => {
+                void navigator.clipboard?.writeText(repro.code);
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1200);
+              }}
+            >
+              {copied ? "copied" : "copy"}
+            </button>
+          </div>
+          <div className="pane-hint">{repro.mode_reason}</div>
+          {repro.tied.length > 0 && (
+            <div className="pane-hint">
+              tied off as don&rsquo;t-care: <span className="mono">{repro.tied.join(", ")}</span>
+            </div>
+          )}
+          {repro.notes.map((n) => (
+            <div className="pane-hint" key={n}>
+              {n}
+            </div>
+          ))}
+          {v && !v.reproduced && v.error && <div className="pane-hint error">{v.error}</div>}
+          <pre className="repro-code" data-testid="repro-code">
+            {repro.code}
+          </pre>
+        </>
+      )}
+    </section>
   );
 }
 

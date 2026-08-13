@@ -1,4 +1,5 @@
 import { defineConfig } from "@playwright/test";
+import { UI_ORIGIN } from "./devserver";
 
 /**
  * Drives the Chrome already installed on the machine (`channel: "chrome"`)
@@ -15,7 +16,7 @@ export default defineConfig({
   workers: 1,
   reporter: [["list"]],
   use: {
-    baseURL: "http://127.0.0.1:5400",
+    baseURL: UI_ORIGIN,
     // Locally, drive the Chrome that is already installed rather than
     // downloading a second browser. CI installs Playwright's own chromium, so
     // no channel is requested there.
@@ -25,7 +26,7 @@ export default defineConfig({
   },
   webServer: {
     command: "npm run dev",
-    url: "http://127.0.0.1:5400",
+    url: UI_ORIGIN,
     reuseExistingServer: true,
     timeout: 60_000,
   },

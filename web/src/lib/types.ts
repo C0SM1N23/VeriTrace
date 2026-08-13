@@ -97,7 +97,9 @@ export type FindingGroup =
   | "liveness"
   | "memory"
   | "integrity"
+  | "fsm"
   | "lint"
+  | "plugin"
   | "parameters";
 export type Severity = "error" | "warn" | "info";
 
@@ -125,6 +127,13 @@ export interface ParamNode {
   children: ParamNode[];
 }
 
+/** §13.7 — a table a project's own plugin produced. It becomes a tab. */
+export interface PluginTable {
+  title: string;
+  columns: string[];
+  rows: (string | number | null)[][];
+}
+
 export interface ChecksReport {
   findings: Finding[];
   groups: Partial<Record<FindingGroup, number>>;
@@ -134,6 +143,12 @@ export interface ChecksReport {
   ms: number;
   suppressed: Record<string, string>;
   parameters: ParamNode | null;
+  /**
+   * §13.7: "Rezultatele tabulare apar automat ca tab nou. Nu trebuie sa atingi
+   * UI-ul ca sa adaugi o analiza." These arrive with the checks and the tab
+   * strip grows to fit them.
+   */
+  plugin_tables: PluginTable[];
 }
 
 /** Messages the main thread sends to the render worker. */
@@ -204,6 +219,166 @@ export interface WhyResult {
   headline?: string;
   root: CausalNode;
   stats: { nodes: number; ms: number; truncated: boolean };
+}
+
+// --- §8.2, §8.3, §11.5 — subtrace, repro, replay ---------------------------
+
+/** One line of §8.2's narrative, with the sentence §11.5's templates produced. */
+export interface SubtraceEvent {
+  signal: string;
+  time: number;
+  cycle: number | null;
+  value: string;
+  prev: string | null;
+  /** `transition` moved here, `held` was established earlier, `terminal` ends it. */
+  kind: "transition" | "held" | "terminal";
+  reason: string;
+  node_kind: string;
+  loc: { file: string; line: number; col: number } | null;
+  detail: string;
+  is_root_cause: boolean;
+  is_symptom: boolean;
+  text: string;
+  /** 1-based position in the replay, root cause first. */
+  step: number;
+}
+
+export interface SubtraceResult {
+  query: string;
+  signal: string;
+  time: number;
+  headline: string;
+  title: string;
+  symptom: string;
+  steps: SubtraceEvent[];
+  /** Events steps 1–4 produced, before the minimality check. */
+  considered: number;
+  /** Events the minimality check removed. */
+  dropped: number;
+  reached_root_cause: boolean;
+  delta_skipped: boolean;
+}
+
+export interface ReproValidation {
+  ran: boolean;
+  reproduced: boolean;
+  tool: string;
+  seconds: number;
+  output: string;
+  error: string;
+}
+
+export interface Repro {
+  /** §8.3 keeps these apart on purpose: `focused` is a window cut, not a minimisation. */
+  mode: "minimal" | "focused";
+  mode_reason: string;
+  module: string;
+  instance: string;
+  top: string;
+  code: string;
+  cycles: number;
+  driven: string[];
+  tied: string[];
+  events: number;
+  level: number;
+  symptom: { signal: string; value: string; time: number; cycle: number | null };
+  validation: ReproValidation;
+  notes: string[];
+}
+
+// --- §8.8 — FSM mode (a mode of Source, not a tab) -------------------------
+
+export interface FsmState {
+  value: number;
+  /** `S_IDLE` when the RTL named it, `2'd1` when it wrote a literal. */
+  name: string;
+  is_reset: boolean;
+}
+
+export interface FsmTransition {
+  /** `null` means "from every state" — the reset branch, or a global override. */
+  src: number | null;
+  dst: number;
+  guard: string;
+  loc: { file: string; line: number } | null;
+  is_reset: boolean;
+}
+
+export interface Machine {
+  signal: string;
+  width: number;
+  loc: { file: string; line: number } | null;
+  states: FsmState[];
+  transitions: FsmTransition[];
+  reset_state: number | null;
+  companions: string[];
+  /** §8.8 step 5, present only when a trace was loaded. Keyed by state value. */
+  visits: Record<string, number>;
+  cycles_in: Record<string, number>;
+  /** Keyed `"src->dst"`. */
+  taken: Record<string, number>;
+  /**
+   * `[cycle, state]` for every change, in order — §8.8 step 6.
+   *
+   * The timeline needs the *sequence*, not the totals: laying per-state sums
+   * side by side draws the states in declaration order and reads as a run that
+   * never happened.
+   */
+  sequence: [number, number][];
+  sequence_truncated: boolean;
+  why_candidate: string;
+}
+
+// --- §8.7, TAB 5 — diff ----------------------------------------------------
+
+export interface OpenSession {
+  session_id: string;
+  trace: string;
+  name: string;
+  has_rtl: boolean;
+  n_signals: number;
+  default: boolean;
+}
+
+export interface Divergence {
+  signal: string;
+  /** Position on the shared axis — the cycle number under the default strategy. */
+  at: number;
+  time_a: number;
+  time_b: number;
+  value_a: string;
+  value_b: string;
+  level: "signal" | "transaction";
+  ref: string;
+  detail: string;
+}
+
+export interface DiffAlignment {
+  strategy: string;
+  matched: number;
+  anchors_a: number;
+  anchors_b: number;
+  note: string;
+  /** Femtoseconds per tick, after §8.7's mandatory normalisation. */
+  timescale_a: number;
+  timescale_b: number;
+}
+
+export interface DiffReport {
+  a: { session_id: string; name: string };
+  b: { session_id: string; name: string };
+  alignment: DiffAlignment;
+  compared: number;
+  only_a: string[];
+  only_b: string[];
+  ignored: string[];
+  divergences: Divergence[];
+  txn_divergences: Divergence[];
+  why_a: CausalNode | null;
+  why_b: CausalNode | null;
+  /** Index on the primary path where the two chains part — magenta in §11.4. */
+  first_differing: number | null;
+  why_error: string;
 }
 
 export interface SourceFile {

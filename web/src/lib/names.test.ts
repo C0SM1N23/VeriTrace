@@ -46,4 +46,17 @@ describe("shortLabels", () => {
     const got = shortLabels(["clk"]);
     expect(got.get("clk")).toBe("clk");
   });
+
+  it("names file paths apart too, on their own separator", () => {
+    // §11.4's trace picker: every design in a project dumps to `dump.vtx`, so
+    // the basename names nothing.
+    const got = shortLabels(
+      ["designs/deadlock/dump.vtx", "designs/dma/dump.vtx", "designs/dma/dump_ok.vtx"],
+      "/",
+    );
+    expect(got.get("designs/deadlock/dump.vtx")).toBe("deadlock/dump.vtx");
+    expect(got.get("designs/dma/dump.vtx")).toBe("dma/dump.vtx");
+    // Already unique on its leaf, so it does not grow.
+    expect(got.get("designs/dma/dump_ok.vtx")).toBe("dump_ok.vtx");
+  });
 });

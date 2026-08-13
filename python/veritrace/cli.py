@@ -12,6 +12,7 @@ import click
 import tomli_w
 
 from veritrace import __version__
+from veritrace.config import WORK_DIR
 from veritrace.export import viewers
 
 EXCLUDED_DIRS = {".git", "node_modules", "target", ".venv", "venv", "__pycache__", "build", "dist"}
@@ -190,6 +191,8 @@ class Context:
     #: §8.19's scoreboard and §8.21/§8.12's coverage, likewise on demand.
     integrity: object = None
     coverage: object = None
+    #: Every automatic finding (§8.4–§8.11), likewise.
+    checks: object = None
 
     def transactions(self) -> object:
         """Extract transactions once per command run (§8.14)."""
@@ -238,6 +241,33 @@ class Context:
         if self.integrity is None:
             self.integrity = int_report.build(self.transactions(), self.store, self.clock)
         return self.integrity
+
+    def check_report(self) -> object:
+        """Every automatic finding, once per command run (§8.4–§8.11).
+
+        `check`, `run` and `export` all need the same list; three calls to
+        `run_all` would be three chances for the CI gate, the terminal report and
+        the bug report's appendix to disagree about what this trace contains.
+        """
+        from veritrace.analysis import checks as checks_mod
+
+        if self.checks is None:
+            self.checks = checks_mod.run_all(
+                self.store,
+                self.graph,
+                self.elaboration,
+                self.clock,
+                self.config,
+                self.transactions(),
+                self.measure().liveness,
+                self.memory_reports(),
+                self.data_integrity(),
+                project_root=(
+                    getattr(self.config, "root", None)
+                    or (self.trace_path.parent if self.trace_path else None)
+                ),
+            )
+        return self.checks
 
     def coverage_report(self, coverage_path: Path | None = None, source: str | None = None) -> object:
         """§8.21's functional coverage and §8.12's imported code coverage."""
@@ -415,7 +445,7 @@ def correlate(trace: Path | None, rtl: tuple[Path, ...], top: str | None, limit:
 
 @main.command()
 @click.argument(
-    "trace", type=click.Path(exists=True, path_type=Path), required=False, default=None
+    "traces", type=click.Path(exists=True, path_type=Path), nargs=-1
 )
 @click.option("--host", default="127.0.0.1", help="Interface to bind.")
 @click.option("--port", default=8765, type=int, help="Port to bind.")
@@ -428,23 +458,44 @@ def correlate(trace: Path | None, rtl: tuple[Path, ...], top: str | None, limit:
 )
 @click.option("--top", default=None, help="Top module (default: inferred).")
 def serve(
-    trace: Path | None, host: str, port: int, browser: bool, rtl: tuple[Path, ...], top: str | None
+    traces: tuple[Path, ...],
+    host: str,
+    port: int,
+    browser: bool,
+    rtl: tuple[Path, ...],
+    top: str | None,
 ) -> None:
-    """Serve a trace over HTTP and WebSocket.
+    """Serve one or more traces over HTTP and WebSocket.
 
-    TRACE may be a `.vtx` store or a raw `.vcd`/`.fst`, which is converted on
-    the way in. With no argument it uses `trace.default` from
+    Each TRACE may be a `.vtx` store or a raw `.vcd`/`.fst`, which is converted
+    on the way in. With no argument it uses `trace.default` from
     `.veritrace.toml`, so §13.4's `veritrace init && veritrace serve` works
     with nothing typed in between.
+
+    \b
+      veritrace serve dump.vtx --rtl src/
+      veritrace serve good.vcd bad.vcd --rtl src/   # both runs, for TAB 5
+
+    A second trace is opened as a session of its own (§10.1) and becomes the
+    other side of the Diff tab — which is the only way §8.7's comparison has a
+    second run to compare against.
     """
     import uvicorn
 
     from veritrace.api import create_app
 
-    trace = _default_trace(trace, flag="a trace path")
+    trace = _default_trace(traces[0] if traces else None, flag="a trace path")
     files, _incdirs, _defines, top = _resolve_rtl(rtl, top)
     app = create_app(default_trace=trace, rtl=[str(f) for f in files], top=top)
     session_id = app.state.default_session_id
+    for extra in traces[1:]:
+        try:
+            other = app.state.registry.open(extra, [str(f) for f in files], top)
+            click.echo(f"  also open: {extra}    session {other.session_id}")
+        except (FileNotFoundError, ValueError, OSError) as e:
+            # §11.8: a second trace that will not open is a message, not a
+            # reason to refuse to serve the first.
+            click.echo(f"  could not open {extra}: {e}", err=True)
     url = f"http://{host}:{port}"
 
     click.echo(f"VeriTrace serving {trace}")
@@ -508,34 +559,12 @@ def why(trace, query, rtl, top, as_json, output, **flags):
     With a viewer flag, writes the causal chain as a save file instead — the
     signals in the chain plus a cursor on the cause (§13.3).
     """
-    from veritrace.analysis import vtq
-    from veritrace.analysis.whytrace import WhyTracer, root_cause
+    from veritrace.analysis.whytrace import root_cause
 
     trace, query = _trace_and_query(trace, query)
-    if not query:
-        raise click.ClickException(
-            'why needs a question, e.g. veritrace why "why(top.dut.full)"'
-        )
+    query = _need_query("why", query)
     ctx = _load(trace, rtl, top, need_rtl=True)
-    try:
-        parsed = vtq.parse(query)
-    except vtq.QueryError as e:
-        raise click.ClickException(str(e)) from e
-
-    headline = ""
-    if parsed.txn is not None:
-        signal, at, headline = _txn_question(ctx, parsed.txn)
-    else:
-        signal = parsed.signal
-        if ctx.graph.get(signal) is None:
-            raise click.ClickException(f"unknown signal: {signal}")
-        at = _at(
-            ctx,
-            None if parsed.time is None else f"c{parsed.time}" if parsed.is_cycle else str(parsed.time),
-        )
-        ctx.transactions()
-
-    result = WhyTracer(ctx.graph, ctx.store, txn_index=ctx.txn_index).why(signal, at)
+    signal, at, headline, result = _ask(ctx, query)
 
     chain = list(result.root.walk())
     cause = root_cause(result.root) or result.root
@@ -559,6 +588,56 @@ def why(trace, query, rtl, top, as_json, output, **flags):
         click.echo(headline + "\n")
     _print_chain(result.root, ctx.clock)
     click.echo(f"\n{result.nodes} nodes in {result.elapsed_ms:.1f} ms")
+
+
+def _need_query(command: str, query: str | None) -> str:
+    """Refuse a missing question before anything expensive is loaded.
+
+    Order matters here: `_load` elaborates the RTL, so checking the question
+    afterwards answers `veritrace why` with "this needs RTL" — true, and not the
+    thing that is wrong.
+    """
+    if not query:
+        raise click.ClickException(
+            f'{command} needs a question, e.g. veritrace {command} "why(top.dut.full)"'
+        )
+    return query
+
+
+def _ask(ctx: "Context", query: str | None):
+    """Resolve a why-question and answer it: `(signal, time, headline, result)`.
+
+    Shared by `why`, `repro` and `export` (§13's P6 — every feature in the
+    terminal). A second copy of this would be a second set of rules for what
+    `@c1247` means and for when a transaction question becomes a signal one.
+    """
+    from veritrace.analysis import vtq
+    from veritrace.analysis.whytrace import WhyTracer
+
+    try:
+        parsed = vtq.parse(query)
+    except vtq.QueryError as e:
+        raise click.ClickException(str(e)) from e
+
+    headline = ""
+    if parsed.txn is not None:
+        signal, at, headline = _txn_question(ctx, parsed.txn)
+    else:
+        signal = parsed.signal
+        if ctx.graph.get(signal) is None:
+            raise click.ClickException(f"unknown signal: {signal}")
+        at = _at(
+            ctx,
+            None
+            if parsed.time is None
+            else f"c{parsed.time}"
+            if parsed.is_cycle
+            else str(parsed.time),
+        )
+        ctx.transactions()
+
+    result = WhyTracer(ctx.graph, ctx.store, txn_index=ctx.txn_index).why(signal, at)
+    return signal, at, headline, result
 
 
 def _txn_question(ctx: "Context", ref) -> tuple[str, int, str]:
@@ -710,20 +789,8 @@ def check(trace, rtl, top, as_json, fail_on):
     With `--fail-on` this is the CI gate: a failing build carries the cause in
     its log rather than a dump nobody will open.
     """
-    from veritrace.analysis import checks as checks_mod
-
     ctx = _load(trace, rtl, top)
-    report = checks_mod.run_all(
-        ctx.store,
-        ctx.graph,
-        ctx.elaboration,
-        ctx.clock,
-        ctx.config,
-        ctx.transactions(),
-        ctx.measure().liveness,
-        ctx.memory_reports(),
-        ctx.data_integrity(),
-    )
+    report = ctx.check_report()
 
     if as_json:
         click.echo(json.dumps(report.to_dict(), indent=2))
@@ -790,7 +857,6 @@ def run(
     touched.
     """
     from veritrace import simulate
-    from veritrace.analysis import checks as checks_mod
 
     roots = list(sources) or [Path.cwd()]
     # A `.f` filelist is passed through to the compiler rather than expanded:
@@ -848,7 +914,7 @@ def run(
         )
 
     base = run_dir
-    work = (work or base / ".veritrace").resolve()
+    work = (work or base / WORK_DIR).resolve()
     # What to name in the "open it" line: the directory the RTL came from, which
     # is not the run directory when a filelist points somewhere else.
     rtl_hint = rtl[0].parent if rtl else base
@@ -880,17 +946,7 @@ def run(
     elif ctx.graph is None:
         say("no RTL graph: causal analysis is off; pass the RTL to enable it")
 
-    report = checks_mod.run_all(
-        ctx.store,
-        ctx.graph,
-        ctx.elaboration,
-        ctx.clock,
-        ctx.config,
-        ctx.transactions(),
-        ctx.measure().liveness,
-        ctx.memory_reports(),
-        ctx.data_integrity(),
-    )
+    report = ctx.check_report()
 
     if as_json:
         click.echo(json.dumps({"dump": str(got.dump), "top": top, **report.to_dict()}, indent=2))
@@ -906,7 +962,11 @@ def run(
         # The real `serve` command, invoked rather than reimplemented, so the
         # banner, the browser and the RTL handling stay in one place.
         click_ctx.invoke(
-            serve, trace=ctx.trace_path, rtl=tuple(rtl) or tuple(roots), top=top, browser=True
+            serve,
+            traces=(ctx.trace_path,),
+            rtl=tuple(rtl) or tuple(roots),
+            top=top,
+            browser=True,
         )
 
 
@@ -1852,6 +1912,590 @@ def _first_look(cwd: Path, trace_rel: str, files: list[Path], top: str | None) -
     else:
         click.echo("  no automatic findings")
     click.echo("\nRun `veritrace serve` to open it.")
+
+
+def _minimise(ctx: "Context", result) -> object:
+    """§8.2's subtrace of a causal answer, narrated."""
+    from veritrace.repro import narrate, subtrace
+
+    return narrate.narrate(subtrace.minimise(result.root, ctx.store, ctx.clock))
+
+
+def _repro_work(ctx: "Context") -> Path:
+    """Where a generated testbench and its build land — beside the trace."""
+    base = ctx.trace_path.parent if ctx.trace_path else Path.cwd()
+    return base / WORK_DIR / "repro"
+
+
+def _rtl_sources(ctx: "Context", rtl: tuple[Path, ...], top: str | None) -> list[Path]:
+    """Every RTL file behind this run, expanded the way the graph saw them."""
+    from veritrace.graph.elaborate import discover
+
+    files, _incdirs, _defines, _top = _resolve_rtl(rtl, top)
+    out: list[Path] = []
+    for f in files:
+        out.extend(discover(f))
+    return out
+
+
+@main.command()
+@click.argument("trace", type=click.Path(path_type=Path), required=False, default=None)
+@click.argument("query", required=False)
+@rtl_options
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write the testbench here instead of to stdout.",
+)
+@click.option(
+    "--mode",
+    type=click.Choice(["auto", "minimal", "focused"]),
+    default="auto",
+    help="Override §8.3's choice. `auto` lets the DUT decide, which is usually right.",
+)
+@click.option(
+    "--validate/--no-validate",
+    default=True,
+    help="Compile and run the result, and report whether it reproduced (§8.3).",
+)
+@click.option("--timeout", default=120.0, help="Seconds before the validation run is given up on.")
+def repro(trace, query, rtl, top, as_json, output, mode, validate, timeout):
+    """Generate a testbench that reproduces a failure (§8.2, §8.3).
+
+    \b
+      veritrace repro dump.vcd "why(tb.dut.full)" -o tb_repro.sv
+      veritrace repro --mode focused          # window cut, for a CPU
+
+    For a control module the stimulus is minimised and the result is checked by
+    running it. For a design with a program image inside it, §8.3 says the
+    honest answer is a focused window rather than a minimisation, and that is
+    what comes out — named accordingly.
+    """
+    from veritrace.repro import testbench
+
+    trace, query = _trace_and_query(trace, query)
+    query = _need_query("repro", query)
+    ctx = _load(trace, rtl, top, need_rtl=True)
+    _signal, _at, _headline, result = _ask(ctx, query)
+    sub = _minimise(ctx, result)
+
+    sources = _rtl_sources(ctx, rtl, top)
+    try:
+        built = testbench.build(
+            sub,
+            ctx.graph,
+            ctx.store,
+            ctx.clock,
+            ctx.elaboration,
+            root=result.root,
+            sources=sources,
+            work=_repro_work(ctx),
+            validate_it=validate,
+            timeout=timeout,
+            mode=None if mode == "auto" else mode,
+        )
+    except testbench.ReproError as e:
+        raise click.ClickException(str(e)) from e
+
+    if as_json:
+        click.echo(json.dumps({"query": query, **built.to_dict()}, indent=2))
+        return
+
+    if output:
+        Path(output).write_text(built.code, encoding="utf-8")
+    else:
+        click.echo(built.code, nl=False)
+
+    label = "minimal repro" if built.mode == "minimal" else "focused testbench"
+    say = lambda text: click.echo(text, err=True)  # noqa: E731 - stdout is the code
+    say("")
+    say(f"{label}: {built.module} · {built.cycles} cycles · {built.events} stimulus event(s)")
+    say(f"  {built.mode_reason}")
+    if built.tied:
+        say(f"  tied off as don't-care: {', '.join(built.tied)}")
+    for note in built.notes:
+        say(f"  {note}")
+    v = built.validation
+    if v.reproduced:
+        say(f"  verified with {v.tool}: reproduces the failure in {built.cycles} cycles")
+    elif v.ran:
+        say(f"  {v.tool}: ran, but did not reproduce — {v.error}")
+    elif v.error:
+        say(f"  not validated: {v.error}")
+    if output:
+        say(f"  -> {output}")
+
+
+@main.command("export")
+@click.argument("trace", type=click.Path(path_type=Path), required=False, default=None)
+@click.option("--why", "query", required=True, help='The question, e.g. "top.ctrl.ready == 0 @ c1247".')
+@rtl_options
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Where to write the report.",
+)
+@click.option(
+    "--repro/--no-repro",
+    "with_repro",
+    default=True,
+    help="Include the generated testbench, validated by running it (§8.3).",
+)
+def export_report(trace, query, rtl, top, output, with_repro):
+    """Write a standalone HTML bug report (§12).
+
+    \b
+      veritrace export dump.vcd --why "why(top.ctrl.ready)" -o bug.html
+
+    One file, no network: it opens the same on a machine that has never heard of
+    this tool, which is the only form a bug report attached to a ticket can take.
+    """
+    from veritrace.api.sessions import sha256_files
+    from veritrace.export import report as report_mod
+    from veritrace.repro import testbench
+
+    ctx = _load(_default_trace(trace, flag="a trace path"), rtl, top, need_rtl=True)
+    _signal, _at, headline, result = _ask(ctx, query)
+    sub = _minimise(ctx, result)
+
+    sources = _rtl_sources(ctx, rtl, top)
+    built = None
+    if with_repro:
+        try:
+            built = testbench.build(
+                sub,
+                ctx.graph,
+                ctx.store,
+                ctx.clock,
+                ctx.elaboration,
+                root=result.root,
+                sources=sources,
+                work=_repro_work(ctx),
+            )
+        except testbench.ReproError as e:
+            # §12 section 6 is one of seven. A design this tool cannot reduce
+            # still deserves the other six.
+            click.echo(f"  no testbench: {e}", err=True)
+
+    page = report_mod.build(
+        result.root,
+        sub,
+        ctx.store,
+        ctx.clock,
+        query=headline or query,
+        sources={p.name: p for p in sources},
+        repro=built,
+        findings=ctx.check_report(),
+        trace_path=ctx.trace_path,
+        rtl_sha256=sha256_files(sources) if sources else None,
+        top=getattr(ctx.graph, "top", "") or "",
+    )
+    report_mod.write(page, Path(output))
+    size = f"{page.bytes / 1024:.0f} KB"
+    click.echo(f"{page.title} -> {output}  ({size})", err=True)
+    if page.oversize:
+        click.echo(
+            f"  over §12's {report_mod.SIZE_TARGET // 1024} KB target. Nothing was dropped; "
+            "a narrower question makes a smaller report.",
+            err=True,
+        )
+
+
+@main.command()
+@click.option(
+    "--root",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Project to look in. Default: the one holding .veritrace.toml.",
+)
+def plugins(root):
+    """What analysis plugins are installed, and what could not load (§13.7).
+
+    Looked for in `~/.veritrace/plugins/` and in `plugins/` beside your
+    `.veritrace.toml`. No install step: a plugin is a file, versioned with the
+    design. See docs/PLUGINS.md.
+    """
+    from veritrace import config as cfg
+    from veritrace import plugin as plugin_mod
+
+    base = root
+    if base is None:
+        conf = cfg.load()
+        base = conf.root if conf is not None else Path.cwd()
+
+    plugin_mod.clear()
+    found, errors = plugin_mod.discover(base)
+    paths = plugin_mod.search_path(base)
+    click.echo("looked in: " + (", ".join(str(p) for p in paths) or "nowhere — no plugin directory exists"))
+
+    if found:
+        click.echo(f"\n{len(found)} plugin(s):")
+        for cls in found:
+            needs = ", ".join(cls.needs) or "nothing"
+            click.echo(f"  {cls.name:<24} needs {needs}")
+            if cls.description:
+                click.echo(f"    {cls.description}")
+    else:
+        click.echo("\nno plugins found")
+
+    if errors:
+        click.echo(f"\n{len(errors)} file(s) could not be loaded:")
+        for name, why in errors.items():
+            click.echo(f"  {name}: {why}")
+
+
+@main.command("gen-sva")
+@click.argument("trace", type=click.Path(path_type=Path), required=False, default=None)
+@rtl_options
+@click.option("--pack", "pack_name", default=None, help="Pack to take the rules from.")
+@click.option("--iface", default=None, help="Interface to bind the checker to.")
+@click.option(
+    "--target",
+    type=click.Choice(["verilator", "portable"]),
+    default="verilator",
+    help="SVA subset, or plain Verilog for simulators that have none (§8.22).",
+)
+@click.option(
+    "-o", "--output", type=click.Path(path_type=Path), default=None, help="Write here."
+)
+def gen_sva(trace, rtl, top, pack_name, iface, target, output):
+    """Emit a protocol checker from a pack's rules (§8.22).
+
+    \b
+      veritrace gen-sva --iface tb.dut.m_axi --target verilator -o chk.sv
+      veritrace gen-sva --iface tb.dut.m_axi --target portable  -o chk.sv
+
+    §8.22: SVA support across the free stack is thin — Verilator takes a subset,
+    ModelSim's free edition varies, Icarus has effectively none — so the same
+    rules come out two ways. `portable` is plain Verilog and runs anywhere.
+
+    The interface is detected from the trace, so the widths in the generated
+    ports are the design's own rather than a guess.
+    """
+    from veritrace.export import sva
+
+    ctx = _load(trace, rtl, top)
+    analysis = ctx.transactions()
+    if not analysis.extractions:
+        raise click.ClickException(
+            "no protocol interfaces were detected in this trace, so there is nothing "
+            "to generate a checker for."
+        )
+
+    found = [e.interface for e in analysis.extractions]
+    if iface:
+        chosen = next((i for i in found if i.name == iface or i.scope == iface), None)
+        if chosen is None:
+            raise click.ClickException(
+                f"no interface called {iface!r}. Found: "
+                + ", ".join(f"{i.name} ({i.pack.name})" for i in found)
+            )
+    elif pack_name:
+        chosen = next((i for i in found if i.pack.slug == pack_name), None)
+        if chosen is None:
+            raise click.ClickException(
+                f"no interface uses the {pack_name!r} pack. Found: "
+                + ", ".join(f"{i.name} ({i.pack.slug})" for i in found)
+            )
+    elif len(found) == 1:
+        chosen = found[0]
+    else:
+        raise click.ClickException(
+            "several interfaces were detected; name one with --iface: "
+            + ", ".join(f"{i.name} ({i.pack.name})" for i in found)
+        )
+
+    widths = {}
+    for suffix, path in chosen.signals.items():
+        handle = ctx.store.find(path)
+        if handle is not None:
+            widths[suffix] = max(1, ctx.store.signal(handle).width)
+
+    try:
+        checker = sva.render(
+            chosen.pack,
+            iface=chosen.scope or chosen.name,
+            target=target,
+            widths=widths,
+            clock=_leaf(chosen.clock) or "clk",
+            reset=_leaf(chosen.reset) or "rst_n",
+        )
+    except sva.SvaError as e:
+        raise click.ClickException(str(e)) from e
+
+    if output:
+        Path(output).write_text(checker.code, encoding="utf-8")
+    else:
+        click.echo(checker.code, nl=False)
+
+    say = lambda t: click.echo(t, err=True)  # noqa: E731 - stdout is the code
+    say(f"{checker.module} ({target}): {len(checker.emitted)} rule(s) from {chosen.pack.name}")
+    for rule_id, why in checker.skipped.items():
+        say(f"  skipped {rule_id}: {why}")
+    if output:
+        say(f"  -> {output}")
+
+
+def _leaf(path: str | None) -> str | None:
+    return path.rsplit(".", 1)[-1] if path else None
+
+
+#: §8.7's alignment strategies. Spelled here rather than imported so that
+#: building the CLI does not pull in the diff engine; the strings are the
+#: contract either way, and `diff.align` refuses anything it does not know.
+_ALIGN_STRATEGIES = ("cycle", "handshake", "retire", "manual")
+
+
+@main.command()
+@click.argument("trace", type=click.Path(path_type=Path), required=False, default=None)
+@click.argument("signal", required=False)
+@rtl_options
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+@click.option(
+    "--svg",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write the state diagram as SVG (§8.8 step 4).",
+)
+def fsm(trace, signal, rtl, top, as_json, svg):
+    """Extract state machines and check them statically (§8.8).
+
+    \b
+      veritrace fsm --rtl rtl/                 # every machine, and its findings
+      veritrace fsm dump.vcd uut.lsu.state_q   # one machine, with the overlay
+
+    **The trace is optional and the checks never use it.** §8.8's whole argument
+    is that a dead state is invisible to a simulation whose stimulus never went
+    there, so `--rtl` alone reports everything. A dump only adds the overlay:
+    which states were visited and how often each edge was taken.
+    """
+    from veritrace.analysis import fsm as fsm_mod
+    from veritrace.analysis import fsmchecks
+
+    # `veritrace fsm --rtl src/ uut.lsu.state_q` names a machine and no trace.
+    # Click cannot tell that from a dump, and this is the same problem `txn` and
+    # `why` already have — one resolver, one rule: a path that does not exist is
+    # not a path.
+    trace, signal = _trace_and_query(trace, signal)
+    if trace is None:
+        # §7.4 in reverse: this is the one analysis that works with no trace at
+        # all, so a missing dump is a supported mode rather than an error.
+        files, incdirs, defines, top = _resolve_rtl(rtl, top)
+        if not files:
+            raise click.ClickException(
+                "fsm needs RTL. Pass --rtl <file|dir>, or set design.rtl in .veritrace.toml."
+            )
+        from veritrace.graph.elaborate import elaborate
+
+        el = elaborate(files, incdirs, defines, top)
+        ctx = Context(store=None, config=None, elaboration=el, graph=el.graph)
+    else:
+        ctx = _load(trace, rtl, top, need_rtl=True)
+
+    machines = fsm_mod.extract(ctx.graph, ctx.elaboration, ctx.store)
+    if signal:
+        one = fsm_mod.find(machines, signal)
+        if one is None:
+            raise click.ClickException(
+                f"no state machine on {signal!r}. Found: "
+                + (", ".join(m.signal for m in machines) or "none")
+            )
+        machines = [one]
+    if ctx.store is not None:
+        for m in machines:
+            fsm_mod.overlay(m, ctx.store, ctx.graph, ctx.clock)
+
+    findings = [
+        f
+        for m in machines
+        for f in _fsm_findings(m, ctx.graph, fsmchecks)
+    ]
+    if svg:
+        from veritrace.export import fsmsvg
+
+        Path(svg).write_text(fsmsvg.render(machines[0]), encoding="utf-8")
+        click.echo(f"{machines[0].signal} -> {svg}", err=True)
+
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "machines": [m.to_dict() for m in machines],
+                    "findings": [f.to_dict() for f in findings],
+                },
+                indent=2,
+            )
+        )
+        return
+    click.echo(_format_fsm(machines, findings, ctx.store is not None))
+
+
+def _fsm_findings(machine, graph, fsmchecks):
+    yield from fsmchecks.dead_states(machine)
+    yield from fsmchecks.unreachable_states(machine)
+    yield from fsmchecks.impossible_transitions(machine)
+    yield from fsmchecks.incomplete_guards(machine)
+    yield from fsmchecks.incomplete_reset(machine, graph)
+
+
+def _format_fsm(machines, findings, has_trace: bool) -> str:
+    out: list[str] = []
+    if not machines:
+        return (
+            "No state machines found.\n"
+            "  §8.8 looks for a register assigned in an always_ff and compared against\n"
+            "  constants in its own guards. A counter is not one, whatever it is called."
+        )
+    for m in machines:
+        out.append(f"{m.signal}   {len(m.states)} states, {len(m.transitions)} transitions")
+        out.append(f"  {m.decl_loc or ''}   [{m.why_candidate}]")
+        for s in m.states:
+            marks = []
+            if s.is_reset:
+                marks.append("reset")
+            if has_trace:
+                seen = m.visits.get(s.value, 0)
+                marks.append(f"{seen} visit(s)" if seen else "NEVER VISITED")
+                if m.cycles_in.get(s.value):
+                    marks.append(f"{m.cycles_in[s.value]} cycles")
+            out.append(f"    {s.name:<14} {'  '.join(marks)}")
+        for t in m.transitions:
+            src = "any" if t.src is None else m.name_of(t.src)
+            count = ""
+            if has_trace and t.src is not None:
+                n = m.taken.get((t.src, t.dst), 0)
+                count = f"   {n}x" if n else "   never taken"
+            out.append(f"    {src:>14} -> {m.name_of(t.dst):<14} [{t.guard}]{count}")
+        out.append("")
+
+    if findings:
+        out.append(f"{len(findings)} finding(s), from the RTL alone:")
+        for f in sorted(findings, key=lambda f: f.sort_key):
+            out.append(f"  [{f.severity.label}] {f.check}   {f.title}")
+            out.append(f"      {f.loc or ''}")
+    else:
+        out.append("No static findings.")
+    return "\n".join(out)
+
+
+@main.command()
+@click.argument("trace_a", type=click.Path(exists=True, path_type=Path))
+@click.argument("trace_b", type=click.Path(exists=True, path_type=Path))
+@rtl_options
+@click.option(
+    "--align",
+    "strategy",
+    type=click.Choice(list(_ALIGN_STRATEGIES)),
+    default="cycle",
+    help="What to align on (§8.7). Clock edges unless the latencies differ.",
+)
+@click.option(
+    "--anchor",
+    default=None,
+    help="Signal whose rising edges are the anchors, for --align retire.",
+)
+@click.option(
+    "--ignore",
+    multiple=True,
+    help="Glob of signals to leave out. Repeatable — counters and timestamps "
+    "legitimately differ.",
+)
+@click.option("--limit", default=12, type=int, help="How many divergences to list.")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def diff(trace_a, trace_b, rtl, top, strategy, anchor, ignore, limit, as_json):
+    """Where two runs part company (§8.7).
+
+    \b
+      veritrace diff good.vcd bad.vcd --rtl src/
+      veritrace diff a.vcd b.vcd --align handshake --ignore "*cycle_count*"
+
+    Timescales are normalised before anything is compared, and the alignment is
+    on anchor events rather than on absolute time — so the cycle it reports means
+    the same moment in both runs.
+    """
+    from veritrace import diff as diff_mod
+
+    ctx_a = _load(trace_a, rtl, top)
+    ctx_b = _load(trace_b, rtl, top)
+    try:
+        side_a = diff_mod.side(trace_a.name, ctx_a.store, ctx_a.clock)
+        side_b = diff_mod.side(trace_b.name, ctx_b.store, ctx_b.clock)
+        alignment = diff_mod.align(
+            side_a,
+            side_b,
+            strategy,
+            protocol_a=ctx_a.transactions() if strategy == "handshake" else None,
+            protocol_b=ctx_b.transactions() if strategy == "handshake" else None,
+            signal=anchor,
+        )
+    except diff_mod.AlignError as e:
+        raise click.ClickException(str(e)) from e
+
+    patterns = list(ignore) + list(getattr(ctx_a.config, "ignore", []) or [])
+    report = diff_mod.compare(alignment, patterns)
+    report.txn_divergences = diff_mod.compare_transactions(
+        alignment, ctx_a.transactions(), ctx_b.transactions()
+    )
+    if report.first is not None and ctx_a.graph is not None:
+        diff_mod.explain(report, ctx_a.graph, ctx_b.graph)
+
+    if as_json:
+        click.echo(json.dumps(report.to_dict(), indent=2))
+        return
+    click.echo(_format_diff(report, limit))
+
+
+def _format_diff(report, limit: int) -> str:
+    al = report.alignment
+    out = [
+        f"aligned on {al.strategy}: {al.matched} anchor(s) matched "
+        f"({al.counts[0]} vs {al.counts[1]})",
+        f"timescale: {al.a.fs} fs vs {al.b.fs} fs per tick — normalised before comparing",
+    ]
+    if al.note:
+        out.append(f"  note: {al.note}")
+    out.append(f"{report.compared} signal(s) compared, {len(report.ignored)} ignored")
+    if report.only_a or report.only_b:
+        out.append(
+            f"  {len(report.only_a)} only in the first run, {len(report.only_b)} only in the second"
+        )
+
+    if not report.divergences:
+        out.append("\nThe two runs agree on every signal they share.")
+    else:
+        first = report.first
+        out.append(f"\nFIRST DIVERGENCE at c{first.at}")
+        out.append(f"  {first.signal}   {first.value_a}  vs  {first.value_b}")
+        if first.detail:
+            out.append(f"  {first.detail}")
+        out.append(f"\n{len(report.divergences)} diverging signal(s), earliest first:")
+        for d in report.divergences[:limit]:
+            out.append(f"  c{d.at:<8} {d.signal:<44} {d.value_a}  vs  {d.value_b}")
+        if len(report.divergences) > limit:
+            out.append(f"  ... {len(report.divergences) - limit} more")
+
+    if report.txn_divergences:
+        out.append("\nFIRST DIVERGING TRANSACTION per interface:")
+        for d in report.txn_divergences[:limit]:
+            out.append(f"  c{d.at:<8} {d.ref:<24} {d.value_a}  vs  {d.value_b}")
+            if d.detail:
+                out.append(f"             {d.detail}")
+
+    if report.first_differing is not None:
+        out.append(
+            f"\nThe two causal chains agree for {report.first_differing} step(s) "
+            "and part at the next one."
+        )
+    elif report.why_error:
+        out.append(f"\nno side-by-side chain: {report.why_error}")
+    elif report.why_a is not None:
+        out.append("\nThe two causal chains are identical — the cause is upstream of both.")
+    return "\n".join(out)
 
 
 if __name__ == "__main__":

@@ -52,6 +52,7 @@ from __future__ import annotations
 from typing import Any, Iterable, Sequence
 
 from veritrace.perf.model import Deadlock, Livelock, Liveness, Starvation, WaitEdge
+from veritrace.protocol import channels
 from veritrace.protocol.model import Extraction, Transaction
 
 #: How long a blockage must persist to be a finding rather than backpressure.
@@ -170,7 +171,7 @@ def _end_signal(iface: Any, t: Transaction) -> str | None:
     phase = spec.end if spec is not None else None
     if phase is None:
         return None
-    return iface.signals.get(iface.pack.channel(phase.channel).valid)
+    return channels.gate_signal(iface, iface.pack.channel(phase.channel).valid)
 
 
 def _would_be(ex: Extraction, channel: str, t: int) -> str:

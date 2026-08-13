@@ -9,15 +9,20 @@
 import { decode, encode } from "@msgpack/msgpack";
 import type {
   ChecksReport,
+  CmdsResult,
+  CoverageReport,
+  DiffReport,
   Layout,
+  Machine,
+  MemoryReport,
+  OpenSession,
+  PerfReport,
+  Repro,
   SessionStatus,
   SignalMeta,
   SourceFile,
+  SubtraceResult,
   TxnQueryResult,
-  CmdsResult,
-  CoverageReport,
-  MemoryReport,
-  PerfReport,
   TxnReport,
   WaveChunk,
   WhyResult,
@@ -64,6 +69,30 @@ async function getJson<T>(url: string): Promise<T> {
   const r = await fetch(url, { headers: { Accept: "application/json" } });
   if (!r.ok) throw new Error(`${r.status} ${r.statusText} for ${url}`);
   return (await r.json()) as T;
+}
+
+/**
+ * POST a JSON body and read a JSON answer, surfacing the server's own `detail`.
+ *
+ * The message matters: every refusal in §11.8 is written to say what to do next,
+ * and a client that replaces it with "request failed: 409" throws that away.
+ */
+async function postJson<T>(url: string, body: unknown): Promise<T> {
+  const r = await post(url, body);
+  return (await r.json()) as T;
+}
+
+async function post(url: string, body: unknown): Promise<Response> {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const detail = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(detail.detail ?? `${r.status} ${r.statusText} for ${url}`);
+  }
+  return r;
 }
 
 export async function fetchRoot(): Promise<Root> {
@@ -199,16 +228,80 @@ export class WaveSocket {
 }
 
 export async function runQuery(session: string, vtq: string): Promise<WhyResult> {
-  const r = await fetch(`${API}/session/${session}/query`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ vtq }),
+  return postJson<WhyResult>(`${API}/session/${session}/query`, { vtq });
+}
+
+// --- §8.2, §8.3, §11.5, §12 — subtrace, repro, replay, report --------------
+
+/** §8.2's minimised chain, narrated — the steps Replay mode walks (§11.5). */
+export async function fetchSubtrace(session: string, vtq: string): Promise<SubtraceResult> {
+  return postJson<SubtraceResult>(`${API}/session/${session}/subtrace`, { vtq });
+}
+
+/** §8.3's testbench. `validate` compiles and runs it, which takes seconds. */
+export async function buildRepro(
+  session: string,
+  vtq: string,
+  opts: { mode?: string; validate?: boolean } = {},
+): Promise<Repro> {
+  return postJson<Repro>(`${API}/session/${session}/repro`, {
+    vtq,
+    mode: opts.mode ?? "auto",
+    validate: opts.validate ?? true,
   });
-  if (!r.ok) {
-    const detail = await r.json().catch(() => ({ detail: r.statusText }));
-    throw new Error(detail.detail ?? `query failed: ${r.status}`);
-  }
-  return (await r.json()) as WhyResult;
+}
+
+/**
+ * §12's report, downloaded as a file.
+ *
+ * A blob rather than a new tab: the page is an attachment the server names, and
+ * `window.open` on a POST route is not a thing.
+ */
+export async function downloadReport(session: string, vtq: string): Promise<string> {
+  const r = await post(`${API}/session/${session}/export`, { vtq, validate: true });
+  const blob = await r.blob();
+  const name =
+    /filename="([^"]+)"/.exec(r.headers.get("content-disposition") ?? "")?.[1] ?? "bug_report.html";
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(url);
+  return name;
+}
+
+// --- §8.8 — FSM mode -------------------------------------------------------
+
+export async function fetchMachines(session: string): Promise<Machine[]> {
+  const got = await getJson<{ machines: Machine[] }>(`${API}/session/${session}/fsm`);
+  return got.machines;
+}
+
+/** The URL "Export SVG" downloads — the server renders it, so CLI and UI agree. */
+export function fsmSvgUrl(session: string, signal: string): string {
+  return `${API}/session/${session}/fsm/${encodeURIComponent(signal)}/svg`;
+}
+
+// --- §8.7, TAB 5 — diff ----------------------------------------------------
+
+/** Every trace this server has open, for the two-trace selector of §11.4. */
+export async function fetchSessions(): Promise<OpenSession[]> {
+  const got = await getJson<{ sessions: OpenSession[] }>(`${API}/sessions`);
+  return got.sessions;
+}
+
+export async function runDiff(
+  session: string,
+  trace: string,
+  opts: { strategy?: string; anchor?: string | null; ignore?: string[] } = {},
+): Promise<DiffReport> {
+  return postJson<DiffReport>(`${API}/session/${session}/diff`, {
+    trace,
+    strategy: opts.strategy ?? "cycle",
+    anchor: opts.anchor ?? null,
+    ignore: opts.ignore ?? [],
+  });
 }
 
 export async function fetchSource(session: string, file: string): Promise<SourceFile> {
@@ -225,12 +318,7 @@ export async function suppressFinding(
   id: string,
   reason: string,
 ): Promise<void> {
-  const r = await fetch(`${API}/session/${session}/checks/${id}/suppress`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ reason }),
-  });
-  if (!r.ok) throw new Error(`suppress failed: ${r.status}`);
+  await post(`${API}/session/${session}/checks/${id}/suppress`, { reason });
 }
 
 export async function unsuppressFinding(session: string, id: string): Promise<void> {
@@ -248,16 +336,7 @@ export async function fetchTransactions(session: string): Promise<TxnReport> {
 
 /** Run a `txn(...)` pipeline (§10.1). */
 export async function runTxnQuery(session: string, vtq: string): Promise<TxnQueryResult> {
-  const r = await fetch(`${API}/session/${session}/transactions/query`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ vtq }),
-  });
-  if (!r.ok) {
-    const detail = await r.json().catch(() => ({ detail: r.statusText }));
-    throw new Error(detail.detail ?? `query failed: ${r.status}`);
-  }
-  return (await r.json()) as TxnQueryResult;
+  return postJson<TxnQueryResult>(`${API}/session/${session}/transactions/query`, { vtq });
 }
 
 // --- TAB 9, Performance (§8.17-8.18) ---------------------------------------

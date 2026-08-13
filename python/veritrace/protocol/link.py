@@ -34,6 +34,7 @@ from bisect import bisect_right
 from dataclasses import dataclass, field
 from typing import Any
 
+from veritrace.protocol import channels
 from veritrace.protocol.model import Interface, Transaction
 
 #: How many transaction hops one tree may contain. §8.16's worked example spans
@@ -125,7 +126,7 @@ class TxnIndex:
         phase = spec.end if spec is not None else None
         if phase is None:
             return None
-        return iface.signals.get(iface.pack.channel(phase.channel).valid)
+        return channels.gate_signal(iface, iface.pack.channel(phase.channel).valid)
 
     def start_signal(self, iface_name: str, kind: str) -> str | None:
         """Path of the `valid` whose rise would *issue* a transaction of this
@@ -136,7 +137,7 @@ class TxnIndex:
         spec = next((t for t in iface.pack.transactions if t.name == kind), None)
         if spec is None:
             return None
-        return iface.signals.get(iface.pack.channel(spec.start).valid)
+        return channels.gate_signal(iface, iface.pack.channel(spec.start).valid)
 
 
 # --- turning a transaction question into a signal question -------------------

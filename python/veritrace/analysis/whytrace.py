@@ -496,6 +496,25 @@ def _guard_true(d: Driver, read) -> bool:
     return (not g.x) and bool(g.v)
 
 
+def effective_time(view: "TraceView", sig: Signal, t: int) -> tuple[int, bool]:
+    """When to read a signal's inputs, and whether to read them *before* — §5.5.
+
+    A combinational signal is explained at `t`. A sequential one is explained at
+    the clock edge that produced it, with its inputs as they were going *into*
+    that edge — otherwise the answer is the absurd "state is WAIT because
+    next_state is WAIT" after next_state has already moved on.
+
+    Public because §8.3's don't-care check has to re-evaluate the same drivers at
+    the same instants: evaluating them one edge out would silently declare live
+    inputs to be don't-cares.
+    """
+    if not any(d.is_sequential for d in sig.drivers):
+        return t, False
+    clock = next((d.clock for d in sig.drivers if d.clock), None)
+    edge = view.last_posedge(clock, t) if clock else None
+    return (edge, True) if edge is not None else (t, False)
+
+
 def falsifying_terms(expr: Expr, read: Callable[[SignalId], BV | None]) -> list[SignalId]:
     """Signals responsible for `expr` being false.
 
@@ -716,15 +735,8 @@ class WhyTracer:
                 reason = Reason.UNCONNECTED_PORT
             return self._node(sid, t, NodeKind.TERMINAL, reason, loc=sig.decl_loc)
 
-        # 2. which driver was active, and when.
-        seq = any(d.is_sequential for d in sig.drivers)
-        t_eff, before = t, False
-        if seq:
-            clock = next((d.clock for d in sig.drivers if d.clock), None)
-            edge = self.view.last_posedge(clock, t) if clock else None
-            if edge is not None:
-                # §5.5 problem 2: evaluate on the values going *into* the edge.
-                t_eff, before = edge, True
+        # 2. which driver was active, and when (§5.5, problem 2).
+        t_eff, before = effective_time(self.view, sig, t)
 
         read = lambda s: self.view.value(s, t_eff, before)  # noqa: E731
 

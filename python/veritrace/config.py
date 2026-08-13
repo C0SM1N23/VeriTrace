@@ -17,6 +17,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+#: Everything this tool writes into a project goes here: the converted trace,
+#: the generated `$dumpvars` module (§13.4b), the repro testbench (§8.3), the
+#: session file. One name, because the tool also has to *avoid* this directory
+#: when it goes looking for the user's RTL — its own output is not design source.
+WORK_DIR = ".veritrace"
+
 #: §8.4 — cycles without a transition before a signal counts as stuck.
 DEFAULT_STUCK_CYCLES = 100
 #: §8.18. The same number as the stuck threshold on purpose: "this is not just

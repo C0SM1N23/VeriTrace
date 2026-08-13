@@ -22,6 +22,10 @@ from veritrace._native import TraceStore
 #: Bumped when the on-disk layout schema changes incompatibly.
 LAYOUT_VERSION = 1
 
+#: How many causal trees a session keeps. Small: the questions that matter are
+#: the one on screen and the ones Replay and the report ask about it.
+WHY_CACHE = 8
+
 
 def session_id_for(trace_path: Path) -> str:
     """Stable id derived from the trace location.
@@ -160,6 +164,34 @@ class Session:
     integrity_error: str = ""
     coverage: Any = None
     coverage_error: str = ""
+    #: Causal answers, keyed by `(signal, time)`. §8.2's minimisation, §8.3's
+    #: repro and §12's report all re-ask the question the Causal tab has just
+    #: answered; without this, pressing Replay rebuilds a tree that is already
+    #: on screen. Bounded, because a long session should not hold every tree it
+    #: ever built.
+    _why: dict[tuple[str, int], Any] = field(default_factory=dict, repr=False)
+
+    def why(self, signal: str, t: int) -> Any:
+        """`WhyResult` for this question, computed once (§8.1)."""
+        from veritrace.analysis.whytrace import WhyTracer
+
+        key = (signal, t)
+        got = self._why.get(key)
+        if got is None:
+            if len(self._why) >= WHY_CACHE:
+                self._why.clear()
+            got = WhyTracer(self.graph, self.store, txn_index=self.txn_index).why(signal, t)
+            self._why[key] = got
+        return got
+
+    def rtl_files(self) -> list[Path]:
+        """Every RTL file behind this session, expanded as the graph saw them."""
+        from veritrace.graph.elaborate import discover
+
+        out: list[Path] = []
+        for p in self.rtl_paths:
+            out.extend(discover(p))
+        return out
 
     @classmethod
     def open(
@@ -221,6 +253,9 @@ class Session:
             self.performance.liveness if self.performance is not None else None,
             self.memory,
             self.integrity,
+            project_root=(
+                getattr(self.config, "root", None) or self.trace_path.parent
+            ),
         )
         return self.report
 
@@ -480,6 +515,10 @@ class SessionRegistry:
 
     def get(self, session_id: str) -> Session | None:
         return self._sessions.get(session_id)
+
+    def all(self) -> list[Session]:
+        """Every open session, in the order they were opened (§11.4's TAB 5)."""
+        return list(self._sessions.values())
 
     def __contains__(self, session_id: object) -> bool:
         return session_id in self._sessions

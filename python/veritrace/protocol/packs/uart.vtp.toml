@@ -1,0 +1,62 @@
+name    = "UART"
+version = "1.0"
+
+# §8.15's serial row: "bring-up de placa". A UART has no handshake at all — it
+# is a shift register against a baud tick — so what makes it a *transaction* is
+# the byte the design already assembled. Every UART implementation exposes one:
+# `rx_valid`/`rx_data` on the way in, `tx_start`/`tx_data` on the way out.
+#
+# Deliberately keyed on those rather than on the serial line itself. Recovering
+# a byte from `rx` would mean re-implementing the receiver, in a tool whose
+# whole argument is that it reads what the design did rather than deciding what
+# it should have done — and it would disagree with the design on exactly the
+# baud-rate bugs somebody is debugging.
+
+[detect]
+required_suffixes = ["tx_data", "tx_start", "tx_busy"]
+prefix_strip      = ["uart_", "u_", ""]
+clock             = "clk|clock|.*_clk"
+reset             = "rst_n|resetn|rst|reset|.*_rst_n"
+
+[[channel]]
+name  = "TX"
+valid = "tx_start"
+# A byte is accepted when the transmitter is not already sending one.
+ready = "!tx_busy"
+payload = ["tx_data"]
+
+[[transaction]]
+name  = "SEND"
+start = "TX"
+key   = "byte = TX.tx_data"
+
+[metrics]
+latency = "end.cycle - start.cycle"
+
+[perf]
+transfer = ["TX"]
+data     = "tx_data"
+
+[[stall_reason]]
+name = "transmitter_busy"
+when = "tx_start && tx_busy"
+msg  = "a byte was offered while the transmitter was still shifting the last one"
+
+[[stall_reason]]
+name = "idle"
+when = "!tx_start"
+msg  = "nothing to send"
+
+[integrity]
+write = { kind = "SEND", data = "tx_data" }
+
+[[cover]]
+corner = "back_to_back"
+when   = "latency <= 1"
+msg    = "a byte offered the cycle the previous one finished"
+
+[[rule]]
+id       = "UART_NO_OVERRUN"
+severity = "error"
+check    = "tx_start |-> !tx_busy"
+msg      = "a byte was started while the transmitter was still busy — it will be lost"

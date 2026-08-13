@@ -17,6 +17,7 @@ from typing import Iterable, Sequence
 import pyslang
 from pyslang import ast as A, driver as D
 
+from veritrace.config import WORK_DIR
 from veritrace.graph import conditions as C
 from veritrace.graph.model import (
     DesignGraph,
@@ -599,8 +600,18 @@ def elaborate(
 
 
 def discover(root: str | Path) -> list[Path]:
-    """Every RTL file under `root`, for the `--rtl <dir>` convenience form."""
+    """Every RTL file under `root`, for the `--rtl <dir>` convenience form.
+
+    `WORK_DIR` is skipped. Everything the tool generates lands there — the
+    `$dumpvars` module of §13.4b, the repro testbench of §8.3 — and picking those
+    back up as design source means elaborating a module twice and failing to
+    compile against a directory that simulated fine ten seconds earlier.
+    """
     r = Path(root)
     if r.is_file():
         return [r]
-    return sorted(p for p in r.rglob("*") if p.suffix in RTL_SUFFIXES and p.is_file())
+    return sorted(
+        p
+        for p in r.rglob("*")
+        if p.suffix in RTL_SUFFIXES and p.is_file() and WORK_DIR not in p.parts
+    )

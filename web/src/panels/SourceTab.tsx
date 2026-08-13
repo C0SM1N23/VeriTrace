@@ -248,7 +248,20 @@ export function SourceTab() {
 
   return (
     <div className="source">
-      <div className="source-head mono">{source.file}</div>
+      <div className="source-head mono">
+        {source.file}
+        <span className="spacer" />
+        {/* §11.4: FSM is a *mode* of this tab. The button is here rather than in
+            the strip because that is what the consolidation decided. */}
+        <button
+          className="chip"
+          onClick={() => useWave.getState().setFsmOpen(true)}
+          data-testid="fsm-open"
+          title="State machines in this design (§8.8)"
+        >
+          FSM <kbd>⌘M</kbd>
+        </button>
+      </div>
       <div className="source-body" ref={hostRef} data-testid="source-editor" />
     </div>
   );

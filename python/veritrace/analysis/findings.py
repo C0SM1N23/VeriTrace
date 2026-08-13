@@ -62,7 +62,15 @@ class Group(Enum):
     #: transaction-derived findings, because corrupted data outranks every
     #: structural warning in the list.
     INTEGRITY = "integrity"
+    #: §8.8's static checks. Above lint because a dead state is a functional bug
+    #: rather than a style warning, and below the transaction-derived groups
+    #: because those carry evidence from the run while these are structural.
+    FSM = "fsm"
     LINT = "lint"
+    #: §13.7 — anything a project's own plugins found. Last but one, because a
+    #: finding from a plugin is by definition about this project rather than
+    #: about RTL in general, and the reader knows their own checks.
+    PLUGIN = "plugin"
     PARAMETERS = "parameters"
 
     @property
@@ -73,8 +81,8 @@ class Group(Enum):
     def label(self) -> str:
         return {"stuck": "STUCK", "x_sources": "X SOURCES", "protocol": "PROTOCOL",
                 "memory": "MEMORY", "integrity": "DATA INTEGRITY",
-                "liveness": "LIVENESS", "lint": "LINT",
-                "parameters": "PARAMETERS"}[self.value]
+                "liveness": "LIVENESS", "fsm": "FSM", "lint": "LINT",
+                "plugin": "PLUGINS", "parameters": "PARAMETERS"}[self.value]
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +169,10 @@ class Report:
 
     findings: list[Finding] = field(default_factory=list)
     skipped: dict[str, str] = field(default_factory=dict)
+    #: §13.7 — tables a project's plugins produced. Carried here rather than
+    #: returned separately because §13.7 promises a tabular result reaches the
+    #: interface without anyone touching it, and the report is what reaches it.
+    plugin_tables: list[Any] = field(default_factory=list)
     #: Wall time of the whole scan, milliseconds.
     elapsed_ms: float = 0.0
 
@@ -190,6 +202,7 @@ class Report:
         return Report(
             findings=[f for f in self.findings if f.id not in dead],
             skipped=dict(self.skipped),
+            plugin_tables=list(self.plugin_tables),
             elapsed_ms=self.elapsed_ms,
         )
 
@@ -199,6 +212,7 @@ class Report:
             "groups": {g.value: len(v) for g, v in self.by_group().items()},
             "counts": self.counts(),
             "skipped": dict(self.skipped),
+            "plugin_tables": [t.to_dict() for t in self.plugin_tables],
             "ms": round(self.elapsed_ms, 2),
         }
 

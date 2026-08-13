@@ -30,7 +30,9 @@ const LABELS: Record<FindingGroup, string> = {
   liveness: "LIVENESS",
   memory: "MEMORY",
   integrity: "DATA INTEGRITY",
+  fsm: "FSM",
   lint: "LINT",
+  plugin: "PLUGINS",
   parameters: "PARAMETERS",
 };
 

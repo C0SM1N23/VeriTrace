@@ -1,0 +1,63 @@
+name    = "RISC-V Retire"
+version = "1.0"
+
+# §8.15: "PC + instructiune retirata — CPU-ul tau, comparatie cu Spike".
+#
+# Not a bus. The "interface" is the retire port every RISC-V core exposes for
+# tracing — the RVFI convention, or a core's own `retire_valid`/`retire_pc` —
+# and a "transaction" is one retired instruction. That makes the whole
+# transaction layer apply to a CPU without a single change to the engine:
+# §8.7's diff aligns two runs on retired instructions, §8.19's scoreboard
+# compares committed writes, and §8.21 covers which instructions a test reached.
+#
+# There is no `ready`: retirement is not refused, it happens.
+
+[detect]
+required_suffixes = ["retire_valid", "retire_pc"]
+prefix_strip      = ["rvfi_", "trace_", "retire_", "core_", ""]
+clock             = "clk|clock|.*_clk"
+reset             = "rst_n|resetn|rst|reset|.*_rst_n"
+
+[[channel]]
+name    = "RET"
+valid   = "retire_valid"
+payload = ["retire_pc", "retire_insn", "retire_rd", "retire_rd_data", "retire_trap", "retire_mode"]
+
+[[transaction]]
+name  = "RETIRE"
+start = "RET"
+key   = "pc = RET.retire_pc"
+
+[metrics]
+# Instructions per cycle falls out of the count and the run length; what is
+# worth naming per instruction is the gap since the last one, which is where a
+# pipeline stall shows up.
+gap = "start.cycle - start.cycle"
+
+[perf]
+transfer = ["RET"]
+data     = "retire_rd_data"
+
+[[stall_reason]]
+name = "no_retire"
+when = "!retire_valid"
+msg  = "no instruction retired this cycle: the pipeline was stalled or flushed"
+
+# §8.19: the register file write each instruction committed. Compared in order,
+# because a program has no addresses to key on — which is exactly the shape the
+# integrity scoreboard already handles for streams.
+[integrity]
+write = { kind = "RETIRE", data = "retire_rd_data" }
+
+[[cover]]
+field = "retire_trap"
+bins  = { NORMAL = 0, TRAP = 1 }
+
+[[cover]]
+field = "retire_mode"
+bins  = { USER = 0, SUPERVISOR = 1, RESERVED = 2, MACHINE = 3 }
+
+[[cover]]
+corner = "back_to_back"
+when   = "gap <= 1"
+msg    = "two instructions retiring in consecutive cycles"

@@ -1,0 +1,108 @@
+name    = "Wishbone B4"
+version = "1.0"
+
+# §8.15: "open-source cores". Wishbone's classic cycle is:
+#
+#   cyc && stb          the master is asking
+#   ack | err | rty     the slave answers, one of three ways
+#
+# So the handshake is `cyc && stb` against `ack || err || rty`, which is why
+# this pack needs the expression form. Writing `valid = "stb"` alone would
+# count the cycles where the master holds STB without owning the bus, and
+# writing `ready = "ack"` alone would leave an errored transfer open forever —
+# ERR and RTY terminate a cycle just as ACK does, and a core that retries is
+# not a core that hung.
+#
+# Registered-feedback (pipelined) Wishbone adds `stall_i`; it is picked up as
+# payload where it exists, and the stall cascade names it.
+
+[detect]
+required_suffixes = ["cyc", "stb", "ack", "adr", "we", "dat_i", "dat_o"]
+prefix_strip      = ["wb_", "wbm_", "wbs_", "m_wb_", "s_wb_", "m_", "s_", ""]
+clock             = "clk|clk_i|wb_clk|.*_clk"
+reset             = "rst|rst_i|rst_n|resetn|wb_rst|.*_rst"
+
+[[channel]]
+name  = "WB"
+valid = "cyc && stb"
+# ERR and RTY end a cycle exactly as ACK does. A pack that only watched `ack`
+# would report every errored transfer as one that never completed.
+ready = "ack || err || rty"
+payload = ["adr", "we", "dat_i", "dat_o", "sel", "cti", "bte", "err", "rty"]
+
+[[transaction]]
+name  = "XFER"
+start = "WB"
+key   = "addr = WB.adr"
+
+[metrics]
+latency     = "end.cycle - start.cycle"
+wait_states = "sum(stall)"
+
+[perf]
+transfer = ["WB"]
+data     = "dat_i"
+strobe   = "sel"
+
+[[stall_reason]]
+name = "slave_wait"
+when = "cyc && stb && !(ack || err || rty)"
+msg  = "the master was asking and the slave had not answered"
+
+[[stall_reason]]
+name = "bus_held"
+# CYC without STB: the master owns the bus between phases of a block cycle.
+when = "cyc && !stb"
+msg  = "the master held the bus without asserting a strobe"
+
+[[stall_reason]]
+name = "idle"
+when = "!cyc"
+msg  = "no bus cycle was in progress"
+
+[integrity]
+addr  = "addr"
+write = { kind = "XFER", data = "dat_i", strobe = "sel" }
+
+[[cover]]
+field = "we"
+bins  = { READ = 0, WRITE = 1 }
+
+[[cover]]
+field = "cti"
+bins  = { CLASSIC = 0, CONST_BURST = 1, INCR_BURST = 2, END_OF_BURST = 7 }
+
+[[cover]]
+corner = "error_termination"
+when   = "err != 0"
+msg    = "a cycle the slave terminated with ERR"
+
+[[cover]]
+corner = "retry"
+when   = "rty != 0"
+msg    = "a cycle the slave asked to be retried"
+
+[[rule]]
+id       = "WB_ADDR_STABLE"
+severity = "error"
+check    = "cyc && stb && !(ack || err || rty) |=> $stable(adr)"
+msg      = "the address changed before the slave terminated the cycle"
+
+[[rule]]
+id       = "WB_STB_HELD"
+severity = "error"
+check    = "cyc && stb && !(ack || err || rty) |=> stb"
+msg      = "the strobe was withdrawn before the slave answered"
+
+# B4 rule 3.20: the three terminating signals are mutually exclusive.
+[[rule]]
+id       = "WB_ONE_TERMINATION"
+severity = "error"
+check    = "ack || err || rty |-> !(ack && err) && !(ack && rty) && !(err && rty)"
+msg      = "more than one of ACK, ERR and RTY was asserted at once"
+
+[[rule]]
+id       = "WB_ERR"
+severity = "warn"
+check    = "err == 0"
+msg      = "the slave terminated a cycle with ERR"

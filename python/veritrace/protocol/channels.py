@@ -23,6 +23,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from veritrace.protocol import expr
 from veritrace.protocol.model import ChannelEvent, FieldValue, Interface
 from veritrace.protocol.pack import Channel
 
@@ -172,15 +173,88 @@ def scan(
     return out
 
 
+def gate_signal(iface: Interface, spec: str | None) -> str | None:
+    """The trace path a handshake gate is *about*, for "what is it waiting on".
+
+    A plain `valid` is that signal. An expression is about the wires it reads,
+    and the first one it names is the one to point a reader at — `htrans` for
+    AHB, `cyc` for Wishbone. Better than `None`, which is what a plain lookup
+    returns and which reads as "this transaction is waiting on nothing".
+    """
+    if spec is None:
+        return None
+    direct = iface.signals.get(spec)
+    if direct is not None:
+        return direct
+    try:
+        node = expr.parse(spec)
+    except expr.ExprError:
+        return None
+    if isinstance(node, expr.Name):
+        return None
+    for name in sorted(expr.identifiers(node)):
+        got = iface.signals.get(name)
+        if got is not None:
+            return got
+    return None
+
+
+def gate(iface: Interface, spec: str | None, sampler: Sampler) -> list[Any] | None:
+    """A channel's `valid` or `ready`, as a column at every clock edge.
+
+    Usually a signal of the interface, and that is one lookup. But several of
+    the protocols in §8.15 do not *have* a valid/ready pair, and their handshake
+    is a small expression over the wires they do have:
+
+        AHB       valid = "htrans[1]"          NONSEQ or SEQ, not IDLE/BUSY
+        Wishbone  valid = "cyc && stb"         the master's request phase
+        SPI       valid = "!cs_n && sck_rise"  a frame is in progress
+
+    So a `valid` that is not a signal of the interface is parsed as an
+    expression over ones that are, and evaluated per edge. Without this the
+    engine can only describe protocols that happen to be shaped like AXI, and
+    §16.2 is explicit that the engine is what matters rather than the number of
+    packs.
+
+    `None` when a name it needs is not in the trace — the caller reports that,
+    rather than treating an unobservable channel as one that never transferred.
+    """
+    if spec is None:
+        return None
+    direct = sampler.column(iface.signals.get(spec))
+    if direct is not None:
+        return direct
+
+    try:
+        node = expr.parse(spec)
+    except expr.ExprError:
+        return None
+    if isinstance(node, expr.Name):
+        return None  # a plain name that simply is not there; not an expression
+
+    names = sorted(expr.identifiers(node))
+    sampler.prefetch([iface.signals.get(n) for n in names])
+    columns: dict[str, list[Any]] = {}
+    for n in names:
+        col = sampler.column(iface.signals.get(n))
+        if col is None:
+            return None
+        columns[n] = col
+    return [
+        expr.evaluate(node, expr.MappingEnv({n: columns[n][i] for n in names}))
+        for i in range(len(sampler.edges))
+    ]
+
+
 def _scan_one(
     iface: Interface, ch: Channel, sampler: Sampler, in_reset: list[bool]
 ) -> ChannelScan:
     res = ChannelScan(channel=ch.name)
-    valid = sampler.column(iface.signals.get(ch.valid))
+    valid = gate(iface, ch.valid, sampler)
     if valid is None:
         res.skipped = f"`{ch.valid}` is not in the trace"
         return res
-    ready = sampler.column(iface.signals.get(ch.ready)) if ch.ready else None
+    ready = gate(iface, ch.ready, sampler) if ch.ready else None
     if ch.ready and ready is None:
         # A dumped valid without its ready is not a reason to give up: the
         # channel still transfers, we just cannot see the backpressure. Say so.

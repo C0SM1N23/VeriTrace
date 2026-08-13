@@ -641,6 +641,12 @@ veritrace perf  trace ["stalls(iface)" | "deadlock()" | "latency(iface, by=maste
 veritrace memory trace ["cmds(iface)" | "banks(iface)" | "timing(iface, chip=…)"]
 veritrace track trace ["track(addr=0x10)" | "track(data=0x…)" | "scoreboard(iface)"]
 veritrace coverage trace ["fcov(iface)" | "uncovered()"] [--coverage logs/coverage.dat]
+veritrace repro trace "why(sig)" [-o tb.sv] [--mode minimal|focused] [--no-validate]
+veritrace export trace --why "why(sig)" -o bug.html   # standalone report, no network
+veritrace diff  good.vcd bad.vcd [--align cycle|handshake|retire] [--ignore "*_cnt"]
+veritrace fsm   [trace] [signal] [--svg d.svg]        # state machines; no trace needed
+veritrace gen-sva trace --iface top.dut.m_axi --target verilator|portable -o chk.sv
+veritrace plugins                    # what analysis plugins this project has
 veritrace check trace --fail-on stuck,x,cdc,protocol,deadlock,memory,integrity  # the CI gate
 veritrace probes sig --format vivado|quartus
 veritrace correlate trace --rtl src/
@@ -675,6 +681,7 @@ the tool stops finding them.
 | `designs/deadlock` | two nodes waiting on each other — the bug is one `define` away from being gone ([README](designs/deadlock/README.md)) |
 | `designs/sdram` | an SDR SDRAM command bus with four injected timing violations, one per category ([README](designs/sdram/README.md)) |
 | `designs/dma` | a DMA path whose byte-enable mask drops two lanes — also one `define` from being clean ([README](designs/dma/README.md)) |
+| `designs/fsm` | **one deliberate flaw per §8.8 check**, plus a clean control machine — and a testbench that deliberately never reaches most of them ([README](designs/fsm/README.md)) |
 
 ## Status
 
@@ -685,12 +692,18 @@ graph and correlation layer, why-trace, stuck / X-prop / cone / lint / parameter
 checks, log triage, viewer and probe export, protocol packs with automatic
 interface detection and rule checking, transaction-level why-trace, stall
 attribution and the liveness scan, SDRAM command decode with the twelve timing
-constraints, the automatic data-integrity scoreboard, and functional coverage
-from transactions with code coverage imported from Verilator or Vivado — and the
-Wave, Causal, Source, Checks, Coverage, Transactions, Performance and Memory
-tabs.
+constraints, the automatic data-integrity scoreboard, functional coverage
+from transactions with code coverage imported from Verilator or Vivado, causal
+subtrace minimisation with a generated testbench that is compiled and run to
+prove it reproduces, the standalone HTML bug report, first-divergence diff
+between two runs, FSM extraction with five static checks that need no trace at
+all, protocol checkers generated as SVA or as plain Verilog, and analysis
+plugins — and the Wave, Causal, Source, Checks, Diff, Coverage, Transactions,
+Performance and Memory tabs, plus Causal Replay and FSM modes.
 
-Not yet: diff, FSM extraction.
+Fifteen protocol packs ship in the repo: AXI4, AXI4-Lite, AXI4-Stream, AHB-Lite,
+APB, Avalon-MM, Avalon-ST, Wishbone B4, SDR SDRAM, DDR3, SPI, I2C, UART, generic
+handshake and RISC-V retire.
 
 Measured on a 50 MB / 3.6 M-event synthetic dump over 5000 signals, against the
 tier-A budget:

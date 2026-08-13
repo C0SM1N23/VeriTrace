@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { UI_PORT } from "./devserver";
 
 const BACKEND = process.env.VERITRACE_BACKEND ?? "http://127.0.0.1:8765";
 
@@ -8,11 +9,10 @@ export default defineConfig({
   server: {
     // Bind the v4 loopback explicitly: `localhost` resolves to ::1 on some
     // Windows setups, and then anything probing 127.0.0.1 is refused.
-    // The port is chosen to sit outside the ranges Windows reserves for
-    // Hyper-V/WSL (see `netsh interface ipv4 show excludedportrange tcp`),
-    // which otherwise fail to bind with EACCES and no listener in sight.
+    // The port lives in `devserver.ts`, shared with the Playwright config and
+    // overridable — see the note there about Windows reserving port ranges.
     host: "127.0.0.1",
-    port: 5400,
+    port: UI_PORT,
     // The dev server proxies to `veritrace serve` so the app talks to one
     // origin and the WebSocket needs no CORS dance.
     proxy: {

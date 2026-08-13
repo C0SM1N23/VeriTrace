@@ -132,6 +132,30 @@ def _interface_name(scope: str, prefix: str) -> str:
     return f"{leaf}.{stem}" if stem else leaf
 
 
+def _handshake_names(ch: Any) -> list[str]:
+    """The signals a channel's handshake is made of.
+
+    Usually just `valid` and `ready`. A protocol with no valid/ready pair spells
+    its handshake as an expression — AHB's `htrans[1]`, Wishbone's `cyc && stb` —
+    and then the identity of the interface is the signals that expression reads.
+    Taking the expression text as a name would find nothing, and two views of one
+    bus would be reported as two buses.
+    """
+    from veritrace.protocol import expr
+
+    out: list[str] = []
+    for spec in (ch.valid, ch.ready):
+        if not spec:
+            continue
+        try:
+            node = expr.parse(spec)
+        except expr.ExprError:
+            out.append(spec)
+            continue
+        out.extend(sorted(expr.identifiers(node)) if not isinstance(node, expr.Name) else [spec])
+    return out
+
+
 def _identity(store: Any, iface: Interface) -> frozenset[int]:
     """The event streams of an interface's handshake signals.
 
@@ -156,8 +180,8 @@ def _identity(store: Any, iface: Interface) -> frozenset[int]:
         paths = [
             p
             for ch in iface.pack.channels
-            for p in (iface.signals.get(ch.valid), iface.signals.get(ch.ready))
-            if p
+            for name in _handshake_names(ch)
+            if (p := iface.signals.get(name))
         ]
     else:
         encoded = {sig for c in iface.pack.commands for sig in c.encode}

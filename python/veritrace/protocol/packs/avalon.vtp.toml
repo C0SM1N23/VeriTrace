@@ -1,0 +1,121 @@
+name    = "Avalon-MM"
+version = "1.0"
+
+# §8.15: "Intel/Altera — **DE10-Lite, placa ta**". The one pack in the table
+# with a board attached to it, so it is worth getting the pipelined case right
+# rather than only the simple one.
+#
+# Avalon-MM's handshake is `waitrequest`, and it runs the *other way* from
+# AXI's ready: the slave asserts `waitrequest` to say **not yet**. So the
+# accepting cycle is `(read || write) && !waitrequest`, which is what `ready`
+# below spells out. A pack that wrote `ready = "waitrequest"` would record a
+# transfer on exactly the cycles where none happened — the failure would look
+# like a working tool with the timing inverted, which is the worst kind.
+#
+# Read data comes back later, flagged by `readdatavalid`, and that is a second
+# channel rather than a field of the first: on a pipelined slave the return is
+# several cycles after the command and the two are not one event.
+
+[detect]
+required_suffixes = ["address", "read", "write", "readdata", "writedata", "waitrequest"]
+prefix_strip      = ["avm_", "avs_", "avalon_", "mm_", "m_", "s_", ""]
+clock             = "clk|clock|.*_clk"
+reset             = "reset_n|resetn|rst_n|reset|.*_reset_n|.*_rst_n"
+
+[[channel]]
+name  = "CMD"
+valid = "read || write"
+# Inverted on purpose: `waitrequest` high means the slave is *not* accepting.
+ready = "!waitrequest"
+payload = ["address", "read", "write", "writedata", "byteenable", "burstcount"]
+
+[[channel]]
+name  = "RSP"
+valid = "readdatavalid"
+payload = ["readdata", "response"]
+
+# A read is only complete when its data comes back, which on a pipelined slave
+# is a different cycle from the command.
+[[transaction]]
+name  = "READ"
+start = "CMD"
+end   = { channel = "RSP" }
+key   = "addr = CMD.address"
+
+# A write completes when it is accepted: Avalon-MM has no write response.
+[[transaction]]
+name  = "WRITE"
+start = "CMD"
+key   = "addr = CMD.address"
+
+[metrics]
+latency     = "end.cycle - start.cycle"
+wait_states = "sum(stall)"
+
+[perf]
+transfer = ["CMD"]
+data     = "writedata"
+strobe   = "byteenable"
+
+[[stall_reason]]
+name = "waitrequest"
+when = "(read || write) && waitrequest"
+msg  = "the slave asserted waitrequest: the command was offered and held off"
+
+[[stall_reason]]
+name = "read_latency"
+when = "outstanding > 0"
+msg  = "a read was accepted and its data had not come back yet"
+
+[[stall_reason]]
+name = "idle"
+when = "!read && !write"
+msg  = "the master issued no command"
+
+[integrity]
+addr  = "addr"
+write = { kind = "WRITE", data = "writedata", strobe = "byteenable" }
+read  = { kind = "READ",  data = "readdata" }
+
+[[cover]]
+field = "response"
+bins  = { OKAY = 0, RESERVED = 1, SLAVEERROR = 2, DECODEERROR = 3 }
+
+[[cover]]
+corner = "burst"
+when   = "burstcount > 1"
+msg    = "a burst longer than one word"
+
+[[cover]]
+corner = "partial_write"
+when   = "byteenable != (1 << stride) - 1"
+msg    = "a write that did not enable every byte lane"
+
+[[cover]]
+sequence = "kind"
+
+[[rule]]
+id       = "AVMM_ADDR_STABLE"
+severity = "error"
+check    = "(read || write) && waitrequest |=> $stable(address)"
+msg      = "the address changed while waitrequest was held"
+
+[[rule]]
+id       = "AVMM_CMD_HELD"
+severity = "error"
+check    = "write && waitrequest |=> write"
+msg      = "the command was withdrawn while the slave was asserting waitrequest"
+
+[[rule]]
+id       = "AVMM_WDATA_STABLE"
+severity = "error"
+check    = "write && waitrequest |=> $stable(writedata)"
+msg      = "the write data changed while waitrequest was held"
+
+# Avalon-MM forbids asserting both in the same cycle. A design that does is not
+# slow, it is broken, and the slave's behaviour is undefined.
+[[rule]]
+id       = "AVMM_RW_EXCLUSIVE"
+severity = "error"
+check    = "read || write |-> !(read && write)"
+msg      = "read and write were asserted in the same cycle"

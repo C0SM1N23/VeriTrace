@@ -18,6 +18,7 @@ import time as _time
 from typing import Any, Callable, Iterator
 
 from veritrace.analysis import (
+    fsmchecks,
     integrity,
     lint,
     liveness,
@@ -36,6 +37,13 @@ ALL_CHECKS: dict[str, str] = {
     xprop.CHECK: "root cause of an X",
     params.CHECK: "parameter left on a default the parent contradicts",
     protocol.CHECK: "protocol rule from a pack that did not hold (§8.14)",
+    **{c: d for c, d in zip(fsmchecks.CHECKS, (
+        "a state with no satisfiable way out (§8.8)",
+        "a state no path from reset reaches",
+        "a transition whose guard contradicts itself",
+        "a state that holds when none of its exits match",
+        "a register of the machine with no reset branch",
+    ))},
     **liveness.CHECKS,
     **memory.CHECKS,
     **integrity.CHECKS,
@@ -54,7 +62,12 @@ GROUP_ALIASES: dict[str, tuple[str, ...]] = {
     "deadlock": (liveness.CHECK_DEADLOCK,),
     "memory": tuple(memory.CHECKS),
     "integrity": tuple(integrity.CHECKS),
+    "fsm": tuple(fsmchecks.CHECKS),
 }
+
+#: Plugin checks are named `plugin.<name>` and discovered at run time, so they
+#: cannot be listed above. `--fail-on plugin` covers all of them, and
+#: `--fail-on plugin.clock_gating` covers one.
 
 
 def expand_checks(names: Iterator[str] | list[str] | tuple[str, ...]) -> set[str]:
@@ -78,6 +91,7 @@ def run_all(
     liveness_report: Any = None,
     memory_reports: Any = None,
     integrity_report: Any = None,
+    project_root: Any = None,
 ) -> Report:
     """Run every applicable check.
 
@@ -145,6 +159,14 @@ def run_all(
         None if integrity_report is not None else "the data-integrity scan was not run",
         lambda: integrity.scan(integrity_report, config),
     )
+    # §8.8. Needs the graph and nothing else: the whole point of these checks is
+    # that they find a dead state the stimulus never reached, so a session with
+    # no dump reports exactly the same list.
+    run(
+        Group.FSM.value,
+        no_rtl,
+        lambda: fsmchecks.scan(graph, elaboration, store, config),
+    )
     run(
         Group.LINT.value,
         no_rtl,
@@ -156,6 +178,13 @@ def run_all(
             config,
         ),
     )
+    # §13.7. Discovered from the project rather than declared here: adding an
+    # analysis must not mean editing the core, which is the whole promise.
+    run(
+        Group.PLUGIN.value,
+        None,
+        lambda: _plugins(store, graph, elaboration, clock, config, analysis, report, project_root),
+    )
     run(
         Group.PARAMETERS.value,
         None if elaboration is not None else "no RTL loaded",
@@ -164,6 +193,38 @@ def run_all(
 
     report.elapsed_ms = (_time.perf_counter() - started) * 1000.0
     return report
+
+
+def _plugins(store, graph, elaboration, clock, config, analysis, report, project_root=None) -> Iterator[Finding]:
+    """§13.7's plugins, discovered and run like any other detector.
+
+    The tables they produce travel on the report rather than being dropped:
+    §13.7 promises a tabular result becomes a tab without anyone touching the UI,
+    and a runner that kept only the findings would quietly break half of that.
+    """
+    from veritrace import plugin as plugin_mod
+
+    # The same rule the protocol packs follow: the project is where the config
+    # says, and failing that where the trace is. A plugin sits next to the
+    # design it is about, and a project with no `.veritrace.toml` is still a
+    # project (§4.3 makes the file optional).
+    root = getattr(config, "root", None) or project_root
+    found, errors = plugin_mod.discover(root)
+    report.skipped.update({f"plugin:{name}": why for name, why in errors.items()})
+    if not found:
+        return
+    got = plugin_mod.run_all(
+        found,
+        store=store,
+        graph=graph,
+        elaboration=elaboration,
+        clock=clock,
+        config=config,
+        protocol=analysis,
+    )
+    report.plugin_tables.extend(got.tables)
+    report.skipped.update({f"plugin:{name}": why for name, why in got.skipped.items()})
+    yield from got.findings
 
 
 def default_tab(

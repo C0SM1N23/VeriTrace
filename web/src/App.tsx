@@ -4,11 +4,19 @@ import { CausalTab } from "./panels/CausalTab";
 import { ChecksTab } from "./panels/ChecksTab";
 import { CommandPalette } from "./panels/CommandPalette";
 import { CoverageTab } from "./panels/CoverageTab";
-import { HelpOverlay, QueryBar, StatusBar, TabStrip, TopBar } from "./panels/Chrome";
+import { DiffTab } from "./panels/DiffTab";
+import { FsmMode } from "./panels/FsmMode";
+import { FIXED_TABS, HelpOverlay, QueryBar, StatusBar, TabStrip, TopBar } from "./panels/Chrome";
+import { PluginTab } from "./panels/PluginTab";
+import type { PluginTable } from "./lib/types";
+
+/** Shared, so the selector below returns a stable reference — see Chrome.tsx. */
+const NO_TABLES: PluginTable[] = [];
 import { SignalPanel } from "./panels/SignalPanel";
 import { SourceTab } from "./panels/SourceTab";
 import { MemoryTab } from "./panels/MemoryTab";
 import { PerformanceTab } from "./panels/PerformanceTab";
+import { ReplayMode } from "./panels/ReplayMode";
 import { TransactionsTab } from "./panels/TransactionsTab";
 import { WaveMenu } from "./panels/WaveMenu";
 import { flushPersist, useWave } from "./state/store";
@@ -18,7 +26,10 @@ export default function App() {
   const error = useWave((s) => s.error);
   const load = useWave((s) => s.load);
   const tab = useWave((s) => s.activeTab);
+  const replay = useWave((s) => s.replay);
+  const fsmOpen = useWave((s) => s.fsmOpen);
   const rtlChanged = useWave((s) => s.status?.rtl_changed ?? false);
+  const pluginTables = useWave((s) => s.checks?.plugin_tables ?? NO_TABLES);
 
   useEffect(() => {
     void load();
@@ -52,7 +63,7 @@ export default function App() {
   }
 
   return (
-    <div className="app">
+    <div className={replay ? "app replaying" : "app"}>
       <TopBar />
       {rtlChanged && (
         // §5.7: the RTL moved on after the run. Warn, never block.
@@ -69,7 +80,11 @@ export default function App() {
         {/* The wave canvas stays mounted across tabs: re-creating the worker
             and refetching on every tab switch would make the app feel cheap. */}
         <div className="panes">
-          <div className={tab === 1 ? "pane on" : "pane"}>
+          {/* Replay covers everything but a strip of this canvas: §11.5 wants a
+              waveform windowed on the current step, and the real one — already
+              mounted, already fed by the worker — is the only one that can be
+              trusted to agree with the rest of the app. */}
+          <div className={tab === 1 || replay ? "pane on" : "pane"}>
             <WaveCanvas />
           </div>
           {tab === 2 && (
@@ -79,12 +94,20 @@ export default function App() {
           )}
           {tab === 3 && (
             <div className="pane on">
-              <SourceTab />
+              {/* §11.4: FSM took the Source pane rather than a tab of its own —
+                  "FSM e o vedere asupra structurii codului, nu un domeniu
+                  separat". Leaving the mode puts the code back. */}
+              {fsmOpen ? <FsmMode /> : <SourceTab />}
             </div>
           )}
           {tab === 5 && (
             <div className="pane on">
               <ChecksTab />
+            </div>
+          )}
+          {tab === 6 && (
+            <div className="pane on">
+              <DiffTab />
             </div>
           )}
           {tab === 7 && (
@@ -107,6 +130,12 @@ export default function App() {
               <MemoryTab />
             </div>
           )}
+          {tab > FIXED_TABS && pluginTables[tab - FIXED_TABS - 1] && (
+            <div className="pane on">
+              <PluginTab table={pluginTables[tab - FIXED_TABS - 1]} />
+            </div>
+          )}
+          <ReplayMode />
         </div>
       </div>
       <StatusBar />
@@ -157,6 +186,23 @@ function useKeyboard() {
       }
       if (e.key === "?") {
         s.setHelp(!s.helpOpen);
+        return;
+      }
+      if (mod && e.key.toLowerCase() === "m") {
+        // §11.4: FSM is a mode of the Source tab, entered and left with the
+        // same chord.
+        e.preventDefault();
+        s.setFsmOpen(!s.fsmOpen);
+        return;
+      }
+      if (e.key === "s" && !mod) {
+        // §11.7: the minimal subtrace of the chain on screen.
+        if (s.causal) void s.loadSubtrace();
+        return;
+      }
+      if (e.key === "r" && !mod) {
+        // §11.7: replay. Only meaningful with a chain to replay.
+        if (s.causal) s.setReplay(true);
         return;
       }
       if (e.key === "w" && !mod) {

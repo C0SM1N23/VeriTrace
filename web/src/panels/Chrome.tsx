@@ -2,16 +2,35 @@
 
 import { useEffect, useRef } from "react";
 import { formatTime } from "../lib/time";
+import type { PluginTable } from "../lib/types";
 import { useWave } from "../state/store";
+
+/**
+ * One empty array, shared.
+ *
+ * `useWave((s) => s.checks?.plugin_tables ?? [])` looks harmless and is not: the
+ * `??` builds a *new* array on every render, so the store's snapshot never
+ * compares equal, React re-renders, and the component loops until it throws
+ * "Maximum update depth exceeded" — which takes the whole application down, not
+ * just the tab strip.
+ */
+const NO_TABLES: PluginTable[] = [];
 
 /** The tab strip of §11.4. Tabs that do not exist yet are visible but inert. */
 const TABS = [
   "Wave", "Causal", "Source", "FSM", "Checks", "Diff", "Coverage",
   "Transactions", "Performance", "Memory",
 ];
-/** 1-based indices of the tabs that are built. FSM (4) and Diff (6) are still
- *  design only. */
-const BUILT = new Set([1, 2, 3, 5, 7, 8, 9, 10]);
+/**
+ * 1-based indices of the tabs that are built.
+ *
+ * FSM keeps its place in the strip but is not one: §11.4 consolidated it into
+ * the Source tab — *"FSM e o vedere asupra structurii codului, nu un domeniu
+ * separat... 10 tab-uri era prea mult"* — so the slot says where it went rather
+ * than pretending the feature is missing.
+ */
+const BUILT = new Set([1, 2, 3, 5, 6, 7, 8, 9, 10]);
+const MOVED: Record<number, string> = { 4: "FSM — a mode of the Source tab (⌘M)" };
 /** Checks is tab 5; its badge shows how much it already knows (§13.4). */
 export const CHECKS_TAB = 5;
 
@@ -46,6 +65,9 @@ export function TabStrip() {
   const active = useWave((s) => s.activeTab);
   const setTab = useWave((s) => s.setTab);
   const nFindings = useWave((s) => s.status?.n_findings ?? 0);
+  // §13.7: a plugin's table becomes a tab, and nobody edits this file to add
+  // one. The strip grows past the ten §11.4 names by however many came back.
+  const tables = useWave((s) => s.checks?.plugin_tables ?? NO_TABLES);
   return (
     <div className="tab-strip" role="tablist">
       {TABS.map((t, i) => {
@@ -58,7 +80,7 @@ export function TabStrip() {
             aria-selected={active === n}
             className={`tab${active === n ? " on" : ""}${enabled ? "" : " disabled"}`}
             onClick={() => enabled && setTab(n)}
-            title={enabled ? t : `${t} — not built yet`}
+            title={enabled ? t : (MOVED[n] ?? `${t} — not built yet`)}
             data-testid={`tab-${n}`}
           >
             <span className="tab-n">{n}</span>
@@ -71,9 +93,29 @@ export function TabStrip() {
           </button>
         );
       })}
+      {tables.map((table, i) => {
+        const n = TABS.length + i + 1;
+        return (
+          <button
+            key={table.title}
+            role="tab"
+            aria-selected={active === n}
+            className={`tab${active === n ? " on" : ""}`}
+            onClick={() => setTab(n)}
+            title={`${table.title} — from a plugin (§13.7)`}
+            data-testid={`tab-${n}`}
+          >
+            <span className="tab-n">+</span>
+            {table.title}
+          </button>
+        );
+      })}
     </div>
   );
 }
+
+/** How many fixed tabs there are, so plugin tabs can be numbered after them. */
+export const FIXED_TABS = TABS.length;
 
 /**
  * Status bar. Subscribes imperatively and writes through refs: selecting `view`
@@ -138,6 +180,9 @@ const SHORTCUTS: [string, string][] = [
   ["⌘K", "focus query bar"],
   ["⌘P", "find a signal"],
   ["w", "why on the selected signal"],
+  ["s", "minimal subtrace of the current chain"],
+  ["r", "replay the chain, step by step"],
+  ["⌘M", "state machines, in the Source tab"],
   ["right-click", "why, on the signal under the pointer"],
   ["1–9, 0", "switch tab"],
   ["← →", "previous/next transition"],
@@ -164,7 +209,6 @@ export function HelpOverlay() {
             <span>{v}</span>
           </div>
         ))}
-        <div className="help-note">FSM, Diff and Coverage are designed but not built yet.</div>
       </div>
     </div>
   );

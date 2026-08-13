@@ -1,0 +1,112 @@
+name    = "AXI4-Stream"
+version = "1.0"
+
+# §8.15: "datapath, accelerator PQC". AXI4-Stream is one channel and no
+# addresses — the whole protocol is `tvalid`/`tready` plus a `tlast` that says
+# where a packet ends. That makes it the shortest useful pack after
+# handshake.vtp, and the difference between the two is exactly one field:
+# `tlast` turns a stream of beats into a stream of *packets*, which is the thing
+# a datapath engineer actually counts.
+
+[detect]
+# `tvalid`/`tready`/`tdata` and nothing else: `tlast`, `tkeep` and `tuser` are
+# all optional in the specification, and requiring them would miss the many
+# streams that carry none of them.
+required_suffixes = ["tvalid", "tready", "tdata"]
+prefix_strip      = ["m_axis_", "s_axis_", "axis_", "m_axi_", "s_axi_", "m_", "s_", ""]
+clock             = "aclk|clk|.*_aclk|.*_clk"
+reset             = "aresetn|areset_n|rst_n|resetn|.*_aresetn|.*_rst_n"
+
+[[channel]]
+name    = "T"
+valid   = "tvalid"
+ready   = "tready"
+payload = ["tdata", "tlast", "tkeep", "tstrb", "tid", "tdest", "tuser"]
+
+# A packet: beats until `tlast`. `terminator` is what the engine watches; a
+# stream with no `tlast` at all never terminates one, so every beat stays open —
+# which is why `PACKET` is not the only transaction here.
+[[transaction]]
+name  = "PACKET"
+start = "T"
+body  = { channel = "T", terminator = "tlast" }
+key   = "dest = T.tdest"
+
+# The individual beat, so a stream without `tlast` still produces transactions
+# and so per-beat metrics have something to hang on. §8.17's throughput is
+# counted on these, not on packets.
+[[transaction]]
+name  = "BEAT"
+start = "T"
+
+[metrics]
+latency      = "end.cycle - start.cycle"
+beats        = "count(T)"
+stall_cycles = "sum(stall)"
+
+[perf]
+transfer = ["T"]
+data     = "tdata"
+strobe   = "tkeep"
+
+[[stall_reason]]
+name = "backpressure"
+when = "tvalid && !tready"
+msg  = "the sink was not accepting: a beat was offered and refused"
+
+[[stall_reason]]
+name = "starvation"
+when = "!tvalid && tready"
+msg  = "the sink was ready and the source had nothing to send"
+
+[[stall_reason]]
+name = "idle"
+when = "!tvalid && !tready"
+msg  = "no beat was offered and no sink was ready"
+
+[integrity]
+# A stream has no addresses, so §8.19 compares it in *order*: the n-th beat out
+# of one interface against the n-th into the next. `addr` is absent on purpose —
+# the scoreboard falls back to sequence, which is the only correspondence a
+# stream has.
+write = { kind = "BEAT", data = "tdata", strobe = "tkeep" }
+
+# §8.21. What a stream test usually fails to cover: a single-beat packet, a
+# packet that ends without `tlast` ever going high, and partial `tkeep`.
+[[cover]]
+field = "tlast"
+bins  = { CONTINUE = 0, END = 1 }
+
+[[cover]]
+corner = "single_beat_packet"
+when   = "beats == 1"
+msg    = "a packet that was one beat long"
+
+[[cover]]
+corner = "partial_keep"
+when   = "tkeep != (1 << stride) - 1"
+msg    = "a beat that did not enable every byte lane"
+
+[[cover]]
+sequence = "kind"
+
+# The three rules AXI4-Stream actually mandates. Everything else in the
+# specification is a recommendation, and a pack that reports recommendations as
+# errors is one people switch off.
+[[rule]]
+id       = "AXIS_NODROP"
+severity = "error"
+check    = "tvalid && !tready |=> tvalid"
+msg      = "tvalid was withdrawn before tready — a beat may not be retracted"
+
+[[rule]]
+id       = "AXIS_TDATA_STABLE"
+severity = "error"
+check    = "tvalid && !tready |=> $stable(tdata)"
+msg      = "the payload changed while the beat was waiting to be accepted"
+
+[[rule]]
+id       = "AXIS_TLAST_STABLE"
+severity = "error"
+check    = "tvalid && !tready |=> $stable(tlast)"
+msg      = "tlast changed while the beat was waiting to be accepted"
