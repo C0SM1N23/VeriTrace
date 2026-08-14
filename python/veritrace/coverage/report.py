@@ -57,6 +57,10 @@ def build(
             out.code = code_mod.read(path, source)
         except CoverageError as e:
             out.skipped["code"] = str(e)
+            # A database that exists and will not parse is a different situation
+            # from having none, and only the reader can be told so — the CLI
+            # prints `skipped` either way.
+            out.code_error = str(e)
 
     if out.code is not None and not out.code.error:
         out.holes, note = holes.derive(out.code, graph, store, clock, project_root)

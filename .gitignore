@@ -27,6 +27,10 @@ node_modules/
 # Session sidecars are per-developer here; in a real project they are committed
 # on purpose (P5 — layout and bookmarks are versionable).
 *.session.json
+# The sidecar is written atomically via a `.tmp` next to it (api/sessions.py). A
+# server killed mid-save leaves one behind, and nothing can clean it up after the
+# fact — so it must not be a file `git add -A` picks up.
+*.session.json.tmp
 
 # Editors / OS
 .vscode/

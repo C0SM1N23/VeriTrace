@@ -46,12 +46,18 @@ interface ElkResult {
   edges?: {
     id: string;
     sections?: { startPoint: ElkPoint; endPoint: ElkPoint; bendPoints?: ElkPoint[] }[];
+    labels?: { x?: number; y?: number; width?: number; height?: number }[];
   }[];
 }
 
 interface Placed {
   nodes: { id: number; x: number; y: number; w: number; h: number }[];
-  edges: { id: string; points: { x: number; y: number }[]; label: string }[];
+  edges: {
+    id: string;
+    points: { x: number; y: number }[];
+    label: string;
+    at: { x: number; y: number } | null;
+  }[];
   width: number;
   height: number;
 }
@@ -60,6 +66,16 @@ const NODE_W = 96;
 const NODE_H = 44;
 /** How much a long-lived state may grow, relative to the base height. */
 const MAX_GROW = 1.8;
+/**
+ * Size of an edge label, so elk can reserve room for it.
+ *
+ * Without this elk lays the graph out as if the labels were not there, every
+ * edge between the same pair of states gets the same route, and two guards land
+ * on top of each other — which is what a reader notices first and trusts least.
+ * 6px per character is `--font-data` at the 10px `.fsm-edge text` sets.
+ */
+const LABEL_CHAR_W = 6;
+const LABEL_H = 13;
 
 export function FsmMode() {
   const open = useWave((s) => s.fsmOpen);
@@ -174,14 +190,26 @@ function useLayout(machine: Machine): Placed | null {
           "elk.direction": "DOWN",
           "elk.layered.spacing.nodeNodeBetweenLayers": "56",
           "elk.spacing.nodeNode": "44",
-          "elk.edgeRouting": "SPLINES",
+          // Drawn as polylines below, so ask for the routing that is actually
+          // rendered: SPLINES spends effort on control points that were then
+          // thrown away and joined with straight segments anyway.
+          "elk.edgeRouting": "POLYLINE",
+          "elk.spacing.edgeLabel": "6",
+          "elk.layered.edgeLabels.sideSelection": "SMART_DOWN",
         },
         children: machine.states.map((s) => ({
           id: `s${s.value}`,
           width: NODE_W,
           height: heights.get(s.value) ?? NODE_H,
         })),
-        edges: edges.map(({ id, sources, targets }) => ({ id, sources, targets })),
+        // The label goes to elk, not just to the renderer: it is what stops two
+        // guards between the same pair of states from being drawn on one spot.
+        edges: edges.map(({ id, sources, targets, label: text }) => ({
+          id,
+          sources,
+          targets,
+          labels: [{ text, width: text.length * LABEL_CHAR_W, height: LABEL_H }],
+        })),
       };
       const out = (await elk.layout(graph)) as ElkResult;
       if (!live) return;
@@ -198,9 +226,13 @@ function useLayout(machine: Machine): Placed | null {
         })),
         edges: (out.edges ?? []).map((e) => {
           const s = e.sections?.[0];
+          const l = e.labels?.[0];
           return {
             id: e.id,
             label: byId.get(e.id) ?? "",
+            // Where elk put the label, in its own top-left coordinates; the
+            // renderer only has to turn that into a baseline.
+            at: l && l.x !== undefined && l.y !== undefined ? { x: l.x, y: l.y } : null,
             points: s ? [s.startPoint, ...(s.bendPoints ?? []), s.endPoint] : [],
           };
         }),
@@ -237,8 +269,14 @@ function Diagram({ machine }: { machine: Machine }) {
 
   return (
     <div className="fsm-canvas">
+      {/* Natural size, capped by the pane rather than stretched to it: a
+          three-state machine blown up to fill a 1600px canvas has 260px boxes
+          and reads as a poster, not a diagram. `max-width` in the stylesheet
+          shrinks the ones that genuinely are too big. */}
       <svg
         viewBox={`-20 -20 ${placed.width + 40} ${placed.height + 40}`}
+        width={placed.width + 40}
+        height={placed.height + 40}
         className="fsm-svg"
         data-testid="fsm-diagram"
       >
@@ -265,14 +303,20 @@ function Diagram({ machine }: { machine: Machine }) {
                 d={e.points.map((p, i) => `${i ? "L" : "M"}${p.x},${p.y}`).join(" ")}
                 style={n ? { strokeWidth: 1.2 + Math.min(3, Math.log2(1 + n) / 2) } : undefined}
               />
-              {e.points.length > 1 && (
-                <text
-                  x={e.points[Math.floor(e.points.length / 2)].x + 6}
-                  y={e.points[Math.floor(e.points.length / 2)].y - 4}
-                >
-                  {e.label}
-                </text>
-              )}
+              {e.points.length > 1 &&
+                (() => {
+                  // elk's placement when it gave one, the middle of the route
+                  // when it did not. `at` is a top-left box, `text` wants a
+                  // baseline, hence the drop of one line.
+                  const mid = e.points[Math.floor(e.points.length / 2)];
+                  const x = e.at ? e.at.x : mid.x + 6;
+                  const y = e.at ? e.at.y + LABEL_H - 3 : mid.y - 4;
+                  return (
+                    <text x={x} y={y}>
+                      {e.label}
+                    </text>
+                  );
+                })()}
             </g>
           );
         })}
@@ -298,11 +342,18 @@ function Diagram({ machine }: { machine: Machine }) {
               data-state={state.name}
             >
               <rect width={n.w} height={n.h} rx={8} />
-              <text x={n.w / 2} y={n.h / 2 + 4} className="fsm-node-name">
+              {/* The counts go inside the box. Below it they sat exactly where
+                  the outgoing edges leave, and every state with a transition
+                  had its own numbers struck through by an arrow. */}
+              <text
+                x={n.w / 2}
+                y={overlay ? n.h / 2 : n.h / 2 + 4}
+                className="fsm-node-name"
+              >
                 {state.name}
               </text>
               {overlay && (
-                <text x={n.w / 2} y={n.h + 13} className="fsm-node-sub">
+                <text x={n.w / 2} y={n.h / 2 + 13} className="fsm-node-sub">
                   {visits ? `${visits}× · ${machine.cycles_in[String(n.id)] ?? 0}c` : "never"}
                 </text>
               )}

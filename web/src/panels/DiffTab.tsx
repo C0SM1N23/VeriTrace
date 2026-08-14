@@ -119,6 +119,21 @@ export function DiffTab() {
         </div>
       )}
 
+      {/* The other tabs arrive with their answer already computed; this one
+          cannot, because it does not know which run to compare against until
+          asked. Saying so beats an empty pane that looks like a tab that failed
+          to load. */}
+      {sessions.length >= 2 && !report && !busy && !error && (
+        <div className="pane-note">
+          Pick the run to compare against, then <b>compare</b>.
+          <div className="pane-hint">
+            Both runs are normalised to femtoseconds and aligned on the anchor chosen
+            above — clock edges, completed handshakes or retired instructions — so
+            latency that differs between runs does not read as a divergence (§8.7).
+          </div>
+        </div>
+      )}
+
       {busy && <div className="pane-note">Aligning and comparing…</div>}
       {error && <div className="pane-note error">{error}</div>}
 

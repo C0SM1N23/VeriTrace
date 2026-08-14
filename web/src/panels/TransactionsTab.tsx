@@ -198,8 +198,12 @@ function Gantt() {
               title={`${t.kind}#${t.index} ${t.status}`}
               onClick={() => open(t)}
             >
+              {/* Index first. A band is only as wide as the transaction is
+                  long, so the label is usually clipped — and `WRITE#0` clipped
+                  to `WRITE#` is the half that every band on the interface
+                  shares. The tooltip above keeps the natural order. */}
               <span className="txn-band-label">
-                {t.kind}#{t.index}
+                #{t.index} {t.kind}
               </span>
             </button>
           );

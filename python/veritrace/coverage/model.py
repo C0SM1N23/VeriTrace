@@ -265,6 +265,11 @@ class CoverageReport:
     code: CodeCoverage | None = None
     holes: list[Hole] = field(default_factory=list)
     skipped: dict[str, str] = field(default_factory=dict)
+    #: Set only when a database was found and could not be read. `skipped["code"]`
+    #: covers both that and plain absence, which is what the CLI wants to print;
+    #: a reader needs to tell them apart, because "none configured" is a normal
+    #: state and "the one you configured is unusable" is not.
+    code_error: str | None = None
     elapsed_ms: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -273,5 +278,6 @@ class CoverageReport:
             "code": self.code.to_dict() if self.code else None,
             "holes": [h.to_dict() for h in self.holes],
             "skipped": dict(self.skipped),
+            "code_error": self.code_error,
             "ms": round(self.elapsed_ms, 2),
         }

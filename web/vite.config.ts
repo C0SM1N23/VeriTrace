@@ -6,6 +6,12 @@ const BACKEND = process.env.VERITRACE_BACKEND ?? "http://127.0.0.1:8765";
 
 export default defineConfig({
   plugins: [react()],
+  // The wave socket cannot go through the proxy (see `WS_ORIGIN` in
+  // `api/client.ts`), so it needs the backend's real origin at build time. Baked
+  // in from the same constant the proxy uses: when the two were allowed to drift
+  // apart, moving the backend off 8765 left the socket dialling 8765 and the
+  // waveform simply never arrived — a blank canvas with nothing in the console.
+  define: { "import.meta.env.VITE_BACKEND": JSON.stringify(BACKEND) },
   server: {
     // Bind the v4 loopback explicitly: `localhost` resolves to ::1 on some
     // Windows setups, and then anything probing 127.0.0.1 is refused.

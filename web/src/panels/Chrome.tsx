@@ -244,7 +244,13 @@ export function QueryBar() {
         onKeyDown={(e) => {
           if (e.key !== "Enter") return;
           const text = (e.target as HTMLInputElement).value.trim();
-          if (text) void useWave.getState().runQueryText(text);
+          if (!text) return;
+          // Hand the keyboard back to the application. The answer arrives with
+          // `s` and `r` offered on it (§11.4b, §11.5), and with the caret still
+          // here those go into the query instead of running — the shortcut is
+          // printed next to the button that ignores it. ⌘K comes back.
+          (e.target as HTMLInputElement).blur();
+          void useWave.getState().runQueryText(text);
         }}
         data-testid="query-bar"
       />

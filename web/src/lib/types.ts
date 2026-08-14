@@ -771,6 +771,9 @@ export interface CoverageReport {
   code: CodeCoverage | null;
   holes: Hole[];
   skipped: Record<string, string>;
+  /** Set only when a database was found and would not parse — see the note on
+   *  `CoverageReport.code_error` in `coverage/model.py`. */
+  code_error: string | null;
   errors: string[];
   ms: number;
 }

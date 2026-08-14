@@ -682,6 +682,9 @@ the tool stops finding them.
 | `designs/sdram` | an SDR SDRAM command bus with four injected timing violations, one per category ([README](designs/sdram/README.md)) |
 | `designs/dma` | a DMA path whose byte-enable mask drops two lanes — also one `define` from being clean ([README](designs/dma/README.md)) |
 | `designs/fsm` | **one deliberate flaw per §8.8 check**, plus a clean control machine — and a testbench that deliberately never reaches most of them ([README](designs/fsm/README.md)) |
+| `designs/mutation` | a **correct** FIFO with a thorough-looking testbench that never fills it — the design under test is the testbench ([README](designs/mutation/README.md)) |
+| `designs/synth_mismatch` | an incomplete sensitivity list: the RTL and the netlist genuinely disagree, and no RTL run can show it ([README](designs/synth_mismatch/README.md)) |
+| `designs/formal` | an AXI rule a solver breaks in four steps, and a branch proved unreachable ([README](designs/formal/README.md)) |
 
 ## Status
 

@@ -50,6 +50,10 @@ const API = import.meta.env.DEV ? "/api" : "";
  * Vite runs its own HMR socket and its proxy refuses the upgrade for our path
  * with a 404. A production build is served by the backend, so the page origin
  * is already correct.
+ *
+ * `VITE_BACKEND` is baked in by `vite.config.ts` from the one value that also
+ * configures the REST proxy, so `VERITRACE_BACKEND=...` moves both. The literal
+ * below is only the fallback for a client built without that config.
  */
 const WS_ORIGIN: string = import.meta.env.DEV
   ? (import.meta.env.VITE_BACKEND ?? "http://127.0.0.1:8765")

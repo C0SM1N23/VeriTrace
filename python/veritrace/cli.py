@@ -1747,31 +1747,10 @@ def _default_trace(trace: Path | None, flag: str = "--trace") -> Path:
 
 
 def _ensure_store(path: Path) -> Path:
-    """A `.vtx` store for `path`, converting a raw dump if that is what it is.
+    """A `.vtx` store for `path` — `store.ensure`, with the CLI's own voice."""
+    from veritrace import store
 
-    §13's examples pass dumps directly (`veritrace serve dump.fst`), so asking
-    the user to convert first would be a step that exists only because the tool
-    wanted it. An existing store is reused unless the dump is newer, which is
-    the case that matters: re-running the simulation must not silently serve
-    yesterday's data.
-    """
-    if path.is_dir():
-        return path
-    if path.suffix.lower() not in (".vcd", ".fst"):
-        return path
-
-    from veritrace import _native
-
-    out = path.with_name(path.name + ".vtx")
-    fresh = (
-        out.is_dir()
-        and (out / "index.bin").exists()
-        and out.stat().st_mtime >= path.stat().st_mtime
-    )
-    if not fresh:
-        click.echo(f"converting {path} -> {out}", err=True)
-        _native.convert(str(path), str(out))
-    return out
+    return store.ensure(path, lambda msg: click.echo(msg, err=True))
 
 
 @main.command()
@@ -2495,6 +2474,463 @@ def _format_diff(report, limit: int) -> str:
         out.append(f"\nno side-by-side chain: {report.why_error}")
     elif report.why_a is not None:
         out.append("\nThe two causal chains are identical — the cause is upstream of both.")
+    return "\n".join(out)
+
+
+# --- §8.28 mutation testing ------------------------------------------------
+
+
+@main.command()
+@rtl_options
+@click.option(
+    "--run",
+    "command",
+    default=None,
+    help="Your suite, e.g. \"make sim-verilator\". A non-zero exit kills the mutant. "
+    "Without it, the sources are built and run with Icarus.",
+)
+@click.option("--tb", "tb", multiple=True, type=click.Path(path_type=Path),
+              help="Testbench file(s) for the built-in Icarus suite. Repeatable.")
+@click.option("--sample", default=200, type=int, help="How many mutants (0 = every one).")
+@click.option("--seed", default=0, type=int, help="Sampling seed — same seed, same mutants.")
+@click.option("--operator", "operators", multiple=True,
+              help="Restrict to these operators. Repeatable.")
+@click.option("--jobs", "-j", default=0, type=int, help="Parallel mutants (default: CPUs).")
+@click.option("--timeout", default=120.0, type=float, help="Seconds one mutant may take.")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def mutate(rtl, top, command, tb, sample, seed, operators, jobs, timeout, as_json):
+    """How good your tests are, not how much they ran (§8.28).
+
+    \b
+      veritrace mutate --rtl designs/mutation --top tb_fifo
+      veritrace mutate --rtl rtl/ --run "make sim-verilator" --sample 200
+
+    A mutant the suite does not notice is a line of the design nothing checks.
+    The survivors are the report; the score is the headline.
+    """
+    import os
+
+    from veritrace.mutate import OPERATORS
+    from veritrace.mutate.run import Suite, run as run_mutants
+
+    files, incdirs, defines, top = _resolve_rtl(rtl, top)
+    if not files:
+        raise click.ClickException("Nothing to mutate. Pass --rtl <file|dir>.")
+    unknown = sorted(set(operators) - set(OPERATORS))
+    if unknown:
+        raise click.ClickException(
+            f"unknown operator(s): {', '.join(unknown)}; try {', '.join(OPERATORS)}"
+        )
+
+    # The testbench is not mutated: §8.28 asks whether the tests notice a change
+    # in the *design*, and a mutated testbench answers a different question.
+    benches = [Path(t).resolve() for t in tb]
+    design = [f for f in files if f.resolve() not in benches]
+    if not benches:
+        benches = [f for f in files if f.name.startswith("tb_") or "_tb" in f.stem]
+        design = [f for f in design if f not in benches]
+    if not command and not top:
+        raise click.ClickException(
+            "The built-in suite needs a top module: pass --top, or --run with your own command."
+        )
+
+    root = Path(os.path.commonpath([str(f.parent.resolve()) for f in files]))
+    suite = Suite(
+        command=command or "",
+        sources=tuple(str(f.resolve().relative_to(root)) for f in (*design, *benches)),
+        top=top or "",
+        timeout=timeout,
+    )
+    report = run_mutants(
+        design, suite, root / WORK_DIR / "mutants", root,
+        sample=sample, seed=seed, operators=set(operators) or None,
+        jobs=jobs or (os.cpu_count() or 4),
+    )
+    if as_json:
+        click.echo(json.dumps(report.to_dict(), indent=2))
+        return
+    click.echo(_format_mutation(report))
+
+
+def _format_mutation(report) -> str:
+    pct = "n/a" if report.score is None else f"{round(100 * report.score)}%"
+    out = [
+        f"Mutation score: {pct} ({report.killed}/{report.scored})",
+        f"  {report.sampled} of {report.total_sites} sites, seed {report.seed}, "
+        f"{report.elapsed_s:.1f}s · {report.command}",
+    ]
+    if report.invalid:
+        out.append(
+            f"  {len(report.invalid)} mutant(s) did not build and are not scored — "
+            "a broken mutant tests the compiler, not the tests."
+        )
+    if not report.survivors:
+        out.append("\nNo survivors: every mutation the suite was shown, it caught.")
+        return "\n".join(out)
+
+    out.append("\nSurvivors grouped by file:")
+    for path, group in report.by_file().items():
+        out.append(f"  {path}")
+        for s in group:
+            m = s.mutation
+            out.append(f"    :{m.line:<5} {m.operator:11} {_clip(m.was)}  ->  {_clip(m.now)}")
+            if m.context:
+                out.append(f"           {_clip(m.context, 74)}")
+    out.append(
+        "\nEach one is a change to the design that nothing observed — a test to write, "
+        "not a line to run."
+    )
+    return "\n".join(out)
+
+
+def _clip(text: str, width: int = 30) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= width else flat[: width - 1] + "…"
+
+
+# --- §8.29 RTL vs post-synthesis -------------------------------------------
+
+
+@main.command("synth-diff")
+@rtl_options
+@click.option("--tb", "tb", multiple=True, required=True, type=click.Path(path_type=Path),
+              help="Testbench file(s). The same ones drive both runs. Repeatable.")
+@click.option("--dut", default=None, help="Instance to synthesise (default: the top's only child).")
+@click.option("--rtl-trace", type=click.Path(path_type=Path), default=None,
+              help="An RTL waveform you already have, instead of re-simulating.")
+@click.option("--limit", default=12, type=int, help="How many divergences to list.")
+@click.option("--timeout", default=300.0, type=float, help="Seconds per simulation.")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def synth_diff(rtl, top, tb, dut, rtl_trace, limit, timeout, as_json):
+    """Prove a sim/synth mismatch instead of suspecting one (§8.29).
+
+    \b
+      veritrace synth-diff --rtl rtl/ --tb tb.sv --top tb_top
+
+    Synthesises with Yosys, simulates the netlist with the *same* testbench, and
+    runs §8.7's diff on the DUT's top-level ports. A divergence here is a
+    mismatch demonstrated, not a pattern matched.
+    """
+    from veritrace import tools
+    from veritrace.graph.elaborate import elaborate
+    from veritrace.synth import diff as synth_mod
+    from veritrace.synth.yosys import dut_of
+
+    files, incdirs, defines, top = _resolve_rtl(rtl, top)
+    benches = [Path(t).resolve() for t in tb]
+    design = [f for f in files if f.resolve() not in benches]
+    if not design:
+        raise click.ClickException("No RTL to synthesise. Pass --rtl <file|dir>.")
+    if not top:
+        raise click.ClickException("synth-diff needs the testbench's top module: pass --top.")
+
+    try:
+        elaboration = elaborate([*design, *benches], incdirs, defines, top)
+        instance = dut_of(elaboration, top, dut)
+        report = synth_mod.run(
+            design, benches, top, instance,
+            Path(WORK_DIR) / "synth", incdirs, defines,
+            rtl_trace=rtl_trace, limit=limit, timeout=timeout,
+        )
+    except tools.ToolError as e:
+        raise click.ClickException(str(e)) from e
+
+    if as_json:
+        click.echo(json.dumps(report.to_dict(), indent=2))
+        return
+    click.echo(_format_synth(report, instance))
+
+
+def _format_synth(report, dut) -> str:
+    out = [
+        f"{report.synthesiser} · {dut.module} at {dut.path}",
+        f"netlist: {report.netlist}",
+        f"{report.report.compared} top-level port(s) compared "
+        f"({report.rtl_trace.name} vs {report.gate_trace.name}), {report.elapsed_s:.1f}s",
+    ]
+    if report.matched:
+        out.append(
+            "\nRTL and netlist agree on every port. No sim/synth mismatch is "
+            "demonstrated by this stimulus."
+        )
+        return "\n".join(out)
+    first = report.report.divergences[0]
+    out.append(f"\nFIRST DIVERGENCE at c{first.at}")
+    out.append(f"  {first.signal}   rtl = {first.value_a}   gate = {first.value_b}")
+    if first.detail:
+        out.append(f"  {first.detail}")
+    if len(report.report.divergences) > 1:
+        out.append(f"\n{len(report.report.divergences)} diverging port(s), earliest first:")
+        for d in report.report.divergences:
+            out.append(f"  c{d.at:<8} {d.signal:<28} {d.value_a}  vs  {d.value_b}")
+    out.append(
+        "\nThe two runs used the same testbench, so this is a mismatch demonstrated "
+        "rather than a pattern matched (§8.29)."
+    )
+    return "\n".join(out)
+
+
+# --- §8.27 formal, §8.35 reachability --------------------------------------
+
+
+@main.command()
+@rtl_options
+@click.option("--pack", "packs", multiple=True, help="Protocol pack(s) to prove. Default: all.")
+@click.option("--iface", default=None, help="Interface to prove (default: every one found).")
+@click.option("--mode", type=click.Choice(["bmc", "prove", "cover"]), default="bmc",
+              help="bmc searches to --depth; prove attempts k-induction as well.")
+@click.option("--depth", default=20, type=int, help="How many cycles to search.")
+@click.option("--engine", default="smtbmc z3", help="SymbiYosys engine line.")
+@click.option("--reset-active-high", is_flag=True, help="The reset asserts high, not low.")
+@click.option("--no-why", is_flag=True, help="Do not open a counterexample and explain it.")
+@click.option("--timeout", default=900.0, type=float, help="Seconds the solver may take.")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def formal(rtl, top, packs, iface, mode, depth, engine, reset_active_high, no_why, timeout, as_json):
+    """Prove a pack's rules, not just observe them (§8.27).
+
+    \b
+      veritrace formal --rtl rtl/ --pack axi4lite --depth 20
+      veritrace formal --rtl rtl/ --iface top.dma.m_axi --mode prove
+
+    §8.14 says a rule held in one run. This says no run of up to `--depth`
+    cycles breaks it — and when one does, the counterexample is opened and
+    why-traced without leaving the terminal.
+
+    Results are always reported with the depth that produced them. Bounded model
+    checking does not prove anything about cycle N+1, and saying so would be the
+    one dishonest thing this command could do.
+    """
+    from veritrace import tools
+    from veritrace.formal import harness
+    from veritrace.formal.prove import prove as run_prove
+    from veritrace.graph.elaborate import elaborate
+    from veritrace.protocol import pack as pack_mod
+
+    files, incdirs, defines, top = _resolve_rtl(rtl, top)
+    if not files:
+        raise click.ClickException("This needs RTL. Pass --rtl <file|dir>.")
+    try:
+        elaboration = elaborate(files, incdirs, defines, top)
+        found = harness.interfaces(elaboration, pack_mod.resolve(list(packs)))
+    except Exception as e:  # noqa: BLE001 - a pack or an RTL problem, both worth saying
+        raise click.ClickException(str(e)) from e
+
+    chosen = [i for i in found if iface in (None, i.name, i.scope)]
+    if not chosen:
+        names = ", ".join(i.name for i in found) or "none"
+        raise click.ClickException(
+            f"no interface to prove{f' called {iface}' if iface else ''}; found: {names}"
+        )
+
+    work = Path(WORK_DIR) / "formal"
+    reports = []
+    for target in chosen:
+        try:
+            reports.append(
+                run_prove(
+                    elaboration, target, files, work / _slug(target.name),
+                    mode, depth, engine, timeout, not reset_active_high,
+                )
+            )
+        except tools.ToolError as e:
+            raise click.ClickException(str(e)) from e
+
+    if as_json:
+        click.echo(json.dumps([r.to_dict() for r in reports], indent=2))
+        return
+    for report in reports:
+        click.echo(_format_formal(report))
+        if not no_why and report.counterexample is not None:
+            _explain_counterexample(report)
+
+
+def _slug(name: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in name)
+
+
+def _format_formal(report) -> str:
+    out = [
+        f"{report.pack} on {report.iface} — {report.mode}, depth {report.depth}, "
+        f"{report.engine}  ({report.elapsed_s:.1f}s)",
+        "",
+    ]
+    for p in report.properties:
+        out.append(f"  {p}")
+        if p.text and p.verdict.value != "unknown":
+            out.append(f"      {p.text}")
+    if report.failed:
+        out.append(f"\n{len(report.failed)} propert(ies) broken. Counterexample: {report.counterexample}")
+    elif report.held:
+        out.append(
+            f"\n{len(report.held)} propert(ies) held to depth {report.depth}. "
+            "That is not a proof for every depth — bounded model checking cannot make one."
+        )
+    return "\n".join(out)
+
+
+def _explain_counterexample(report) -> None:
+    """§8.27's last step: open the trace the solver produced, and ask why.
+
+    This is the part that makes the feature worth having. A counterexample is a
+    waveform like any other, so the causal engine works on it unchanged — the
+    only thing needed is to point it at the generated harness, which is the
+    design the trace is of.
+    """
+    from veritrace.analysis.whytrace import root_cause
+
+    broken = report.failed[0]
+    click.echo(f"\n--- {broken.id}: the counterexample, explained ---")
+    sources = sorted(Path(report.work).glob("*.sv"))
+    try:
+        ctx = _load(broken.trace, tuple(sources), "vt_formal_top", need_rtl=True)
+    except click.ClickException as e:
+        click.echo(f"  could not open the counterexample: {e}", err=True)
+        return
+
+    subject = _subject_of(ctx, broken)
+    if subject is None:
+        click.echo("  no signal in this rule is in the counterexample; nothing to trace.")
+        return
+    try:
+        signal, at, _, result = _ask(ctx, f"why({subject})")
+    except click.ClickException as e:
+        click.echo(f"  {e}", err=True)
+        return
+    click.echo(f"  why({subject}) at the step the assertion broke:")
+    _print_chain(result.root, ctx.clock)
+    cause = root_cause(result.root)
+    if cause is not None:
+        click.echo(f"\n  root cause: {cause.signal.path()} = {cause.value}")
+
+
+def _subject_of(ctx: "Context", broken) -> str | None:
+    """The signal to ask why about, confirmed against the counterexample.
+
+    The pack already decided which signal the rule is about (`Property.subject`).
+    This only checks it survived into the trace and into the elaborated harness —
+    a solver writes witness wires of its own into the VCD, and picking one of
+    those would produce a chain about the solver rather than about the design.
+    """
+    if broken.subject and ctx.graph.get(broken.subject) is not None:
+        return broken.subject
+    for sig in ctx.store.signals():
+        if ".u_dut." in sig.path and "_witness_" not in sig.path:
+            if ctx.graph.get(sig.path) is not None:
+                return sig.path
+    return None
+
+
+@main.command()
+@rtl_options
+@click.option("--uncovered", type=click.Path(exists=True, path_type=Path), required=True,
+              help="Coverage report from `veritrace coverage --json`.")
+@click.option("--dut", default=None, help="Instance to check (default: --top).")
+@click.option("--depth", default=30, type=int, help="How many cycles to search.")
+@click.option("--engine", default="smtbmc z3", help="SymbiYosys engine line.")
+@click.option("--limit", default=25, type=int, help="How many holes to classify.")
+@click.option("--timeout", default=900.0, type=float, help="Seconds the solver may take.")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def reach(rtl, top, uncovered, dut, depth, engine, limit, timeout, as_json):
+    """Is this coverage hole reachable, or is it dead code (§8.35)?
+
+    \b
+      veritrace coverage dump.vcd --rtl rtl/ --json > cov.json
+      veritrace reach --rtl rtl/ --uncovered cov.json --depth 30
+
+    §8.12 says what it would take to reach an uncovered point. This says whether
+    anything can: a reachable hole is a test worth writing, an unreachable one is
+    dead code, and telling them apart is the difference between "81% and I do not
+    know what to do with the rest" and "81%, and three of the rest cannot happen".
+    """
+    from veritrace import tools
+    from veritrace.formal.prove import reach as run_reach
+    from veritrace.graph.elaborate import elaborate
+
+    files, incdirs, defines, top = _resolve_rtl(rtl, top)
+    if not files:
+        raise click.ClickException("This needs RTL. Pass --rtl <file|dir>.")
+    if not top:
+        raise click.ClickException("reach needs the module to check: pass --top.")
+
+    holes = _holes_from(uncovered)[:limit]
+    if not holes:
+        raise click.ClickException(f"{uncovered} lists no uncovered points.")
+
+    try:
+        elaboration = elaborate(files, incdirs, defines, top)
+        results = run_reach(
+            elaboration, holes, files, dut or top,
+            Path(WORK_DIR) / "reach", depth, engine, timeout,
+        )
+    except tools.ToolError as e:
+        raise click.ClickException(str(e)) from e
+
+    if as_json:
+        click.echo(json.dumps([r.to_dict() for r in results], indent=2))
+        return
+    click.echo(_format_reach(results, depth))
+
+
+@dataclass(slots=True)
+class _Hole:
+    """A coverage hole read back from JSON, in the shape `formal.reach` wants."""
+
+    file: str
+    line: int
+    label: str = ""
+    note: str = ""
+    conditions: list = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class _Cond:
+    text: str
+
+
+def _holes_from(path: Path) -> list[_Hole]:
+    """The `holes` array of a coverage report, whoever produced it.
+
+    Reading the JSON rather than recomputing coverage keeps §8.35 a step in a
+    pipeline — `veritrace coverage --json | veritrace reach` — instead of a
+    second implementation of §8.12 that could disagree with the first.
+    """
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    raw = data.get("holes", data) if isinstance(data, dict) else data
+    out: list[_Hole] = []
+    for h in raw:
+        out.append(
+            _Hole(
+                file=h.get("file", ""),
+                line=int(h.get("line", 0)),
+                label=h.get("label", "") or "",
+                note=h.get("note", "") or "",
+                conditions=[_Cond(c["text"]) for c in h.get("conditions", []) if c.get("text")],
+            )
+        )
+    return out
+
+
+def _format_reach(results, depth: int) -> str:
+    counts = {"reachable": 0, "unreachable": 0, "unknown": 0}
+    out = []
+    for r in results:
+        counts[r.status] = counts.get(r.status, 0) + 1
+        out.append(f"{r.file}:{r.line}  {r.label or 'branch'} \"{_clip(r.condition, 46)}\"")
+        if r.status == "reachable":
+            out.append(f"  -> REACHABLE (formal), counterexample at depth {r.step}")
+            if r.trace:
+                out.append(f"     {r.trace}")
+            out.append("     a test can close this one, and stimgen can target it")
+        elif r.status == "unreachable":
+            out.append(f"  -> PROVED UNREACHABLE (depth={depth}) — dead code, not a missing test")
+            out.append("     remove the branch, or relax the condition that guards it")
+        else:
+            out.append(f"  -> UNKNOWN — {r.reason}")
+        out.append("")
+    out.append(
+        f"{counts['reachable']} reachable · {counts['unreachable']} unreachable "
+        f"· {counts['unknown']} unclassified, searched to depth {depth}"
+    )
     return "\n".join(out)
 
 

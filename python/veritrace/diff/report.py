@@ -212,8 +212,15 @@ def compare(
     alignment: Alignment,
     ignore: Iterable[str] = (),
     limit: int = MAX_DIVERGENCES,
+    only: Iterable[str] = (),
 ) -> DiffReport:
-    """§8.7 steps 1, 3 and 4 — every signal that ever disagrees, earliest first."""
+    """§8.7 steps 1, 3 and 4 — every signal that ever disagrees, earliest first.
+
+    `only` restricts the comparison to a named set, in normalised form. §8.29
+    needs it: a post-synthesis netlist keeps its top-level ports and is free to
+    rename, merge or delete everything inside, so comparing internals would
+    report a synthesiser doing its job as a mismatch.
+    """
     a, b = alignment.a, alignment.b
     patterns = tuple(ignore) + DEFAULT_IGNORE
     top_a, top_b = _top_of(a.store), _top_of(b.store)
@@ -221,6 +228,9 @@ def compare(
     by_a = {normalise(s.path, top_a): s for s in a.store.signals()}
     by_b = {normalise(s.path, top_b): s for s in b.store.signals()}
     common = sorted(set(by_a) & set(by_b))
+    if only:
+        keep = set(only)
+        common = [n for n in common if n in keep]
 
     report = DiffReport(
         alignment=alignment,
