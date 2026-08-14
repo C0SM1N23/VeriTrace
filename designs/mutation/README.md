@@ -16,7 +16,8 @@ veritrace mutate --rtl designs/mutation --top tb_fifo
 
 ```
 Mutation score: 79% (26/33)
-  33 of 33 sites, seed 0 · iverilog + vvp (top tb_fifo)
+  37 of 37 sites, seed 7 · iverilog + vvp (top tb_fifo)
+  4 mutant(s) did not build and are not scored
 
 Survivors grouped by file:
   fifo.sv:25   (wr_ptr[AW] != rd_ptr[AW]) && ...  ->  '0    stuck-at

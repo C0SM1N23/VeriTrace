@@ -1,0 +1,97 @@
+Copyright 1986-2022 Xilinx, Inc. All Rights Reserved.
+----------------------------------------------------------------------------------------
+| Tool Version : Vivado v2022.2 (64-bit)
+| Date         : Mon Aug 11 14:22:07 2025
+| Host         : workstation running 64-bit major release
+| Command      : report_timing_summary -file timing_summary.rpt
+| Design       : tb_axi_lite
+| Device       : xc7a35t-cpg236
+| Speed File   : -1  PRODUCTION 1.23 2018-06-13
+----------------------------------------------------------------------------------------
+
+Timing Summary Report
+
+------------------------------------------------------------------------------------------------
+| Design Timing Summary
+| ---------------------
+------------------------------------------------------------------------------------------------
+
+    WNS(ns)      TNS(ns)  TNS Failing Endpoints  TNS Total Endpoints      WHS(ns)      THS(ns)
+    -------      -------  ---------------------  -------------------      -------      -------
+     -0.417       -1.204                      3                  842        0.061        0.000
+
+
+------------------------------------------------------------------------------------------------
+| Max Delay Paths
+| --------------
+------------------------------------------------------------------------------------------------
+
+Slack (VIOLATED) :        -0.417ns  (required time - arrival time)
+  Source:                 regs/rdata_reg[7]/C
+                            (rising edge-triggered cell FDRE clocked by aclk  {rise@0.000ns fall@5.000ns period=10.000ns})
+  Destination:            cpu/state_reg[1]/D
+                            (rising edge-triggered cell FDRE clocked by aclk  {rise@0.000ns fall@5.000ns period=10.000ns})
+  Path Group:             aclk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            10.000ns  (aclk rise@10.000ns - aclk rise@0.000ns)
+  Data Path Delay:        9.912ns  (logic 3.204ns (32.3%)  route 6.708ns (67.7%))
+  Logic Levels:           11  (CARRY4=8 LUT2=1 LUT6=2)
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock aclk rise edge)       0.000     0.000 r
+    E3                                                0.000     0.000 r  aclk
+    SLICE_X12Y30         FDRE (Prop_fdre_C_Q)         0.456     0.456 r  regs/rdata_reg[7]/Q
+                         net (fo=3, routed)           1.204     1.660    regs/rdata[7]
+    SLICE_X14Y31         LUT6 (Prop_lut6_I0_O)        0.124     1.784 r  cpu/state[1]_i_4/O
+                         net (fo=1, routed)           2.891     4.675    cpu/state[1]_i_4_n_0
+    SLICE_X15Y31         CARRY4 (Prop_carry4_S_CO)    0.532     5.207 r  cpu/cnt_reg[4]_i_1/CO[3]
+                         net (fo=2, routed)           2.613     7.820    cpu/cnt_reg[4]_i_1_n_0
+    SLICE_X16Y31         LUT2 (Prop_lut2_I1_O)        0.098     7.918 r  cpu/state[1]_i_1/O
+                         net (fo=1, routed)           1.994     9.912    cpu/state_reg[1]_i_1_n_0
+    SLICE_X17Y31         FDRE                                            cpu/state_reg[1]/D
+  -------------------------------------------------------------------    -------------------
+
+Slack (VIOLATED) :        -0.402ns  (required time - arrival time)
+  Source:                 cpu/awprot_reg[0]/C
+                            (rising edge-triggered cell FDRE clocked by aclk  {rise@0.000ns fall@5.000ns period=10.000ns})
+  Destination:            regs/awprot_reg[2]/D
+                            (rising edge-triggered cell FDRE clocked by aclk  {rise@0.000ns fall@5.000ns period=10.000ns})
+  Path Group:             aclk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            10.000ns  (aclk rise@10.000ns - aclk rise@0.000ns)
+  Data Path Delay:        9.887ns  (logic 2.912ns (29.5%)  route 6.975ns (70.5%))
+  Logic Levels:           9  (CARRY4=7 LUT4=2)
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock aclk rise edge)       0.000     0.000 r
+    SLICE_X20Y18         FDRE (Prop_fdre_C_Q)         0.419     0.419 r  cpu/awprot_reg[0]/Q
+                         net (fo=5, routed)           3.284     3.703    cpu/awprot[0]
+    SLICE_X22Y19         LUT4 (Prop_lut4_I2_O)        0.152     3.855 r  regs/awprot[2]_i_2/O
+                         net (fo=1, routed)           3.691     7.546    regs/awprot[2]_i_2_n_0
+    SLICE_X23Y19         CARRY4 (Prop_carry4_S_CO)    0.489     8.035 r  regs/awprot_reg[2]_i_1/CO[3]
+                         net (fo=1, routed)           1.852     9.887    regs/awprot_reg[2]_i_1_n_0
+    SLICE_X24Y19         FDRE                                            regs/awprot_reg[2]/D
+  -------------------------------------------------------------------    -------------------
+
+Slack (MET) :             1.318ns  (required time - arrival time)
+  Source:                 cpu/cnt_reg[0]/C
+                            (rising edge-triggered cell FDRE clocked by aclk  {rise@0.000ns fall@5.000ns period=10.000ns})
+  Destination:            cpu/cnt_reg[7]/D
+                            (rising edge-triggered cell FDRE clocked by aclk  {rise@0.000ns fall@5.000ns period=10.000ns})
+  Path Group:             aclk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            10.000ns  (aclk rise@10.000ns - aclk rise@0.000ns)
+  Data Path Delay:        8.216ns  (logic 2.104ns (25.6%)  route 6.112ns (74.4%))
+  Logic Levels:           6  (CARRY4=5 LUT1=1)
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock aclk rise edge)       0.000     0.000 r
+    SLICE_X10Y22         FDRE (Prop_fdre_C_Q)         0.441     0.441 r  cpu/cnt_reg[0]/Q
+                         net (fo=8, routed)           2.318     2.759    cpu/cnt[0]
+    SLICE_X11Y22         CARRY4 (Prop_carry4_S_CO)    1.663     4.422 r  cpu/cnt_reg[7]_i_1/CO[3]
+                         net (fo=1, routed)           3.794     8.216    cpu/cnt_reg[7]_i_1_n_0
+    SLICE_X12Y22         FDRE                                            cpu/cnt_reg[7]/D
+  -------------------------------------------------------------------    -------------------

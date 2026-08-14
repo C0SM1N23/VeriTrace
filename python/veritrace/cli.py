@@ -14,6 +14,7 @@ import tomli_w
 from veritrace import __version__
 from veritrace.config import WORK_DIR
 from veritrace.export import viewers
+from veritrace.stim.emit import TARGETS as _STIM_TARGETS
 
 EXCLUDED_DIRS = {".git", "node_modules", "target", ".venv", "venv", "__pycache__", "build", "dist"}
 
@@ -2932,6 +2933,236 @@ def _format_reach(results, depth: int) -> str:
         f"· {counts['unknown']} unclassified, searched to depth {depth}"
     )
     return "\n".join(out)
+
+
+# --- §8.32 stimgen, §8.31 SAIF, §8.33 WaveDrom, §8.30 timing ---------------
+
+
+@main.command()
+@rtl_options
+@click.option("--pack", "packs", multiple=True, help="Pack to generate for. Default: all detected.")
+@click.option("--iface", default=None, help="Interface to drive (default: the only one found).")
+@click.option("--n", default=100, type=int, help="How many transactions.")
+@click.option("--seed", default=0, type=int, help="Same seed, same stimulus.")
+@click.option("--cover-holes", type=click.Path(exists=True, path_type=Path), default=None,
+              help="`veritrace coverage --json` output. Every never-hit bin is targeted.")
+@click.option("--target", type=click.Choice(list(_STIM_TARGETS)), default="sv",
+              help="cocotb runs under any free simulator; sv needs none.")
+@click.option("-o", "--output", type=click.Path(path_type=Path), default=None,
+              help="Where to write it (default: stdout).")
+@click.option("--json", "as_json", is_flag=True, help="The plan, not the testbench.")
+def stimgen(rtl, top, packs, iface, n, seed, cover_holes, target, output, as_json):
+    """Legal transactions, aimed at the holes you have left (§8.32).
+
+    \b
+      veritrace coverage dump.vcd --rtl rtl/ --json > fcov.json
+      veritrace stimgen --rtl rtl/ --top axil_slave --cover-holes fcov.json -o tb.sv
+
+    The pack knows the field domains, so the transactions are legal by
+    construction; `--cover-holes` makes the first few of them aim at bins nothing
+    has reached yet. A hole no stimulus can close — a response field the DUT
+    drives — is reported as such instead of generating traffic that will not work.
+    """
+    from veritrace.formal import harness
+    from veritrace.graph.elaborate import elaborate
+    from veritrace.protocol import pack as pack_mod
+    from veritrace.stim import generate, holes_from, render
+
+    files, incdirs, defines, top = _resolve_rtl(rtl, top)
+    if not files:
+        raise click.ClickException("This needs RTL. Pass --rtl <file|dir>.")
+    if not top:
+        raise click.ClickException("stimgen needs the module to drive: pass --top.")
+
+    elaboration = elaborate(files, incdirs, defines, top)
+    found = harness.interfaces(elaboration, pack_mod.resolve(list(packs)))
+    chosen = [i for i in found if iface in (None, i.name, i.scope)]
+    if not chosen:
+        names = ", ".join(i.name for i in found) or "none"
+        raise click.ClickException(f"no interface to drive; found: {names}")
+    target_iface = chosen[0]
+
+    holes: list[tuple[str, str]] = []
+    if cover_holes:
+        holes = holes_from(json.loads(Path(cover_holes).read_text(encoding="utf-8")))
+
+    dut = harness.instance_of(elaboration, top)
+    plan = generate(
+        target_iface.pack, target_iface, elaboration.graph, n=n, seed=seed, holes=holes
+    )
+    if as_json:
+        click.echo(json.dumps(plan.to_dict(), indent=2))
+        return
+
+    text = render(plan, target_iface.pack, target_iface, dut, target)
+    for t in plan.unreachable:
+        click.echo(f"  not targeted — {t.point}/{t.bin}: {t.reason}", err=True)
+    if plan.targeted:
+        click.echo(
+            f"  targeting {len(plan.targeted)} hole(s): "
+            + ", ".join(f"{t.point}/{t.bin}" for t in plan.targeted),
+            err=True,
+        )
+    _write(text, output, f"{len(plan.items)} transaction(s)")
+
+
+@main.command()
+@click.argument("trace", type=click.Path(path_type=Path), required=False, default=None)
+@click.option("-o", "--output", type=click.Path(path_type=Path), default=None,
+              help="Where to write the SAIF (default: stdout).")
+@click.option("--design", default="design", help="Design name recorded in the file.")
+@click.option("--gating", is_flag=True, help="List clock-gating candidates instead.")
+@click.option("--top-n", default=20, type=int, help="How many rows for --gating.")
+def saif(trace, output, design, gating, top_n):
+    """Switching activity, for power estimation (§8.31).
+
+    \b
+      veritrace saif dump.fst -o activity.saif
+      veritrace saif dump.vcd --gating
+
+    xsim writes SAIF natively, so a Vivado flow already has this. It exists for
+    Icarus, Verilator and ModelSim, which write none — and there the alternative
+    is Vivado's flat 12.5% toggle-rate default.
+    """
+    from veritrace import TraceStore
+    from veritrace.export import saif as saif_mod
+
+    path = _ensure_store(_default_trace(trace, flag="a trace path"))
+    report = saif_mod.measure(TraceStore(str(path)))
+
+    if gating:
+        rows = saif_mod.gating_candidates(report)[:top_n]
+        if not rows:
+            click.echo("No register holds its value for more than 90% of the run.")
+            return
+        click.echo(f"{len(rows)} clock-gating candidate(s) — held > 90% of the run:")
+        for a in rows:
+            click.echo(f"  {(a.held or 0) * 100:5.1f}%  {a.tc:6} toggles  {a.path}")
+        click.echo(
+            "\nCandidates, not findings: whether a clock can be gated is a question "
+            "about the design, and this only says it would have been worth it."
+        )
+        return
+
+    _write(saif_mod.render(report, design), output, f"{len(report.signals)} net(s)")
+
+
+@main.command()
+@click.argument("trace", type=click.Path(path_type=Path), required=False, default=None)
+@rtl_options
+@click.option("--signals", required=True, help="Comma-separated signal paths, in order.")
+@click.option("--range", "window", default=None, help="`c1200:c1230` or `100ns:300ns`.")
+@click.option("--svg", is_flag=True, help="Render an SVG instead of WaveDrom JSON.")
+@click.option("--light", is_flag=True, help="Ink on white, for print.")
+@click.option("-o", "--output", type=click.Path(path_type=Path), default=None,
+              help="Where to write it (default: stdout).")
+def wavedrom(trace, rtl, top, signals, window, svg, light, output):
+    """A diagram for a README or a thesis, not a screenshot (§8.33).
+
+    \b
+      veritrace wavedrom dump.vcd --signals "clk,awvalid,awready,awaddr" --range c120:c150
+      veritrace wavedrom dump.vcd --signals "..." --svg --light -o handshake.svg
+    """
+    from veritrace.export import wavedrom as wd
+
+    ctx = _load(trace, rtl, top)
+    paths = [s.strip() for s in signals.split(",") if s.strip()]
+    missing = [p for p in paths if ctx.store.find(p) is None]
+    if missing:
+        raise click.ClickException(f"not in the trace: {', '.join(missing)}")
+
+    t0, t1 = ctx.store.time_range
+    if window:
+        a, _, b = window.partition(":")
+        if not b:
+            raise click.ClickException("--range wants two points, as `c100:c130`")
+        t0, t1 = _at(ctx, a.strip()), _at(ctx, b.strip())
+
+    diagram = wd.build(ctx.store, paths, t0, t1, ctx.clock)
+    text = wd.to_svg(diagram, light) if svg else diagram.to_json()
+    _write(text, output, f"{len(diagram.rows)} row(s)")
+
+
+@main.command()
+@click.argument("report", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument("trace", type=click.Path(path_type=Path), required=False, default=None)
+@rtl_options
+@click.option("--limit", default=10, type=int, help="How many paths to list.")
+@click.option("--violated", is_flag=True, help="Only paths that missed timing.")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def timing(report, trace, rtl, top, limit, violated, as_json):
+    """Vivado's critical paths, over your RTL and your run (§8.30).
+
+    \b
+      veritrace timing timing_summary.rpt dump.vcd --rtl rtl/
+
+    This is not static timing analysis — Vivado already did that. What it adds is
+    the two joins Vivado cannot make: each path's endpoint against the line of RTL
+    it comes from, and against how often the run actually switched it. A critical
+    path that never toggles is a false priority, and nothing else will tell you.
+    """
+    from veritrace import timing as timing_mod
+
+    parsed = timing_mod.load(report)
+    if not parsed.paths:
+        raise click.ClickException(
+            f"{report} has no timing paths in it. It should be the output of "
+            "`report_timing_summary`, not `report_timing`."
+        )
+    ctx = _load(trace, rtl, top) if trace else None
+    timing_mod.correlate(parsed, ctx.graph if ctx else None, ctx.store if ctx else None)
+
+    if as_json:
+        click.echo(json.dumps(parsed.to_dict(), indent=2))
+        return
+    click.echo(_format_timing(parsed, limit, violated))
+
+
+def _format_timing(report, limit: int, only_violated: bool) -> str:
+    out = []
+    if report.wns is not None:
+        out.append(f"WNS {report.wns:+.3f} ns · TNS {report.tns:+.3f} ns · {len(report.paths)} path(s)")
+    paths = report.violated if only_violated else report.paths
+    if not paths:
+        out.append("\nEvery path in this report met timing.")
+        return "\n".join(out)
+
+    for p in paths[:limit]:
+        mark = "VIOLATED" if p.violated else "met"
+        out.append(f"\n{p.slack:+.3f} ns  {mark}   {p.group or 'no group'}")
+        out.append(f"  from {p.source}")
+        if p.source_signal:
+            out.append(f"       -> {p.source_signal}{'   ' + p.source_loc if p.source_loc else ''}")
+        out.append(f"  to   {p.destination}")
+        if p.dest_signal:
+            out.append(f"       -> {p.dest_signal}{'   ' + p.dest_loc if p.dest_loc else ''}")
+        worst = sorted(p.hops, key=lambda h: -h.delay_ns)[:3]
+        for h in worst:
+            where = f"   {h.loc}" if h.loc else ""
+            out.append(f"  {h.delay_ns:6.3f} ns  {h.resource}{where}")
+        if p.toggles is not None:
+            out.append(f"  switched {p.toggles}x in the run")
+        if p.note:
+            out.append(f"  {p.note}")
+
+    if report.correlated and report.false_priorities:
+        out.append(
+            f"\n{len(report.false_priorities)} violated path(s) never switched in this run. "
+            "Vivado cannot know that; it has never run the design."
+        )
+    elif not report.correlated:
+        out.append("\nNo trace given, so nothing is said about which paths matter. Pass one.")
+    return "\n".join(out)
+
+
+def _write(text: str, output: Path | None, what: str) -> None:
+    """To a file, or to stdout when there is none — §13's P6."""
+    if output is None:
+        click.echo(text)
+        return
+    Path(output).parent.mkdir(parents=True, exist_ok=True)
+    Path(output).write_text(text, encoding="utf-8")
+    click.echo(f"{what} -> {output}  ({len(text.encode()) // 1024 or 1} KB)", err=True)
 
 
 if __name__ == "__main__":

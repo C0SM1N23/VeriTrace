@@ -647,6 +647,16 @@ veritrace diff  good.vcd bad.vcd [--align cycle|handshake|retire] [--ignore "*_c
 veritrace fsm   [trace] [signal] [--svg d.svg]        # state machines; no trace needed
 veritrace gen-sva trace --iface top.dut.m_axi --target verilator|portable -o chk.sv
 veritrace plugins                    # what analysis plugins this project has
+
+veritrace mutate --rtl rtl/ --top tb [--run "make sim"] [--sample N --seed S]
+veritrace synth-diff --rtl rtl/ --tb tb.sv --top tb   # RTL vs netlist, same testbench
+veritrace formal --rtl rtl/ --pack axi4lite --depth 20    # HELD (bounded, depth=N)
+veritrace reach  --rtl rtl/ --top dut --uncovered cov.json   # dead code, or a missing test
+veritrace stimgen --rtl rtl/ --top dut --cover-holes fcov.json --target sv|cocotb
+veritrace timing report.rpt [trace] --rtl rtl/   # Vivado's paths, over your run
+veritrace saif  trace -o activity.saif [--gating]
+veritrace wavedrom trace --signals "a,b,c" --range c120:c150 [--svg --light]
+
 veritrace check trace --fail-on stuck,x,cdc,protocol,deadlock,memory,integrity  # the CI gate
 veritrace probes sig --format vivado|quartus
 veritrace correlate trace --rtl src/
@@ -685,6 +695,7 @@ the tool stops finding them.
 | `designs/mutation` | a **correct** FIFO with a thorough-looking testbench that never fills it — the design under test is the testbench ([README](designs/mutation/README.md)) |
 | `designs/synth_mismatch` | an incomplete sensitivity list: the RTL and the netlist genuinely disagree, and no RTL run can show it ([README](designs/synth_mismatch/README.md)) |
 | `designs/formal` | an AXI rule a solver breaks in four steps, and a branch proved unreachable ([README](designs/formal/README.md)) |
+| `designs/axi_lite/timing_summary.rpt` | a Vivado timing report with one violated path the run never switches — §8.30's false priority |
 
 ## Status
 

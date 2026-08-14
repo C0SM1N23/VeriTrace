@@ -258,11 +258,17 @@ def _walk(node: object) -> Iterator[object]:
             yield from _walk(child)
 
 
-def sites(path: Path, enabled: set[str] | None = None) -> list[Mutation]:
+def sites(path: Path, enabled: set[str] | None = None, validate: bool = True) -> list[Mutation]:
     """Every mutation `path` admits, in source order.
 
     A file slang cannot parse yields nothing rather than raising: one unparsable
     file in an RTL directory should cost its own mutations, not the whole run.
+
+    `validate` re-parses each candidate, which is what makes §8.28's "syntactically
+    valid by construction" true rather than aspirational — but it costs a parse
+    per site, and a run that samples 200 out of 5000 would pay for 4800 it will
+    never use. So the *runner* turns it off here and checks the sample instead
+    (`run.one`), and the cost stays proportional to what is actually simulated.
     """
     data = Path(path).read_bytes()
     try:
@@ -293,7 +299,7 @@ def sites(path: Path, enabled: set[str] | None = None) -> list[Mutation]:
     # Source order, and stable: the sampler seeds off this list, so the same seed
     # has to mean the same mutants on the same input.
     out.sort(key=lambda m: (m.start, m.operator))
-    return [m for m in out if _valid(m, data, str(path))]
+    return [m for m in out if not validate or _valid(m, data, str(path))]
 
 
 def _valid(m: Mutation, data: bytes, name: str) -> bool:
@@ -307,9 +313,9 @@ def _valid(m: Mutation, data: bytes, name: str) -> bool:
     bracket. Rather than make the offset arithmetic cleverer, the claim is simply
     made true: a site that does not parse is not a site.
 
-    Costs one parse per candidate — a millisecond against the seconds each mutant
-    spends in a simulator — and it is what keeps the sample budget spent on
-    mutants that can actually be scored.
+    Costs one parse per candidate, so `sites` only does it when asked; the runner
+    checks the sampled mutants instead and books the failures as `invalid`, which
+    is the same guarantee for a fraction of the work.
     """
     from pyslang import syntax as S
 

@@ -147,7 +147,9 @@ def run(
     files = [Path(f) for f in files]
     root = Path(root).resolve()
 
-    every = [m for f in files for m in sites(f, operators)]
+    # Not validated here — `one` checks the ones that get sampled, which is the
+    # same guarantee without parsing thousands of candidates nobody will run.
+    every = [m for f in files for m in sites(f, operators, validate=False)]
     chosen = _sample(every, sample, seed)
 
     report = MutationReport(
