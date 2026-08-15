@@ -17,7 +17,7 @@ import pytest
 from veritrace import licensing, notes, share
 from veritrace.api.sessions import LayoutFile
 
-from tests.test_api import make_vtx
+from conftest import SMALL_VCD, make_vtx
 
 
 @pytest.fixture
@@ -167,8 +167,6 @@ def test_a_different_dump_is_applied_but_called_out(vtx, tmp_path):
     them = tmp_path / "them"
     them.mkdir()
     # Same signals, one extra event: a re-run, not the shared run.
-    from tests.test_api import SMALL_VCD
-
     theirs = make_vtx(them, text=SMALL_VCD + "#40\n0!\n")
     applied = share.apply(bundle, theirs, them)
 

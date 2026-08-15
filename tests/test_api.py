@@ -16,45 +16,12 @@ import msgpack
 import pytest
 from fastapi.testclient import TestClient
 
+from conftest import SMALL_VCD, make_vtx
 from veritrace import convert
 from veritrace.api import create_app
 from veritrace.api.sessions import Session, SessionRegistry, session_id_for
 
 DESIGNS = Path(__file__).resolve().parents[1] / "designs"
-
-SMALL_VCD = """\
-$timescale 1ns $end
-$scope module tb $end
-$var reg 1 ! clk $end
-$var reg 8 " data [7:0] $end
-$scope module dut $end
-$var wire 1 ! clk $end
-$var wire 4 # state [3:0] $end
-$upscope $end
-$upscope $end
-$enddefinitions $end
-#0
-0!
-b0 "
-bx #
-#10
-1!
-b10100000 "
-#20
-0!
-b1 #
-#30
-1!
-"""
-
-
-def make_vtx(tmp_path: Path, text: str = SMALL_VCD, name: str = "dump") -> Path:
-    src = tmp_path / f"{name}.vcd"
-    src.write_text(text)
-    out = tmp_path / f"{name}.vtx"
-    convert(str(src), str(out))
-    return out
-
 
 @pytest.fixture
 def vtx(tmp_path: Path) -> Path:
