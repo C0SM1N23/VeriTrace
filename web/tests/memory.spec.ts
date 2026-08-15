@@ -149,7 +149,18 @@ test("clicking a violation sends Wave to that cycle with the command wires", asy
 
 test("clicking a bank segment jumps to it", async ({ page }) => {
   await open(page, violating);
-  await page.locator('[data-testid="mem-bank-track"] .mem-seg').first().click();
+  // Wait for the timeline to be laid out before clicking into it. The segments
+  // exist as soon as the report arrives, but a click that lands while the track
+  // is still being sized hits nothing and the tab never changes — which showed
+  // up as a failure only on a loaded machine, where the layout took longer than
+  // Playwright's implicit wait for the element itself.
+  const segment = page.locator('[data-testid="mem-bank-track"] .mem-seg').first();
+  await expect(segment).toBeVisible();
+  await expect
+    .poll(async () => (await segment.boundingBox())?.width ?? 0)
+    .toBeGreaterThan(0);
+
+  await segment.click();
   await expect(page.locator('[data-testid="tab-1"]')).toHaveAttribute("aria-selected", "true");
 });
 

@@ -368,22 +368,42 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - run: uv sync
+
+      # §8.3's "generate and verify" compiles the testbench it produced and runs
+      # it. Without a simulator the verdict is "not run", and the test that
+      # asserts the simulator's own answer has nothing to read.
+      - name: Install Icarus, for the repro validation test
+        run: sudo apt-get update && sudo apt-get install -y iverilog
+
       - name: Convert the reference dumps
         # fifo_buggy carries the injected bug, so the causal tests have a real
         # root cause to find; checks carries the deliberate flaws for TAB 6;
         # axi_lite and axi_arb carry the interfaces TAB 8 and §8.16 need;
         # deadlock carries the injected wait-for cycle TAB 9 is about;
         # sdram carries the four injected timing violations TAB 10 is about;
-        # dma carries the byte-enable bug TAB 7 and §8.19 are about.
+        # dma carries the byte-enable bug TAB 7 and §8.19 are about;
+        # fsm carries the state machines TAB 3's mode, the plugin tab and the
+        # smoke test all open.
+        #
+        # The names are the ones the specs ask for, not a convention: three
+        # specs open `designs/fsm/dump.vcd.vtx`, and a store written as
+        # `dump.vtx` is a different path that `POST /session` answers 404 for.
         run: |
           for d in fifo_buggy checks axi_lite axi_arb deadlock sdram dma; do
             uv run veritrace convert designs/$d/dump.vcd -o designs/$d/dump.vtx
           done
+          uv run veritrace convert designs/fsm/dump.vcd -o designs/fsm/dump.vcd.vtx
           # The control runs: TAB 9's and TAB 7's tests need the same RTL
           # without the bug, so that "none found" is checkable in the browser
           # too and not only on the command line.
           for d in deadlock sdram dma; do
             uv run veritrace convert designs/$d/dump_ok.vcd -o designs/$d/dump_ok.vtx
+          done
+          # Every trace the browser suite opens must exist before it starts, or
+          # the spec fails in `beforeAll` and its whole file is reported as
+          # "did not run" — which reads like a harness problem and is not one.
+          for want in $(grep -rho 'designs/[a-z_]*/[a-z_.]*\.vtx' web/tests/*.spec.ts | sort -u); do
+            test -d "$want" || { echo "missing store: $want"; exit 1; }
           done
 
       - run: npm ci

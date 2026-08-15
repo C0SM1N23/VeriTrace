@@ -156,6 +156,17 @@ pub(crate) fn parse_range(s: &str) -> (Option<i64>, Option<i64>) {
     }
 }
 
+/// A declared name as the rest of the tool spells it.
+///
+/// An escaped identifier keeps its text but drops the leading backslash, so
+/// paths read the way users type them: `tb.dut.mem[0]`. Shared with the FST
+/// reader on purpose — Icarus names every dumped array word as an escaped
+/// identifier, so the two formats disagreeing here means one dump correlates
+/// against the RTL and the other does not (§7.1).
+pub(crate) fn unescape_name(raw: &str) -> String {
+    raw.trim_start_matches('\\').to_string()
+}
+
 /// Trailing `[n]` on a name marks one element of an unpacked array (§5.6).
 pub(crate) fn array_index_of(name: &str) -> Option<i64> {
     let inner = name.strip_suffix(']')?;
@@ -369,10 +380,7 @@ fn read_declarations<R: Read>(
                             .parse()
                             .map_err(|_| err(line, format!("bad width {:?}", parts[1])))?;
                         let code = parts[2].clone();
-                        // An escaped identifier keeps its text but drops the
-                        // leading backslash, so paths read the way users type
-                        // them: tb.dut.mem[0].
-                        let raw_name = parts[3].trim_start_matches('\\').to_string();
+                        let raw_name = unescape_name(&parts[3]);
                         let suffix = parts.get(4).cloned().unwrap_or_default();
                         let (msb, lsb) = parse_range(&suffix);
 

@@ -64,7 +64,13 @@ fn timescale_from_exp(exp: i32) -> Timescale {
 }
 
 /// FST names often carry their range, e.g. `data [7:0]`.
+///
+/// The leading backslash of an escaped identifier is dropped here for the same
+/// reason the VCD reader drops it: Icarus writes every dumped array word as
+/// `\mem[0]`, and a signal that arrives as `mem[0]` from one format and
+/// `\mem[0]` from the other correlates against the RTL in only one of them.
 fn split_name_range(raw: &str) -> (String, Option<i64>, Option<i64>) {
+    let raw = crate::vcd::unescape_name(raw.trim());
     let raw = raw.trim();
     if let Some(pos) = raw.rfind(' ') {
         let (name, tail) = raw.split_at(pos);
@@ -246,5 +252,17 @@ mod tests {
         assert_eq!(split_name_range("clk"), ("clk".into(), None, None));
         assert_eq!(split_name_range("data [7:0]"), ("data".into(), Some(7), Some(0)));
         assert_eq!(split_name_range("mem[3] [7:0]"), ("mem[3]".into(), Some(7), Some(0)));
+    }
+
+    #[test]
+    fn an_escaped_identifier_is_named_the_way_the_vcd_path_names_it() {
+        // Icarus writes every dumped array word as an escaped identifier. The
+        // two readers disagreeing here means the same signal correlates under
+        // one format and not the other — which is exactly what CI caught.
+        assert_eq!(
+            split_name_range(r"\mem[0] [7:0]"),
+            ("mem[0]".into(), Some(7), Some(0))
+        );
+        assert_eq!(split_name_range(r"\my$sig"), ("my$sig".into(), None, None));
     }
 }
