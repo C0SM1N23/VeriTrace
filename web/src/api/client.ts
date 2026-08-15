@@ -10,6 +10,7 @@ import { decode, encode } from "@msgpack/msgpack";
 import type {
   ChecksReport,
   CmdsResult,
+  CorrelationReport,
   CoverageReport,
   DiffReport,
   Layout,
@@ -21,6 +22,7 @@ import type {
   SessionStatus,
   SignalMeta,
   SourceFile,
+  StuckResult,
   SubtraceResult,
   TxnQueryResult,
   TxnReport,
@@ -314,6 +316,19 @@ export async function fetchSource(session: string, file: string): Promise<Source
 
 export async function fetchChecks(session: string): Promise<ChecksReport> {
   return getJson<ChecksReport>(`${API}/session/${session}/checks`);
+}
+
+/**
+ * §8.4 at another threshold. Only the stuck scan re-runs, not the suite: the
+ * right window depends on the run, so it has to be cheap enough to try.
+ */
+export async function fetchStuck(session: string, cycles: number): Promise<StuckResult> {
+  return getJson<StuckResult>(`${API}/session/${session}/stuck?cycles=${cycles}`);
+}
+
+/** §7.2 — the rate in the status bar, and the names it is a summary of. */
+export async function fetchCorrelation(session: string): Promise<CorrelationReport> {
+  return getJson<CorrelationReport>(`${API}/session/${session}/correlation`);
 }
 
 /** §11.4: suppress a finding. The reason is required by the server too. */

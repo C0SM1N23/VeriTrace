@@ -75,6 +75,39 @@ def test_metrics_land_in_tables_the_spec_queries(con):
     assert regress.query(con, "SELECT score FROM coverage WHERE kind='line'")[1] == [(0.94,)]
 
 
+def test_history_is_machine_readable(tmp_path):
+    """§13.6's whole point is a trend across runs, which is read by a script.
+
+    DuckDB hands back `datetime` for the timestamp column, which `json.dumps`
+    refuses — so the default query, the one `veritrace history` runs with no
+    SQL, is exactly the one that would have failed.
+    """
+    import json
+
+    from click.testing import CliRunner
+
+    from veritrace.cli import main
+
+    path = tmp_path / "r.duckdb"
+    con = regress.connect(path)
+    run = _run()
+    run.findings.append(("stuck", "warn", 3))
+    regress.record(con, run)
+    con.close()
+
+    r = CliRunner().invoke(main, ["history", "--db", str(path), "--json"])
+    assert r.exit_code == 0, r.output
+    doc = json.loads(r.output)
+    assert "ts" in doc["columns"] and "seed" in doc["columns"]
+    assert len(doc["rows"]) == 1
+    assert doc["rows"][0][doc["columns"].index("seed")] == 3910182
+
+    q = CliRunner().invoke(
+        main, ["history", "--db", str(path), "--json", "SELECT n FROM findings WHERE grp='stuck'"]
+    )
+    assert json.loads(q.output)["rows"] == [[3]]
+
+
 def test_the_rtl_hash_changes_when_the_rtl_does(tmp_path):
     a, b = tmp_path / "a.sv", tmp_path / "b.sv"
     a.write_text("module a; endmodule\n", encoding="utf-8")

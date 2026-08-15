@@ -10,14 +10,34 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # Both ends of the range `requires-python` promises. PyO3 sets the
-        # ceiling, so a claim of 3.12-3.14 has to be checked at 3.14 or it is
-        # only a claim.
+        # Two axes, each for a reason §4.1 states.
+        #
+        # **Python**: both ends of the range `requires-python` promises. PyO3
+        # sets the ceiling, so a claim of 3.12-3.14 has to be checked at 3.14
+        # or it is only a claim.
+        #
+        # **OS**: *"`pip install veritrace` trebuie sa functioneze pe
+        # Linux/macOS/Windows"*. Running only on Linux has already cost this
+        # project twice, in both directions: the FST hierarchy bug is specific
+        # to Windows/MSVC and no Linux job could ever have found it, and the
+        # escaped-identifier bug was caught by CI on Linux only because the
+        # development machine is Windows and behaved differently. A
+        # cross-platform promise checked on one platform is a guess.
+        #
+        # The full Python matrix runs on Linux; the other two platforms run the
+        # supported floor. Nine jobs to catch a platform bug that two would is
+        # a cost paid on every push.
+        os: [ubuntu-latest]
         python: ["3.12", "3.14"]
+        include:
+          - os: windows-latest
+            python: "3.12"
+          - os: macos-latest
+            python: "3.12"
     steps:
       - uses: actions/checkout@v4
 
@@ -29,8 +49,10 @@ jobs:
 
       # fstapi builds libfst from C sources and generates bindings with
       # bindgen, so it needs zlib headers and libclang. Cheap here; on Windows
-      # it also wants vcpkg, which is why the `fst` feature is off by default.
+      # it also wants vcpkg, which is why the `fst` feature is off by default
+      # and why the FST job below stays on Linux.
       - name: Install FST build dependencies
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libclang-dev
 
       - name: Install uv
@@ -42,6 +64,7 @@ jobs:
         run: cargo test --workspace
 
       - name: cargo test (fst feature)
+        if: runner.os == 'Linux'
         run: cargo test -p vt-trace --features fst
 
       - name: Install project
@@ -59,8 +82,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
       - name: Tier B — 1 GB over 50k signals
         run: cargo run --release -p vt-trace --example bench -- 1000 50000
+      - run: uv sync
+      - name: Tier B, above the core
+        run: uv run python bench/pybench.py --tier b
 
   # §13.9: the tool gating itself. A failing build should carry the cause, not
   # a dump nobody will open — so this runs the same commands a user would, on
@@ -83,12 +112,10 @@ jobs:
         run: uv run python bench/ttrc.py
 
       - name: Correlation must not regress
-        run: |
-          uv run veritrace correlate designs/lanes/dump.vcd --rtl designs/lanes | tee corr.txt
-          # §7 sets 90% as the bar for the hard cases of §7.1.
-          rate=$(grep -oP '\(\K[0-9.]+(?=%\))' corr.txt | head -1)
-          echo "correlation: $rate%"
-          awk -v r="$rate" 'BEGIN { exit (r >= 90) ? 0 : 1 }'
+        # §7 sets 90% as the bar for the hard cases of §7.1. The gate is the
+        # command's own exit code: this used to grep the percentage out of the
+        # console report, which passes silently the day the sentence is reworded.
+        run: uv run veritrace correlate designs/lanes/dump.vcd --rtl designs/lanes --fail-under 90
 
       - name: Every injected problem is still reported
         run: |
@@ -266,8 +293,74 @@ jobs:
           # produced, read off the graph rather than suggested.
           grep -q "<- rd_rst_n <= 0" holes.txt
 
+  # §4.1: *"`pip install veritrace` trebuie sa functioneze pe Linux/macOS/Windows
+  # fara toolchain. Wheel-uri pre-build in CI."* One wheel built on one platform
+  # is not that promise checked, it is that promise restated — so this builds on
+  # all three and runs the packaged binary from a venv that has never seen the
+  # repository.
+  #
+  # Deliberately a smoke test and not the acceptance criteria below: what varies
+  # by platform is the *build* — the PyO3 extension, the MSVC CRT, the macOS
+  # deployment target — and behaviour is worth checking once, thoroughly, rather
+  # than three times, shallowly. `shell: bash` so one script covers all three.
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # The wheel is supposed to carry the interface, so the UI has to be built
+      # into it here too — a wheel that installs and then serves a 404 is not a
+      # wheel that works.
+      - name: Build the UI into the package
+        run: npm ci && npm run build
+        working-directory: web
+
+      - name: Build a wheel
+        run: |
+          pip install maturin
+          maturin build --release -o dist
+
+      - name: Install it into a fresh environment
+        run: |
+          python -m venv fresh
+          # venv puts scripts in bin/ on POSIX and Scripts/ on Windows.
+          bin=$([ -d fresh/bin ] && echo fresh/bin || echo fresh/Scripts)
+          echo "VT=$PWD/$bin" >> "$GITHUB_ENV"
+          "$bin/python" -m pip install --disable-pip-version-check dist/*.whl
+
+      - name: The packaged CLI runs and converts a real dump
+        run: |
+          "$VT/veritrace" --version
+          "$VT/veritrace" convert designs/fifo_buggy/dump.vcd -o out.vtx
+          # Conversion succeeding is not the claim; reading it back is.
+          "$VT/veritrace" signals out.vtx rd_ptr | tee sig.txt
+          grep -q "tb_fifo_buggy.dut.rd_ptr" sig.txt
+
+      - name: The packaged wheel carries its protocol packs
+        run: |
+          "$VT/veritrace" packs --json | tee packs.json
+          grep -q '"AXI4-Lite"' packs.json
+
   # A clean machine, a wheel, and the three commands §13.4 promises. This is the
-  # packaging acceptance criterion of Prompt 8, not a smoke test.
+  # packaging acceptance criterion of Prompt 8, not a smoke test — so it stays
+  # on one platform and goes deep. The `wheels` job above is the breadth.
   packaging:
     runs-on: ubuntu-latest
     steps:
@@ -447,5 +540,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
       - name: Benchmark against the tier-A budget
         run: cargo run --release -p vt-trace --example bench -- 50
+
+      # The other half of §4.2's tier A. `bench.rs` covers what is pure Rust;
+      # the stuck detector, transaction extraction and `why()` are Python and
+      # were measured by nothing at all, which is how the stuck detector came to
+      # sit three times over its budget without anyone noticing.
+      - run: uv sync
+      - name: The tier-A budgets above the core
+        run: uv run python bench/pybench.py

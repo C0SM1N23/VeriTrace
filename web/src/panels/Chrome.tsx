@@ -1,8 +1,9 @@
 /** Top bar, tab strip, status bar and the shortcut overlay (§11.3, §11.7). */
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+import { fetchCorrelation } from "../api/client";
 import { formatTime } from "../lib/time";
-import type { PluginTable } from "../lib/types";
+import type { CorrelationReport, PluginTable } from "../lib/types";
 import { useWave } from "../state/store";
 
 /**
@@ -46,14 +47,92 @@ export function TopBar() {
       <Dot />
       <span className="crumb">{rows.length} shown</span>
       <Dot />
-      <span className="crumb">
-        {status.correlation_rate === null ? "no RTL" : `${status.correlation_rate}% correlated`}
-      </span>
+      <Correlation rate={status.correlation_rate} />
       <Dot />
       <span className="crumb">
         t: {formatTime(status.t0, status.timescale)}–{formatTime(status.t1, status.timescale)}
       </span>
     </div>
+  );
+}
+
+/**
+ * §7.2's rate, and the names behind it.
+ *
+ * The percentage has always been here; what it could not do was answer the
+ * question it provokes. §7.2 makes the rate a first-class metric and prescribes
+ * a remedy — the simulator dump flags of §4.0 — that is chosen by looking at
+ * *which* signals are missing, so the list is one click from the number rather
+ * than only in `veritrace correlate`.
+ */
+function Correlation({ rate }: { rate: number | null }) {
+  const session = useWave((s) => s.session);
+  const [open, setOpen] = useState<CorrelationReport | null>(null);
+
+  if (rate === null) return <span className="crumb">no RTL</span>;
+  return (
+    <>
+      <button
+        className="crumb crumb-button"
+        title="Which RTL signals are not in this dump (§7.2)"
+        onClick={() => {
+          if (open) return setOpen(null);
+          if (session) void fetchCorrelation(session).then(setOpen).catch(() => setOpen(null));
+        }}
+        data-testid="correlation-crumb"
+      >
+        {rate}% correlated
+      </button>
+      {open && (
+        <div className="palette-backdrop" onClick={() => setOpen(null)}>
+          <div
+            className="correlation"
+            onClick={(e) => e.stopPropagation()}
+            data-testid="correlation-panel"
+          >
+            <div className="strong">{open.summary}</div>
+            <div className="dim">
+              by method:{" "}
+              {Object.entries(open.by_method)
+                .map(([k, v]) => `${k}=${v}`)
+                .join(", ")}
+            </div>
+            {open.percent < 90 && (
+              <div className="pane-hint" data-testid="correlation-warning">
+                Below §7.2's 90%. This is nearly always a missing simulator dump
+                flag — Verilator needs --no-inline and --trace-structs (§4.0).
+              </div>
+            )}
+            {open.n_reconstructible > 0 && (
+              <>
+                {/* §7.3: absent but derivable is not a correlation failure, and
+                    showing it in the same list as the losses would read as one. */}
+                <h3>
+                  NOT DUMPED, RECONSTRUCTIBLE FROM RTL ({open.n_reconstructible})
+                </h3>
+                <ul data-testid="correlation-reconstructible">
+                  {open.reconstructible.map((p) => (
+                    <li key={p}>~ {p}</li>
+                  ))}
+                </ul>
+              </>
+            )}
+            {open.n_unmatched > 0 ? (
+              <>
+                <h3>NOT CORRELATED ({open.n_unmatched})</h3>
+                <ul data-testid="correlation-unmatched">
+                  {open.unmatched.map((p) => (
+                    <li key={p}>{p}</li>
+                  ))}
+                </ul>
+              </>
+            ) : (
+              <h3 data-testid="correlation-complete">EVERY RTL SIGNAL WAS FOUND</h3>
+            )}
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 

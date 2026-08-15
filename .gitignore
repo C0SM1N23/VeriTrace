@@ -48,7 +48,17 @@ node_modules/
 # Frontend build + test output. designs/*/sim.log IS committed: the triage
 # acceptance test reads it, so CI needs no simulator.
 web/dist/
-web/test-results/
+# Unanchored: Playwright writes these relative to its own cwd, which is not
+# always `web/` — a `-g` run from the repo root left one at the top level.
+test-results/
+
+# `pytest --cov` artefacts. Not a declared dependency — it is installed when
+# somebody wants to know where the holes are, which is worth doing and not
+# worth committing the output of.
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 web/playwright-report/
 web/vite.log
 

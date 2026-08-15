@@ -13,6 +13,9 @@ import tomli_w
 
 from veritrace import __version__
 from veritrace.config import WORK_DIR
+#: §7.2's 90% bar, needed at import time because it is a default in a decorator.
+#: The module it comes from is stdlib-only, so this costs nothing at startup.
+from veritrace.correlate.resolver import FLOOR as _FLOOR
 from veritrace.export import viewers
 from veritrace.ingest.capture import FORMATS as _CAPTURE_FORMATS
 from veritrace.stim.emit import TARGETS as _STIM_TARGETS
@@ -374,6 +377,57 @@ def _warn_if_rtl_moved(ctx: "Context", files: list[Path]) -> None:
         pass
 
 
+#: How many candidates an ambiguous name lists before it stops.
+_CANDIDATES = 10
+
+
+def resolve_signal(graph, name: str, store=None) -> str:
+    """`resolver.resolve_path`, with the terminal's phrasing for a refusal.
+
+    The rule itself is §7.2's and lives in the correlator; what belongs here is
+    what to say when it declines — including the nearest names the *trace* has,
+    which the graph cannot know about.
+    """
+    from veritrace.correlate.resolver import resolve_path
+
+    path, candidates = resolve_path(graph, name)
+    if path is not None:
+        if path != name:
+            # Say which one, on stderr: the answer that follows is about a path
+            # the user did not type, and a script piping stdout is unaffected.
+            click.echo(f"  {name} -> {path}", err=True)
+        return path
+    if candidates:
+        listed = "\n".join(f"    {p}" for p in candidates[:_CANDIDATES])
+        more = (
+            f"\n    ... and {len(candidates) - _CANDIDATES} more"
+            if len(candidates) > _CANDIDATES
+            else ""
+        )
+        raise click.ClickException(
+            f"{name!r} is ambiguous — {len(candidates)} signals end with it:\n{listed}{more}"
+        )
+    raise click.ClickException(_unknown_signal(name, store))
+
+
+def _unknown_signal(name: str, store=None) -> str:
+    """`unknown signal`, with the nearest names the trace actually has.
+
+    The same subsequence ranking the command palette uses, so the terminal and
+    the interface suggest the same thing for the same typo.
+    """
+    from veritrace.api.search import search_signals
+
+    near = [r["path"] for r in search_signals(store.signals(), name, limit=5)] if store else []
+    if not near:
+        return f"unknown signal: {name}"
+    listed = "\n".join(f"    {p}" for p in near)
+    return (
+        f"unknown signal: {name}\n  did you mean:\n{listed}\n"
+        f"  `veritrace signals {name}` searches the whole trace."
+    )
+
+
 def _at(ctx: Context, when: str | None) -> int:
     """Resolve `--at`: a raw timestamp, `cN` for a clock cycle, or the end."""
     _t0, t1 = ctx.store.time_range
@@ -460,12 +514,37 @@ def _emit_selection(
 )
 @rtl_options
 @click.option("--limit", default=20, type=int, help="How many unmatched paths to list.")
-def correlate(trace: Path | None, rtl: tuple[Path, ...], top: str | None, limit: int) -> None:
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+@click.option(
+    "--fail-under",
+    default=None,
+    type=float,
+    # A value, never an optional one: click's optional-value options bind only
+    # with `=`, so `--fail-under 90` would silently use the default and let a
+    # 12%-correlated run pass a gate that looks like it demands 90.
+    help=f"Exit non-zero below this percentage. §7.2's bar is {_FLOOR:g}.",
+)
+def correlate(
+    trace: Path | None,
+    rtl: tuple[Path, ...],
+    top: str | None,
+    limit: int,
+    as_json: bool,
+    fail_under: float | None,
+) -> None:
     """Match RTL signals against a trace and report the correlation rate.
 
     §7 makes this a first-class number rather than something buried: a low rate
     means every later answer is built on sand, and it is nearly always a
     missing simulator flag (§4.0).
+
+    \b
+      veritrace correlate dump.vcd --rtl src/
+      veritrace correlate dump.vcd --rtl src/ --fail-under 90   # the CI gate
+
+    `--fail-under` is what makes §7.2's *first-class metric* first-class in a
+    build: without it the only way to gate on the rate is to grep a percentage
+    out of prose, which passes silently the day the sentence is reworded.
     """
     from veritrace.correlate.resolver import format_report
 
@@ -474,13 +553,34 @@ def correlate(trace: Path | None, rtl: tuple[Path, ...], top: str | None, limit:
     ctx = _load(_default_trace(trace, flag="a trace path"), rtl, top, need_rtl=True)
     el = ctx.elaboration
 
-    click.echo(f"top = {el.graph.top or '?'}")
-    click.echo(f"{len(el.graph)} RTL signals, {ctx.store.n_signals} trace signals")
-    click.echo(format_report(ctx.correlation, limit=limit))
-    if el.graph.blackboxes:
-        click.echo(f"  {len(el.graph.blackboxes)} black-box instance(s) without source")
-    if el.errors:
-        click.echo(f"  {len(el.errors)} elaboration error(s); first: {el.errors[0]}")
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "top": el.graph.top,
+                    "n_rtl_signals": len(el.graph),
+                    "n_trace_signals": ctx.store.n_signals,
+                    "blackboxes": sorted(el.graph.blackboxes),
+                    "elaboration_errors": list(el.errors),
+                    **ctx.correlation.to_dict(limit=limit),
+                },
+                indent=2,
+            )
+        )
+    else:
+        click.echo(f"top = {el.graph.top or '?'}")
+        click.echo(f"{len(el.graph)} RTL signals, {ctx.store.n_signals} trace signals")
+        click.echo(format_report(ctx.correlation, limit=limit))
+        if el.graph.blackboxes:
+            click.echo(f"  {len(el.graph.blackboxes)} black-box instance(s) without source")
+        if el.errors:
+            click.echo(f"  {len(el.errors)} elaboration error(s); first: {el.errors[0]}")
+
+    if fail_under is not None and ctx.correlation.percent < fail_under:
+        raise click.ClickException(
+            f"correlation is {ctx.correlation.percent}%, below the required "
+            f"{fail_under:g}% — see §4.0 for the dump flags this usually means."
+        )
 
 
 @main.command()
@@ -679,9 +779,9 @@ def _ask(ctx: "Context", query: str | None):
     if parsed.txn is not None:
         signal, at, headline = _txn_question(ctx, parsed.txn)
     else:
-        signal = parsed.signal
-        if ctx.graph.get(signal) is None:
-            raise click.ClickException(f"unknown signal: {signal}")
+        # A partial name is resolved the way §7.2 resolves one, or refused with
+        # the candidates — never guessed at.
+        signal = resolve_signal(ctx.graph, parsed.signal, ctx.store)
         at = _at(
             ctx,
             None
@@ -776,12 +876,16 @@ def _print_chain(node, clock, depth: int = 0, seen: set | None = None) -> None:
 )
 @click.option("--from", "t_from", default=None, help="Window start, or cN.")
 @click.option("--to", "t_to", default=None, help="Window end, or cN.")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 @viewer_options
-def cone(trace, signal, rtl, top, depth, direction, active_only, t_from, t_to, output, **flags):
+def cone(
+    trace, signal, rtl, top, depth, direction, active_only, t_from, t_to, as_json, output, **flags
+):
     """Signals within N edges of SIGNAL. From 4000 signals you keep 8 (§8.6)."""
     from veritrace.analysis import cone as cone_mod
 
     ctx = _load(trace, rtl, top, need_rtl=True)
+    signal = resolve_signal(ctx.graph, signal, ctx.store)
     lo, hi = ctx.store.time_range
     window = (_at(ctx, t_from) if t_from else lo, _at(ctx, t_to) if t_to else hi + 1)
     try:
@@ -795,6 +899,24 @@ def cone(trace, signal, rtl, top, depth, direction, active_only, t_from, t_to, o
         )
     except KeyError:
         raise click.ClickException(f"unknown signal: {signal}") from None
+
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "signal": signal,
+                    "direction": direction,
+                    "depth": depth,
+                    "window": list(window) if active_only else None,
+                    "n_inactive": result.n_inactive,
+                    "nodes": [
+                        {"path": n.path, "depth": n.depth, "role": n.role} for n in result.nodes
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return
 
     if _emit_selection(ctx, result.paths(), f"Cone of {signal}", flags, output):
         return
@@ -813,8 +935,9 @@ def cone(trace, signal, rtl, top, depth, direction, active_only, t_from, t_to, o
 )
 @rtl_options
 @click.option("--cycles", default=None, type=int, help="Threshold, in clock cycles.")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 @viewer_options
-def stuck(trace, rtl, top, cycles, output, **flags):
+def stuck(trace, rtl, top, cycles, as_json, output, **flags):
     """Signals frozen for longer than the threshold (§8.4)."""
     from veritrace.analysis import stuck as stuck_mod
 
@@ -825,10 +948,33 @@ def stuck(trace, rtl, top, cycles, output, **flags):
         stuck_mod.scan(ctx.store, ctx.clock, ctx.graph, ctx.config, cycles),
         key=lambda f: f.sort_key,
     )
+    # Whether the window could have fired at all — the difference between "the
+    # design is fine" and "you asked about a wider window than the run has".
+    unreachable = stuck_mod.too_short(ctx.store, ctx.clock, ctx.config, cycles)
+
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "clock": ctx.clock.path,
+                    "n_cycles": ctx.clock.n_cycles,
+                    "threshold_cycles": (
+                        cycles
+                        if cycles is not None
+                        else getattr(ctx.config, "stuck_cycles", stuck_mod.DEFAULT_CYCLES)
+                    ),
+                    "unreachable": unreachable,
+                    "findings": [f.to_dict() for f in found],
+                },
+                indent=2,
+            )
+        )
+        return
+
     if _emit_selection(ctx, [f.signal for f in found if f.signal], "Stuck", flags, output):
         return
     if not found:
-        click.echo("nothing has been frozen for longer than the threshold")
+        click.echo(unreachable or "nothing has been frozen for longer than the threshold")
         return
     click.echo(f"{len(found)} frozen signal(s), clock {ctx.clock.path}")
     for f in found:
@@ -857,9 +1003,21 @@ def check(trace, rtl, top, as_json, fail_on):
     report = ctx.check_report()
 
     if as_json:
-        click.echo(json.dumps(report.to_dict(), indent=2))
+        click.echo(
+            json.dumps(
+                {
+                    **report.to_dict(),
+                    # §7.2: the rate the findings were produced under. A gate
+                    # reading this file can tell "clean" from "matched nothing".
+                    "correlation": (
+                        ctx.correlation.to_dict(limit=20) if ctx.correlation else None
+                    ),
+                },
+                indent=2,
+            )
+        )
     else:
-        click.echo(_format_report(report, ctx.clock))
+        click.echo(_format_report(report, ctx.clock, ctx.correlation))
 
     _gate(report, fail_on)
 
@@ -1705,24 +1863,56 @@ def _format_performance(report, wait_for, clock) -> str:
     return "\n".join(out)
 
 
-def _format_report(report, clock) -> str:
+def _format_report(report, clock, correlation=None) -> str:
+    """The console form of a check report — reservations first, verdict after.
+
+    Two things sit above the findings on purpose:
+
+    * **The correlation rate** (§7.2). `check` reads the RTL, and RTL that does
+      not match the dump produces confident findings about a different design —
+      pointing `--rtl` at the wrong directory is a far commoner mistake than
+      editing the sources after the run, and nothing else in the output says a
+      word about it.
+    * **What did not run** (P7). "no automatic findings" printed above a list
+      of checks that never happened reads as a clean bill of health for a scan
+      that mostly did not take place.
+    """
     from veritrace import clocks as _clocks
 
-    if not len(report):
-        out = ["no automatic findings"]
-    else:
-        out = [f"{len(report)} finding(s) in {report.elapsed_ms:.0f} ms"]
-        for group, findings in report.by_group().items():
-            out.append("")
-            out.append(f"{group.label} ({len(findings)})")
-            for f in findings:
-                at = f"  at {_clocks.format_time(f.time, clock)}" if f.time is not None else ""
-                out.append(f"  {f.signal or '-'}   {f.title}{at}   {f.loc or ''}")
-                for note in f.notes:
-                    out.append(f"      {note}")
+    out: list[str] = []
+    if correlation is not None:
+        out.append(f"RTL: {correlation.summary()}")
+        if correlation.percent < _FLOOR:
+            out.append(
+                f"  WARNING: below §7.2's {_FLOOR:g}%. These findings are about RTL "
+                "that barely matches this dump — check --rtl points at the right "
+                "sources, and see §4.0 for the simulator dump flags."
+            )
+        out.append("")
+
     # P7: a check that could not run says so; silence would read as a pass.
-    for name, why_not in report.skipped.items():
-        out.append(f"  not run: {name} - {why_not}")
+    if report.skipped:
+        out.append(f"{len(report.skipped)} check(s) did not run:")
+        out += [f"  {name} - {why_not}" for name, why_not in report.skipped.items()]
+        out.append("")
+
+    if not len(report):
+        out.append(
+            "no automatic findings from the checks that ran"
+            if report.skipped
+            else "no automatic findings"
+        )
+        return "\n".join(out)
+
+    out.append(f"{len(report)} finding(s) in {report.elapsed_ms:.0f} ms")
+    for group, findings in report.by_group().items():
+        out.append("")
+        out.append(f"{group.label} ({len(findings)})")
+        for f in findings:
+            at = f"  at {_clocks.format_time(f.time, clock)}" if f.time is not None else ""
+            out.append(f"  {f.signal or '-'}   {f.title}{at}   {f.loc or ''}")
+            for note in f.notes:
+                out.append(f"      {note}")
     return "\n".join(out)
 
 
@@ -1756,10 +1946,10 @@ def probes(signal, rtl, top, trace, depth, fmt, samples, clock_path, output):
             "This needs RTL. Pass --rtl <file|dir>, or set design.rtl in .veritrace.toml."
         )
     graph = elaborate(files, incdirs, defines, top).graph
-    try:
-        result = cone_mod.cone(graph, signal, depth=depth)
-    except KeyError:
-        raise click.ClickException(f"unknown signal: {signal}") from None
+    # No trace here by design, so there is nothing to suggest names from — but
+    # a unique suffix still resolves against the graph.
+    signal = resolve_signal(graph, signal)
+    result = cone_mod.cone(graph, signal, depth=depth)
 
     plan = probes_mod.plan_from_cone(
         result,
@@ -1816,6 +2006,59 @@ def triage(log, trace, rtl, top, as_json, output, **flags):
         click.echo(json.dumps(report.to_dict(), indent=2))
         return
     click.echo(triage_mod.format_report(report, ctx.clock))
+
+
+@main.command()
+@click.argument("trace", type=click.Path(path_type=Path), required=False, default=None)
+@click.argument("pattern", required=False, default=None)
+@click.option("--limit", default=40, type=int, help="How many rows.")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+@viewer_options
+def signals(trace, pattern, limit, as_json, output, **flags):
+    """Find a signal's full path (§13's P6 — every feature in the terminal).
+
+    \b
+      veritrace signals full            # the trace from .veritrace.toml
+      veritrace signals dump.vtx wr_ptr
+      veritrace signals dump.vtx --gtkw -o all.gtkw
+
+    Every other command wants a hierarchical path, and until now the terminal
+    was the one surface with no way to find out what they are: the API has
+    `/signals?q=`, the interface has ⌘P, and `veritrace why "why(full)"` simply
+    said the signal was unknown. The ranking is the palette's, so the same typo
+    suggests the same names in both places.
+
+    Needs no RTL — this is a question about the dump.
+    """
+    from veritrace import TraceStore
+    from veritrace import config as cfg
+    from veritrace.api.search import search_signals
+
+    trace, pattern = _trace_and_query(trace, pattern)
+    # Deliberately not `_load`: this is a question about the dump, and going
+    # through the usual path would elaborate whatever `design.rtl` names — a
+    # multi-second wait for a lookup that has to feel like `grep`.
+    path = _default_trace(trace, flag="a trace path")
+    ctx = Context(
+        store=TraceStore(str(path)),
+        config=cfg.load() or cfg.load_or_empty(path.parent),
+        trace_path=path,
+    )
+    rows = search_signals(ctx.store.signals(), pattern or "", limit=limit)
+    total = ctx.store.n_signals
+
+    if as_json:
+        click.echo(json.dumps({"pattern": pattern or "", "total": total, "signals": rows}, indent=2))
+        return
+    if _emit_selection(ctx, [r["path"] for r in rows], pattern or "All signals", flags, output):
+        return
+    if not rows:
+        click.echo(f"nothing in this trace matches {pattern!r} ({total} signals)")
+        return
+    click.echo(f"{len(rows)} of {total} signal(s)" + (f" matching {pattern!r}" if pattern else ""))
+    for r in rows:
+        width = f"[{r['msb']}:{r['lsb']}]" if r["msb"] is not None else f"{r['width']}b"
+        click.echo(f"  {r['path']:<52} {width:>10}  {r['kind']:<10} {r['n_events']} event(s)")
 
 
 def _trace_and_query(trace: Path | None, query: str | None) -> tuple[Path | None, str | None]:
@@ -2206,7 +2449,8 @@ def export_report(trace, query, rtl, top, output, with_repro):
     default=None,
     help="Project to look in. Default: the one holding .veritrace.toml.",
 )
-def plugins(root):
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def plugins(root, as_json):
     """What analysis plugins are installed, and what could not load (§13.7).
 
     Looked for in `~/.veritrace/plugins/` and in `plugins/` beside your
@@ -2224,6 +2468,29 @@ def plugins(root):
     plugin_mod.clear()
     found, errors = plugin_mod.discover(base)
     paths = plugin_mod.search_path(base)
+
+    if as_json:
+        # P6: a project that vendors plugins wants to assert in CI that they all
+        # loaded — `errors` empty is the assertion, and it needs a shape.
+        click.echo(
+            json.dumps(
+                {
+                    "searched": [str(p) for p in paths],
+                    "plugins": [
+                        {
+                            "name": c.name,
+                            "needs": list(c.needs),
+                            "description": c.description,
+                        }
+                        for c in found
+                    ],
+                    "errors": dict(errors),
+                },
+                indent=2,
+            )
+        )
+        return
+
     click.echo("looked in: " + (", ".join(str(p) for p in paths) or "nowhere — no plugin directory exists"))
 
     if found:
@@ -2247,7 +2514,8 @@ def plugins(root):
               default=None, help="Project to look in (default: the one you are standing in).")
 @click.option("--trace", type=click.Path(path_type=Path), default=None,
               help="Also say which packs match this dump, and why the others do not.")
-def packs(root, trace):
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def packs(root, trace, as_json):
     """What protocol packs are loaded, and what could not load (§8.15).
 
     \b
@@ -2269,6 +2537,45 @@ def packs(root, trace):
 
     errors: list[str] = []
     found = pack_mod.discover(base, errors)
+
+    if as_json:
+        # Same reason as `plugins --json`: "every pack I ship still loads, and
+        # the bus I care about is still detected" is a CI assertion (P6).
+        doc: dict = {
+            "searched": [str(p) for p in pack_mod.search_path(base)],
+            "packs": [
+                {
+                    "name": p.name,
+                    "version": p.version,
+                    "channels": len(p.channels),
+                    "transactions": len(p.transactions),
+                    "rules": len(p.rules),
+                    "cover": len(p.cover),
+                    "needs": list(p.detect.required_suffixes),
+                }
+                for p in sorted(found, key=lambda x: x.name.lower())
+            ],
+            "errors": list(errors),
+        }
+        if trace is not None:
+            from veritrace import TraceStore
+            from veritrace import store as store_mod
+
+            store = TraceStore(str(store_mod.ensure(_default_trace(trace, flag="a trace path"))))
+            matched = {i.pack.name: i for i in detect_mod.detect(store, found)}
+            doc["matched"] = [
+                {"pack": name, "interface": i.name, "scope": i.scope}
+                for name, i in sorted(matched.items())
+            ]
+            doc["near_misses"] = [
+                {"pack": p.name, "scope": where, "missing": list(missing)}
+                for p in sorted(found, key=lambda x: x.name.lower())
+                if p.name not in matched
+                for where, missing in detect_mod.near_misses(store, p)
+            ]
+        click.echo(json.dumps(doc, indent=2))
+        return
+
     click.echo("looked in: " + ", ".join(str(p) for p in pack_mod.search_path(base)))
     click.echo(f"\n{len(found)} pack(s):")
     for p in sorted(found, key=lambda x: x.name.lower()):
@@ -3201,7 +3508,8 @@ def stimgen(rtl, top, packs, iface, n, seed, cover_holes, target, output, as_jso
 @click.option("--design", default="design", help="Design name recorded in the file.")
 @click.option("--gating", is_flag=True, help="List clock-gating candidates instead.")
 @click.option("--top-n", default=20, type=int, help="How many rows for --gating.")
-def saif(trace, output, design, gating, top_n):
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def saif(trace, output, design, gating, top_n, as_json):
     """Switching activity, for power estimation (§8.31).
 
     \b
@@ -3217,6 +3525,25 @@ def saif(trace, output, design, gating, top_n):
 
     path = _ensure_store(_default_trace(trace, flag="a trace path"))
     report = saif_mod.measure(TraceStore(str(path)))
+
+    if as_json:
+        # Both modes in one document: the toggle counts are what a power script
+        # wants, and `held` is the only thing --gating adds on top of them.
+        _write(
+            json.dumps(
+                {
+                    **report.to_dict(),
+                    "gating_candidates": [
+                        {"path": a.path, "held": a.held, "tc": a.tc}
+                        for a in saif_mod.gating_candidates(report)[:top_n]
+                    ],
+                },
+                indent=2,
+            ),
+            output,
+            f"{len(report.signals)} net(s)",
+        )
+        return
 
     if gating:
         rows = saif_mod.gating_candidates(report)[:top_n]
@@ -3555,12 +3882,25 @@ def _collect(ctx: "Context", run) -> None:
             run.coverage.append(("functional", f.iface, covered, total, covered / max(1, total)))
 
 
+def _jsonable(v):
+    """DuckDB hands back timestamps and decimals; JSON does not take them."""
+    from datetime import date, datetime
+    from decimal import Decimal
+
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+    if isinstance(v, Decimal):
+        return float(v)
+    return v
+
+
 @main.command()
 @click.argument("sql", required=False)
 @click.option("--db", "db_path", type=click.Path(exists=True, path_type=Path), default=None,
               help="The DuckDB file (default: regressions.duckdb).")
 @click.option("--limit", default=40, type=int, help="Rows, when no SQL is given.")
-def history(sql, db_path, limit):
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def history(sql, db_path, limit, as_json):
     """Query the regression database (§13.6).
 
     \b
@@ -3586,6 +3926,16 @@ def history(sql, db_path, limit):
     finally:
         con.close()
 
+    if as_json:
+        # P6, and the one place it matters most: §13.6's whole point is a trend
+        # across runs, which is read by a script or a dashboard, not by eye.
+        click.echo(
+            json.dumps(
+                {"columns": list(cols), "rows": [[_jsonable(v) for v in r] for r in rows]},
+                indent=2,
+            )
+        )
+        return
     if not rows:
         click.echo("no rows")
         return

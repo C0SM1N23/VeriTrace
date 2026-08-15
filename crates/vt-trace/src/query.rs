@@ -14,7 +14,7 @@
 //! glitches deliberately, and `value_before` gives the value strictly before a
 //! timestamp, which is what NBA semantics need at a clock edge (problem 2).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -179,6 +179,10 @@ pub struct TraceStore {
     pub signals: Vec<SignalMeta>,
     pub scopes: Vec<ScopeMeta>,
     by_path: HashMap<String, Handle>,
+    /// One representative handle per event stream. Width and encoding belong to
+    /// the stream, so a bulk read that works stream by stream (§7.1 puts many
+    /// names on one) needs a way back to them that is not a linear search.
+    by_stream: HashMap<u32, Handle>,
     cache: RwLock<HashMap<u32, Arc<StreamData>>>,
     times_cache: RwLock<HashMap<u32, Arc<Vec<Time>>>>,
     /// Parquet footers, keyed by part file. Without this every signal would
@@ -196,6 +200,8 @@ impl TraceStore {
         let scopes = read_scopes(&dir.join("scopes.parquet"))?;
         let by_path =
             signals.iter().map(|s| (s.path.clone(), s.signal_id)).collect::<HashMap<_, _>>();
+        let by_stream =
+            signals.iter().map(|s| (s.stream_id, s.signal_id)).collect::<HashMap<_, _>>();
         Ok(TraceStore {
             dir,
             meta,
@@ -203,6 +209,7 @@ impl TraceStore {
             signals,
             scopes,
             by_path,
+            by_stream,
             cache: RwLock::new(HashMap::new()),
             times_cache: RwLock::new(HashMap::new()),
             part_meta: RwLock::new(HashMap::new()),
@@ -689,6 +696,148 @@ impl TraceStore {
             .collect()
     }
 
+    /// `value_at(t)` for many signals, in one parallel pass.
+    ///
+    /// The companion to `last_change_all`, and it exists for the same caller:
+    /// §8.4's stuck detector asks *when* every signal last moved and then *what*
+    /// each frozen one is stuck at. The first half was already one rayon pass;
+    /// the second was a Python loop paying a cold Parquet decode per signal,
+    /// which measured at 74% of the whole scan and put it three times over
+    /// §4.2's 400 ms budget.
+    ///
+    /// Neither `value_at` in a loop nor `sample_before`, and for the same
+    /// reason: both decode a signal's *whole* event stream to answer about one
+    /// timestamp. That is the right trade when a session then asks a hundred
+    /// more questions of the same signal — it is what the stream cache is for —
+    /// and the wrong one here, where each signal is asked exactly once and
+    /// 2969 full decodes is the entire cost of the scan.
+    ///
+    /// So this goes through the index instead: `chunk_for_time` gives the one
+    /// Parquet row group that can contain `t`, and only that row group is read.
+    /// The stream cache is deliberately left untouched — a whole-trace scan
+    /// that populated it would leave every signal in the design resident for a
+    /// pass that never looks at them again (§4.2's tier-B RAM budget).
+    /// Grouped by Parquet part, not by signal, and that is the whole point.
+    /// One reader per signal meant one `File::open` per signal — 283 µs of
+    /// fixed cost each, which at three thousand frozen signals *is* the scan.
+    /// A store has a handful of parts, so opening each once and reading all the
+    /// row groups wanted from it turns three thousand opens into sixteen.
+    pub fn value_at_all(&self, handles: &[Handle], t: Time) -> Vec<Option<Value>> {
+        // Stream → the one chunk that can contain `t`, from the index. Several
+        // handles can share a stream (§7.1 aliases), so the work is per stream
+        // and the answer is fanned back out per handle at the end.
+        let mut by_part: HashMap<u32, Vec<(u32, usize)>> = HashMap::new();
+        let mut cached: HashMap<u32, Option<Value>> = HashMap::new();
+        let mut seen: HashSet<u32> = HashSet::new();
+        for &h in handles {
+            let Ok(sig) = self.signal(h) else { continue };
+            let stream = sig.stream_id;
+            if !seen.insert(stream) {
+                continue;
+            }
+            if let Some(d) = self.cache.read().unwrap().get(&stream) {
+                // Already decoded by something else this session: reading the
+                // file again would be slower than the answer already in hand.
+                cached.insert(stream, d.idx_at(t).map(|i| d.values.get(i)));
+                continue;
+            }
+            match self.index.chunk_for_time(stream, t) {
+                Some(ci) => {
+                    let e = self.index.entry(ci);
+                    by_part.entry(e.part_id).or_default().push((stream, e.row_group as usize));
+                }
+                None => {
+                    cached.insert(stream, None);
+                }
+            }
+        }
+
+        let parts: Vec<_> = by_part.into_iter().collect();
+        let decoded: HashMap<u32, Option<Value>> = parts
+            .par_iter()
+            .map(|(part, wanted)| self.values_from_part(*part, wanted, t).unwrap_or_default())
+            .reduce(HashMap::new, |mut a, b| {
+                a.extend(b);
+                a
+            });
+
+        handles
+            .iter()
+            .map(|&h| {
+                let stream = self.signal(h).ok()?.stream_id;
+                cached
+                    .get(&stream)
+                    .or_else(|| decoded.get(&stream))
+                    .cloned()
+                    .flatten()
+            })
+            .collect()
+    }
+
+    /// The settled value at `t` of every stream named in `wanted`, from one part.
+    ///
+    /// `wanted` is `(stream, row_group)`; each Parquet row group holds exactly
+    /// one stream, so the rows can be routed by their `signal_id` column with no
+    /// bookkeeping about which group they came from.
+    fn values_from_part(
+        &self,
+        part: u32,
+        wanted: &[(u32, usize)],
+        t: Time,
+    ) -> Result<HashMap<u32, Option<Value>>> {
+        let mut groups: Vec<usize> = wanted.iter().map(|(_, g)| *g).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        // Columns 0, 1 and 3 — `delta` is never read here, and skipping it is
+        // the same column pruning §6.3 counts as a reason to be in Parquet at
+        // all. `load_times` does the same for its one column.
+        let builder = self.part_reader(part)?;
+        let mask = ProjectionMask::roots(builder.parquet_schema(), [0, 1, 3]);
+        let reader = builder.with_row_groups(groups).with_projection(mask).build()?;
+
+        // Last row at or before `t` wins: rows inside a chunk are in time order
+        // and a timestamp repeats across delta cycles (§5.5), so the settled
+        // value is the last match, not the first.
+        let mut best: HashMap<u32, Vec<u8>> = HashMap::new();
+        let mut last_row: HashMap<u32, usize> = HashMap::new();
+        for batch in reader {
+            let batch = batch?;
+            // Index 2, not 3: the projection above dropped `delta`, so the
+            // batch has three columns and `value` moved up one.
+            let ids = col::<UInt32Array>(&batch, 0, "signal_id")?;
+            let ts = col::<Int64Array>(&batch, 1, "time")?;
+            let vs = col::<BinaryArray>(&batch, 2, "value")?;
+            // Two passes over the batch, deliberately. Copying the value of
+            // every candidate row and overwriting it with the next is one heap
+            // allocation per event for an answer that keeps one per stream; the
+            // row indices are integers and cost nothing to overwrite.
+            last_row.clear();
+            for r in 0..batch.num_rows() {
+                if ts.value(r) <= t {
+                    last_row.insert(ids.value(r), r);
+                }
+            }
+            for (&stream, &r) in &last_row {
+                best.insert(stream, vs.value(r).to_vec());
+            }
+        }
+
+        let mut out = HashMap::with_capacity(wanted.len());
+        for &(stream, _) in wanted {
+            // Width and encoding belong to the stream, so any handle on it will
+            // do; `by_stream` is built once at open rather than searched here.
+            let value = match (best.get(&stream), self.by_stream.get(&stream)) {
+                (Some(bytes), Some(&h)) => {
+                    let s = &self.signals[h as usize];
+                    Some(decode_one(bytes, s.width, s.encoding, words_for(s.width).max(1)))
+                }
+                _ => None,
+            };
+            out.insert(stream, value);
+        }
+        Ok(out)
+    }
+
     // ---- cycle-aligned sampling (§5.5, §8.14) ----------------------------
 
     /// Timestamps where the settled value of a signal becomes 1.
@@ -754,6 +903,27 @@ impl TraceStore {
                 Ok(out)
             })
             .collect()
+    }
+}
+
+/// One serialised row back into a [`Value`], without building a column for it.
+///
+/// The single-row twin of what `load_stream` does in bulk, reusing the same
+/// `append_planes` so the two cannot decode a row differently — which is the
+/// only thing that would make a scoped read disagree with a cached one.
+fn decode_one(bytes: &[u8], width: u32, enc: Encoding, words: usize) -> Value {
+    match enc {
+        Encoding::Real => {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&bytes[..8.min(bytes.len())]);
+            Value::Real(f64::from_le_bytes(buf))
+        }
+        Encoding::Str => Value::Str(String::from_utf8_lossy(bytes).to_string()),
+        _ => {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            append_planes(bytes, width, enc, words, &mut a, &mut b);
+            ValueColumn::Bits { width, words, a, b }.get(0)
+        }
     }
 }
 

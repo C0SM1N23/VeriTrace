@@ -184,6 +184,58 @@ def test_convert_records_source_hash(store):
     # §5.7 provenance: the store remembers which dump it came from.
     assert store.source_sha256 is not None
     assert len(store.source_sha256) == 64
+    assert store.source_bytes and store.source_bytes > 0
+
+
+def test_a_dump_that_changed_without_a_newer_timestamp_is_reconverted(tmp_path):
+    """§5.7's failure, and it is not theoretical.
+
+    Freshness used to be an mtime comparison alone. A dump restored by `git
+    checkout`, copied with `cp -p` or extracted from an archive keeps its old
+    timestamp, so a store built later reads as fresh — and every answer that
+    follows is about the previous run, with total confidence.
+    """
+    import os
+
+    from veritrace import TraceStore
+    from veritrace import store as store_mod
+
+    vcd = "$timescale 1ns $end\n$scope module tb $end\n$var reg 8 ! d [7:0] $end\n" \
+          "$upscope $end\n$enddefinitions $end\n#0\nb0 !\n#10\nb{v} !\n"
+    src = tmp_path / "dump.vcd"
+    src.write_text(vcd.format(v="1010"))
+    first = TraceStore(str(store_mod.ensure(src)))
+    assert str(first.value_at(0, 10)) == "1010"
+    mtime = os.stat(store_mod.ensure(src)).st_mtime
+
+    # A different run, deliberately not newer than the store.
+    src.write_text(vcd.format(v="11110000"))
+    os.utime(src, (mtime - 5, mtime - 5))
+
+    second = TraceStore(str(store_mod.ensure(src)))
+    assert str(second.value_at(0, 10)) == "11110000"
+    assert second.source_sha256 != first.source_sha256
+
+
+def test_a_store_from_before_the_size_was_recorded_is_still_usable(tmp_path):
+    """The size is a new field, and an old store has none.
+
+    Nothing to compare is not the same as a contradiction: the check falls back
+    to the timestamp rather than reconverting every store ever written.
+    """
+    import json
+
+    from veritrace import store as store_mod
+
+    src = tmp_path / "dump.vcd"
+    src.write_text(SAMPLE_VCD)
+    out = store_mod.ensure(src)
+    meta_path = out / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    del meta["source_bytes"]
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    assert store_mod._matches_source(out, src) is True
 
 
 def test_cli_convert(tmp_path):

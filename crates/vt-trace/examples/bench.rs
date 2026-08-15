@@ -214,11 +214,22 @@ fn main() {
     println!("  ---");
     println!("  parse                {parse_s:>9.2} s");
     println!("  write .vtx           {write_s:>9.2} s");
-    println!("  convert total        {convert_s:>9.2} s   (budget {BUDGET_CONVERT_S:.0} s)");
-    println!("  open store           {open_s:>9.3} s");
+    // Each line prints the budget for the tier that was actually run. Printing
+    // the tier-A constant beside a tier-B run is how a failing gate reads as a
+    // pass, and vice versa.
+    println!("  convert total        {convert_s:>9.2} s   (budget {convert_budget:.0} s)");
+    println!("  open store           {open_s:>9.3} s   (budget {open_budget:.0} s)");
     println!("  value_at (warm)      {value_at_us:>9.3} us  (budget {BUDGET_VALUE_AT_US:.0} us)");
     println!("  value_at (cold)      {cold_us:>9.1} us  (first touch of a signal)");
-    println!("  constant_signals     {scan_ms:>9.1} ms  (budget {scan_budget:.0} ms, {} constant)", consts.len());
+    // §4.2 budgets *the stuck detector* at 400 ms / 3 s, not this. This is the
+    // Rust half of it — the whole-trace constant scan — and labelling it with
+    // the detector's number read as if §8.4 were being measured here. It is
+    // not: the detector is Python, and `bench/pybench.py` measures it.
+    println!(
+        "  constant_signals     {scan_ms:>9.1} ms  ({} constant)  [the Rust half of §8.4; \
+         see bench/pybench.py for the detector]",
+        consts.len()
+    );
     println!();
 
     let mut failed = false;
@@ -235,9 +246,10 @@ fn main() {
         failed = true;
     }
     if scan_ms > scan_budget {
-        // Reported, not fatal: §4.2 gives the whole-trace scan a budget at both
-        // tiers, and a regression here is worth seeing without blocking a build
-        // on a machine slower than the one the numbers were taken on.
+        // Reported, not fatal: a regression here is worth seeing without
+        // blocking a build on a machine slower than the one the numbers were
+        // taken on. The threshold is the stuck detector's, used as a ceiling
+        // for its Rust half rather than as a claim that §8.4 was measured.
         eprintln!("OVER: constant_signals {scan_ms:.0}ms exceeds {scan_budget:.0}ms ({tier})");
     }
     if failed {

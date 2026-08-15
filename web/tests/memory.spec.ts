@@ -149,19 +149,25 @@ test("clicking a violation sends Wave to that cycle with the command wires", asy
 
 test("clicking a bank segment jumps to it", async ({ page }) => {
   await open(page, violating);
-  // Wait for the timeline to be laid out before clicking into it. The segments
-  // exist as soon as the report arrives, but a click that lands while the track
-  // is still being sized hits nothing and the tab never changes — which showed
-  // up as a failure only on a loaded machine, where the layout took longer than
-  // Playwright's implicit wait for the element itself.
+  // The segments exist as soon as the report arrives, but a click that lands
+  // while the track is still being sized hits nothing and the tab never
+  // changes — visible only on a loaded machine, where the layout takes longer
+  // than Playwright's implicit wait for the element itself. Waiting for a
+  // non-zero width narrowed the window without closing it, because the
+  // re-render can still move the segment out from under the pointer between
+  // the measurement and the click. Retrying the click *with* its effect is the
+  // only formulation that cannot race: a lost click is retried, and a landed
+  // one passes on the first attempt.
   const segment = page.locator('[data-testid="mem-bank-track"] .mem-seg').first();
   await expect(segment).toBeVisible();
-  await expect
-    .poll(async () => (await segment.boundingBox())?.width ?? 0)
-    .toBeGreaterThan(0);
-
-  await segment.click();
-  await expect(page.locator('[data-testid="tab-1"]')).toHaveAttribute("aria-selected", "true");
+  await expect(async () => {
+    await segment.click();
+    await expect(page.locator('[data-testid="tab-1"]')).toHaveAttribute(
+      "aria-selected",
+      "true",
+      { timeout: 1000 },
+    );
+  }).toPass({ timeout: 10_000 });
 });
 
 test("the command stream lists every decoded command and filters", async ({ page }) => {

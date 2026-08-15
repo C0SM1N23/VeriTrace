@@ -1,3 +1,4 @@
+import json
 import tomllib
 
 from click.testing import CliRunner
@@ -175,6 +176,220 @@ def test_stuck_reports_the_frozen_signals(buggy):
     r = run(["stuck", str(buggy / "dump.vtx"), "--rtl", str(buggy), "--cycles", "5"])
     assert r.exit_code == 0, r.output
     assert "frozen signal(s)" in r.output
+
+
+def test_stuck_says_when_the_window_is_wider_than_the_run(buggy):
+    """The default is 100 cycles and this run is 46 — a fact about the window.
+
+    "nothing has been frozen" reads as a verdict on the design, which is the
+    one thing §8.4's detector must not do by accident.
+    """
+    r = run(["stuck", str(buggy / "dump.vtx"), "--rtl", str(buggy)])
+    assert r.exit_code == 0, r.output
+    assert "the whole run is 46" in r.output
+    assert "--cycles" in r.output
+
+
+def test_stuck_json_carries_the_window_it_used(buggy):
+    """P6. Without the threshold in the payload an empty list is unreadable."""
+    r = run(["stuck", str(buggy / "dump.vtx"), "--rtl", str(buggy), "--json"])
+    assert r.exit_code == 0, r.output
+    data = json.loads(r.output)
+    assert data["threshold_cycles"] == 100
+    assert data["findings"] == []
+    assert "the whole run is 46" in data["unreachable"]
+
+    tight = json.loads(
+        run(["stuck", str(buggy / "dump.vtx"), "--rtl", str(buggy), "--cycles", "5", "--json"]).output
+    )
+    assert tight["unreachable"] is None
+    assert tight["findings"] and tight["findings"][0]["check"] == "stuck"
+
+
+def test_cone_json_lists_the_nodes_with_their_depth(buggy):
+    r = run([
+        "cone", str(buggy / "dump.vtx"), "tb_fifo_buggy.dut.full",
+        "--rtl", str(buggy), "--depth", "2", "--json",
+    ])
+    assert r.exit_code == 0, r.output
+    data = json.loads(r.output)
+    assert data["signal"] == "tb_fifo_buggy.dut.full"
+    assert any(n["path"].endswith("rd_ptr") for n in data["nodes"])
+    assert all(n["depth"] <= 2 for n in data["nodes"])
+
+
+# --- P6: "daca nu se poate scripta, nu e terminat" (§13) --------------------
+
+#: Commands with no report to serialise, and why. Everything else must offer
+#: `--json`, so a new reporting command cannot be added without one — which is
+#: how six of them (cone, stuck, correlate, packs, plugins, saif) came to be
+#: unscriptable without anyone noticing.
+NOT_A_REPORT = {
+    # Actions: they change something and say what they did.
+    "init", "serve", "convert", "record", "restore", "share", "note",
+    "reproduce", "import-capture",
+    # Emit a file in a format that is already specified — JSON would be a
+    # different artefact, not a machine-readable view of the same one.
+    "export", "gen-sva", "probes", "wavedrom",
+}
+
+
+def test_every_reporting_command_can_be_scripted():
+    """§13: *"Daca nu se poate scripta, nu e terminat."*"""
+    import click
+
+    from veritrace.cli import main as cli
+
+    ctx = click.Context(cli)
+    missing = [
+        name
+        for name in cli.list_commands(ctx)
+        if name not in NOT_A_REPORT
+        and not any(p.name == "as_json" for p in cli.get_command(ctx, name).params)
+    ]
+    assert not missing, f"no --json on: {', '.join(missing)}"
+    # And the exemption list stays honest: a name that no longer exists in it
+    # is a stale entry that would hide a real gap.
+    assert NOT_A_REPORT <= set(cli.list_commands(ctx))
+
+
+def test_packs_and_plugins_are_machine_readable():
+    packs = json.loads(run(["packs", "--root", str(DESIGNS / "axi_lite"), "--json"]).output)
+    assert packs["errors"] == []
+    assert "AXI4-Lite" in [p["name"] for p in packs["packs"]]
+
+    matched = json.loads(
+        run([
+            "packs", "--root", str(DESIGNS / "axi_lite"),
+            "--trace", str(DESIGNS / "axi_lite" / "dump.vcd"), "--json",
+        ]).output
+    )
+    assert [m["pack"] for m in matched["matched"]] == ["AXI4-Lite"]
+
+    plugins = json.loads(run(["plugins", "--root", str(DESIGNS / "fsm"), "--json"]).output)
+    assert plugins["errors"] == {}
+    assert "state_dwell" in [p["name"] for p in plugins["plugins"]]
+
+
+def test_saif_json_carries_both_modes(buggy):
+    data = json.loads(run(["saif", str(buggy / "dump.vtx"), "--json"]).output)
+    assert data["duration"] > 0
+    assert any(s["tc"] > 0 for s in data["signals"])
+    # `held` is the only thing --gating adds on top of the toggle counts.
+    assert all("held" in c for c in data["gating_candidates"])
+
+
+# --- finding a signal by name (§7.2's rule, applied to what was typed) ------
+
+
+def test_signals_finds_a_path_without_rtl(buggy):
+    """The terminal's answer to "what is this signal actually called?".
+
+    Every other command wants a hierarchical path; until this existed the CLI
+    was the only surface with no way to discover one (§13's P6).
+    """
+    r = run(["signals", str(buggy / "dump.vtx"), "wr_ptr"])
+    assert r.exit_code == 0, r.output
+    assert "tb_fifo_buggy.dut.wr_ptr" in r.output
+
+
+def test_signals_json_and_a_miss_that_says_so(buggy):
+    data = json.loads(run(["signals", str(buggy / "dump.vtx"), "full", "--json"]).output)
+    assert data["total"] == 28
+    assert "tb_fifo_buggy.dut.full" in [s["path"] for s in data["signals"]]
+
+    r = run(["signals", str(buggy / "dump.vtx"), "zzzz"])
+    assert r.exit_code == 0
+    assert "nothing in this trace matches" in r.output
+
+
+def test_why_accepts_a_unique_suffix(buggy):
+    """§7.2 matches RTL to trace on longest unique suffix; so does the prompt."""
+    r = run(["why", str(buggy / "dump.vtx"), "why(dut.full @ c45)", "--rtl", str(buggy)])
+    assert r.exit_code == 0, r.output
+    assert "tb_fifo_buggy.dut.full" in r.output
+
+
+def test_an_ambiguous_suffix_lists_the_candidates_rather_than_guessing(buggy):
+    """Ambiguity means no answer, not a guess — the same rule §7.2 follows.
+
+    `full` is both the testbench wire and the DUT output here. Picking one
+    silently would answer a question that was not asked.
+    """
+    r = run(["why", str(buggy / "dump.vtx"), "why(full @ c45)", "--rtl", str(buggy)])
+    assert r.exit_code != 0
+    assert "ambiguous" in r.output
+    assert "tb_fifo_buggy.dut.full" in r.output
+    assert "tb_fifo_buggy.full" in r.output
+
+
+def test_an_unknown_signal_suggests_the_names_that_do_exist(buggy):
+    r = run(["why", str(buggy / "dump.vtx"), "why(rdptr @ c45)", "--rtl", str(buggy)])
+    assert r.exit_code != 0
+    assert "unknown signal" in r.output
+    assert "did you mean" in r.output
+    assert "rd_ptr" in r.output
+
+
+# --- correlation as a gate (§7.2) -------------------------------------------
+
+
+def test_correlate_json_and_fail_under(buggy):
+    """§7.2 calls the rate first-class, which is only true if CI can read it.
+
+    Grepping a percentage out of prose is one reworded line away from passing
+    on a broken run.
+    """
+    data = json.loads(
+        run(["correlate", str(buggy / "dump.vtx"), "--rtl", str(buggy), "--json"]).output
+    )
+    assert data["percent"] >= 90
+    assert data["matched"] <= data["total"]
+    assert data["summary"].endswith(f"({data['percent']}%)")
+
+    ok = run(["correlate", str(buggy / "dump.vtx"), "--rtl", str(buggy), "--fail-under", "90"])
+    assert ok.exit_code == 0, ok.output
+    # The case the gate exists for: RTL that has nothing to do with the dump.
+    gated = run([
+        "correlate", str(buggy / "dump.vtx"), "--rtl", str(DESIGNS / "axi_lite"),
+        "--fail-under", "90",
+    ])
+    assert gated.exit_code != 0
+    assert "below the required 90%" in gated.output
+
+
+def test_check_leads_with_the_correlation_it_produced_the_findings_under(buggy):
+    """RTL that does not match the dump gives confident answers about another
+    design, and pointing `--rtl` at the wrong directory is the commoner mistake
+    (§7.2). Nothing else in `check`'s output mentioned correlation at all."""
+    r = run(["check", str(buggy / "dump.vtx"), "--rtl", str(DESIGNS / "axi_lite")])
+    assert r.exit_code == 0, r.output
+    lines = r.output.splitlines()
+    # Positions, not line numbers: CliRunner folds stderr in, so a provenance
+    # warning may or may not sit above depending on what ran before.
+    rate = next(i for i, ln in enumerate(lines) if ln.startswith("RTL: 0/"))
+    assert "(0.0%)" in lines[rate]
+    assert "below" in r.output and "90%" in r.output
+    assert rate < next(i for i, ln in enumerate(lines) if "finding(s)" in ln)
+
+    data = json.loads(
+        run(["check", str(buggy / "dump.vtx"), "--rtl", str(buggy), "--json"]).output
+    )
+    assert data["correlation"]["percent"] >= 90
+
+
+def test_what_did_not_run_is_printed_above_the_verdict(buggy):
+    """P7. "no automatic findings" over a list of checks that never happened
+    reads as a clean bill of health for a scan that mostly did not."""
+    r = run(["check", str(buggy / "dump.vtx")])
+    assert r.exit_code == 0, r.output
+    lines = r.output.splitlines()
+    header = next(i for i, ln in enumerate(lines) if ln.endswith("check(s) did not run:"))
+    verdict = next(
+        i for i, ln in enumerate(lines) if ln == "no automatic findings from the checks that ran"
+    )
+    assert header < verdict
+    assert "no RTL loaded" in r.output
 
 
 def test_check_reports_every_group(buggy):

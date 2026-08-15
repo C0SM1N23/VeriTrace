@@ -50,11 +50,38 @@ def _readable(store: Path) -> bool:
     return True
 
 
+def _matches_source(store: Path, source: Path) -> bool:
+    """Whether `store` was built from the bytes currently in `source`.
+
+    An mtime comparison alone is not enough, and the hole is not theoretical: a
+    dump restored by `git checkout`, copied with `cp -p`, or extracted from an
+    archive keeps its old timestamp, so a store built later reads as fresh and
+    every answer that follows is about the previous run — with total confidence,
+    which is the failure §5.7 exists to prevent.
+
+    The size is the O(1) half of the answer and comes from the directory entry.
+    The hash is the whole answer but costs a full read of the dump, which §4.2's
+    < 1 s reopen cannot pay at a gigabyte — so it is recorded at convert time
+    and compared only when the caller asks for certainty.
+    """
+    from veritrace import _native
+
+    try:
+        recorded = _native.TraceStore(str(store)).source_bytes
+    except Exception:  # noqa: BLE001 - an unreadable store is reconverted anyway
+        return False
+    # `None` is a store written before the size was recorded, or one converted
+    # from something with no file behind it. Nothing to compare, so nothing to
+    # contradict: fall back to the timestamp on its own.
+    return recorded is None or recorded == source.stat().st_size
+
+
 def ensure(path: Path, announce: Callable[[str], None] | None = None) -> Path:
     """`path` as a store, converting a raw dump if that is what it is.
 
-    An existing store is reused unless the dump is newer — the case that matters
-    is re-running the simulation, which must not silently serve yesterday's data.
+    An existing store is reused unless the dump has changed under it — the case
+    that matters is re-running the simulation, which must not silently serve
+    yesterday's data.
     """
     path = Path(path)
     if path.is_dir() or path.suffix.lower() not in RAW:
@@ -85,6 +112,7 @@ def ensure(path: Path, announce: Callable[[str], None] | None = None) -> Path:
         and (out / "index.bin").exists()
         and out.stat().st_mtime >= path.stat().st_mtime
         and _readable(out)
+        and _matches_source(out, path)
     )
     if not fresh:
         if announce:

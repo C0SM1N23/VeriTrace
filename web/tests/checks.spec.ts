@@ -156,6 +156,52 @@ test("the filter narrows the list without hiding the section structure", async (
   }
 });
 
+test("the stuck window can be narrowed without restarting the server", async ({ page }) => {
+  // §8.4's threshold decides what this tab says, and its right value depends
+  // on the run — until now it lived only in `.veritrace.toml`.
+  await open(page);
+  const before = await page.locator('[data-testid="check-row"][data-check="stuck"]').count();
+  expect(before).toBeGreaterThan(0);
+  const latches = page.locator('[data-testid="check-row"][data-check="inferred_latch"]');
+  const nLatches = await latches.count();
+  expect(nLatches).toBeGreaterThan(0);
+
+  await page.locator('[data-testid="stuck-cycles"]').fill("1000000");
+  await page.locator('[data-testid="stuck-apply"]').click();
+
+  // Empty, and saying why it is empty rather than reading as a clean design.
+  await expect(page.locator('[data-testid="stuck-note"]')).toContainText("1000000 cycles");
+  await expect(page.locator('[data-testid="check-row"][data-check="stuck"]')).toHaveCount(0);
+  // And only that group moved: the rest of the report is the session's.
+  await expect(latches).toHaveCount(nLatches);
+
+  await page.locator('[data-testid="stuck-reset"]').click();
+  await expect(page.locator('[data-testid="check-row"][data-check="stuck"]')).toHaveCount(before);
+});
+
+test("the correlation rate opens the list of what is missing", async ({ page }) => {
+  // §7.2 makes the rate first-class; a rate is only actionable next to the
+  // names it summarises, and those lived only in `veritrace correlate`.
+  await open(page);
+  const crumb = page.locator('[data-testid="correlation-crumb"]');
+  await expect(crumb).toContainText("% correlated");
+  await crumb.click();
+
+  const panel = page.locator('[data-testid="correlation-panel"]');
+  await expect(panel).toBeVisible();
+  await expect(panel).toContainText("signals correlated");
+  await expect(panel).toContainText("by method:");
+  // Either there is a list of losses or an explicit statement that there are
+  // none — never an unexplained empty box.
+  const listed =
+    (await panel.locator('[data-testid="correlation-unmatched"] li').count()) +
+    (await panel.locator('[data-testid="correlation-complete"]').count());
+  expect(listed).toBeGreaterThan(0);
+
+  await page.locator(".palette-backdrop").click({ position: { x: 5, y: 5 } });
+  await expect(panel).toHaveCount(0);
+});
+
 test("the parameter tree marks the default an ancestor contradicts", async ({ page }) => {
   await open(page);
   await page.locator('button:has-text("PARAMETER TREE")').click();

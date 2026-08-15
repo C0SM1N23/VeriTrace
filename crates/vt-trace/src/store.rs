@@ -111,6 +111,15 @@ pub struct Meta {
     /// detected rather than silently believed.
     #[serde(default)]
     pub source_sha256: Option<String>,
+    /// Size of the source dump, in bytes.
+    ///
+    /// The hash answers §5.7's question but costs a full read, which the < 1 s
+    /// reopen budget of §4.2 cannot pay on every open. The size is O(1) from
+    /// the directory entry and catches a regenerated dump whose timestamp was
+    /// preserved — a `git checkout`, a `cp -p`, an extracted archive — which
+    /// an mtime comparison alone reads as fresh.
+    #[serde(default)]
+    pub source_bytes: Option<u64>,
 }
 
 fn bytes_per_plane(width: u32) -> usize {
@@ -263,6 +272,7 @@ pub fn write_vtx(trace: &Trace, out_dir: impl AsRef<Path>, source: Option<&Path>
         writer: trace.version.clone(),
         source_file: source.map(|p| p.display().to_string()),
         source_sha256,
+        source_bytes: source.and_then(|p| fs::metadata(p).ok()).map(|m| m.len()),
     };
     fs::write(out_dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
     Ok(())

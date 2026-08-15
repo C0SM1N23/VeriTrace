@@ -153,6 +153,32 @@ export interface ChecksReport {
   plugin_tables: PluginTable[];
 }
 
+/**
+ * §8.4 re-run at a threshold the user chose.
+ *
+ * `unreachable` is the honest half: a window wider than the run cannot fire, so
+ * an empty list there is a fact about the question rather than about the design.
+ */
+export interface StuckResult {
+  cycles: number;
+  n_cycles?: number;
+  unreachable: string | null;
+  findings: Finding[];
+}
+
+/** §7.2's rate with the names behind it — what `/correlation` returns. */
+export interface CorrelationReport {
+  total: number;
+  matched: number;
+  percent: number;
+  summary: string;
+  by_method: Record<string, number>;
+  n_unmatched: number;
+  n_reconstructible: number;
+  unmatched: string[];
+  reconstructible: string[];
+}
+
 /** Messages the main thread sends to the render worker. */
 export type ToWorker =
   | { type: "init"; canvas: OffscreenCanvas; dpr: number }

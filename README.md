@@ -192,9 +192,30 @@ $ veritrace correlate dump.vcd --rtl rtl/
 ```
 
 The rate is a first-class number and what it could not place is named, rather
-than quietly matched on a suffix.
+than quietly matched on a suffix. `--fail-under 90` makes it a build gate, and
+`--json` gives a script the list rather than the sentence.
 
 ## What it does
+
+### Find the signal
+
+Every other command wants a hierarchical path, and nobody remembers
+`tb_axi_arb.dut.m0.u_fifo.wr_ptr`:
+
+```sh
+$ veritrace signals dump.vcd wr_ptr
+2 of 4183 signal(s) matching 'wr_ptr'
+  tb_axi_arb.dut.m0.u_fifo.wr_ptr                          [4:0]  reg   612 event(s)
+  tb_axi_arb.dut.m1.u_fifo.wr_ptr                          [4:0]  reg   588 event(s)
+```
+
+`why` and `cone` take a partial name directly when it can only mean one signal,
+and list the candidates when it cannot — the same rule the correlator follows:
+
+```sh
+$ veritrace why dump.vcd --rtl rtl/ "why(dut.full @ c45)"
+  dut.full -> tb_fifo_buggy.dut.full
+```
 
 ### Ask why
 
@@ -403,6 +424,20 @@ veritrace serve dump.vcd --rtl rtl/
 
 Opens on **Checks** when there is something to report and on **Wave** when there
 is not, because an empty tab is exactly the blank canvas to avoid.
+
+The query bar above every tab takes VTQ, and not only `why()`:
+
+```
+why(top.ctrl.ready == 0 @ c1247)     cone(ctrl.ready, depth=3, active=true)
+find(wr_ptr)                          fanout(ctrl.ready, depth=2)
+stuck(min_duration=c50)               edges(ctrl.ready, c100:c500)
+hold(ctrl.ready, c100:c500)           xtrace()   fsm(state)   lint(top.dma)
+```
+
+Each one calls the same module the terminal command does, so the two cannot
+answer differently. Partial names resolve the way the correlator resolves them —
+unique suffix, and the candidates listed rather than a guess when there are
+several.
 
 ### Wave
 
@@ -976,7 +1011,7 @@ make bench       # the tier-A budget
 make designs     # re-simulate every reference design
 ```
 
-**991 tests**: 72 Rust, 774 Python, 45 Vitest, 100 Playwright — 76 Rust with `--features fst` — with the
+**1024 tests**: 74 Rust, 803 Python, 45 Vitest, 102 Playwright — 76 Rust with `--features fst` — with the
 acceptance criterion of each stage tested rather than asserted.
 
 Two of those suites are the ones worth knowing about. `tests/test_golden.py`

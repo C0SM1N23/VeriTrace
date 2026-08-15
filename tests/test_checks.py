@@ -160,6 +160,72 @@ def test_stuck_needs_a_clock_and_says_so_when_there_is_none(session):
     assert "clock" in report.skipped[Group.STUCK.value]
 
 
+def test_a_window_wider_than_the_run_is_a_skip_not_a_clean_report(session):
+    """The same rule of honesty, for the commonest case of all.
+
+    §8.4's default is 100 cycles and a testbench is routinely shorter than
+    that, so on most runs the check is structurally unable to fire — and
+    "nothing has been frozen" read as a verdict on the design. Three of the
+    four reference designs are in this position.
+    """
+    from veritrace.analysis import stuck as stuck_mod
+
+    store, el, clock, _report = session
+    config = Config.empty()
+    config.stuck_cycles = 100_000
+
+    note = stuck_mod.too_short(store, clock, config)
+    assert note and "100000 cycles" in note and "--cycles" in note
+    assert not list(stuck_mod.scan(store, clock, el.graph, config))
+
+    report = checks.run_all(store, el.graph, el, clock, config)
+    assert report.skipped[Group.STUCK.value] == note
+    # And the window the design *does* fit reports normally.
+    assert stuck_mod.too_short(store, clock, Config.empty()) is None
+
+
+def test_a_clock_that_stopped_is_the_finding_not_four_hundred_frozen_signals(tmp_path):
+    """§8.4: *"singurul finding util e acel fapt"*.
+
+    The scan used to return silently here, which is the one thing this check
+    cannot look like: a design that stopped being clocked and a design with
+    nothing wrong produced the same empty report.
+    """
+    from veritrace.analysis import stuck as stuck_mod
+
+    # Twenty cycles of clock, then a long tail with the clock parked low.
+    vcd = ["$timescale 1ns $end", "$scope module tb $end",
+           "$var reg 1 ! clk $end", "$var reg 8 \" data [7:0] $end",
+           "$upscope $end", "$enddefinitions $end", "#0", "0!", "b0 \""]
+    t = 0
+    for i in range(40):
+        t += 5
+        vcd += [f"#{t}", f"{i % 2}!"]
+    vcd += [f"#{t + 5000}", "b1 \""]
+
+    src = tmp_path / "stopped.vcd"
+    src.write_text("\n".join(vcd) + "\n")
+    out = tmp_path / "stopped.vtx"
+    convert(str(src), str(out))
+    store = TraceStore(str(out))
+    clock = clocks.resolve(store, None, Config.empty())
+
+    found = list(stuck_mod.scan(store, clock, None, Config.empty(), threshold_cycles=2))
+    assert len(found) == 1, [f.title for f in found]
+    assert found[0].check == stuck_mod.CHECK_CLOCK_STOPPED
+    assert found[0].severity is Severity.ERROR
+    assert "the clock stopped at c" in found[0].title
+    # It is nameable by `--fail-on stuck`, like the rows it stands in for.
+    assert found[0].check in checks.expand_checks(["stuck"])
+
+    # And it survives a threshold wider than the run: a stopped clock is a fact
+    # about the run rather than a signal measured against the window, so the
+    # scan must not be recorded as unable to say anything.
+    assert stuck_mod.too_short(store, clock, Config.empty(), 1_000_000) is None
+    wide = list(stuck_mod.scan(store, clock, None, Config.empty(), threshold_cycles=1_000_000))
+    assert [f.check for f in wide] == [stuck_mod.CHECK_CLOCK_STOPPED]
+
+
 # --- X propagation (§8.5) --------------------------------------------------
 
 

@@ -22,6 +22,12 @@ from veritrace.correlate.heuristics import build_index, normalize, suffixes
 from veritrace.graph.model import DesignGraph, Signal
 
 
+#: §7.2's bar: *"sub 90% ceva e gresit si utilizatorul trebuie sa stie"*. Named
+#: once so the console report, `--fail-under`'s default and `check`'s warning
+#: cannot drift apart.
+FLOOR = 90.0
+
+
 class Method(Enum):
     EXACT = "exact"
     NORMALIZED = "normalized"
@@ -50,6 +56,29 @@ class CorrelationReport:
 
     def summary(self) -> str:
         return f"{self.matched}/{self.total} signals correlated ({self.percent}%)"
+
+    def to_dict(self, limit: int | None = None) -> dict:
+        """The same report, for `--json` and for the interface (§13's P6).
+
+        §7.2 makes the rate a first-class metric, which is only true if it can
+        be read by something other than a human: a CI gate that has to grep a
+        percentage out of prose is one reworded line away from passing on a
+        broken run.
+        """
+        return {
+            "total": self.total,
+            "matched": self.matched,
+            "rate": self.rate,
+            "percent": self.percent,
+            "summary": self.summary(),
+            "by_method": dict(self.by_method),
+            "n_unmatched": len(self.unmatched),
+            "n_reconstructible": len(self.reconstructible),
+            "unmatched": self.unmatched[:limit] if limit else list(self.unmatched),
+            "reconstructible": (
+                self.reconstructible[:limit] if limit else list(self.reconstructible)
+            ),
+        }
 
 
 class _Union:
@@ -188,6 +217,29 @@ def _match(
     return Method.NOT_TRACED, None
 
 
+def resolve_path(graph: DesignGraph, name: str) -> tuple[str | None, list[str]]:
+    """The one hierarchical path `name` can mean, or the ones it could mean.
+
+    Step (d) of §7.2, applied to a name a person typed instead of one a
+    simulator wrote: longest unique suffix, and ambiguity means no answer. It
+    lives here rather than in either front end because the terminal and the
+    query bar are typed into by hand in exactly the same way, and a
+    `why(dut.full)` that works in only one of them is a rule the user has to
+    remember rather than a rule the tool has.
+
+    Returns `(path, [])` when it resolves, `(None, candidates)` when more than
+    one signal fits, and `(None, [])` when nothing does. The callers phrase the
+    refusal; neither phrasing belongs in the matching rule.
+    """
+    if graph.get(name) is not None:
+        return name, []
+    tail = "." + name.lstrip(".")
+    hits = sorted({s.path for s in graph if s.path.endswith(tail)})
+    if len(hits) == 1:
+        return hits[0], []
+    return None, hits
+
+
 def format_report(report: CorrelationReport, limit: int = 20) -> str:
     """Console report (§7.2 step 4)."""
     lines = [report.summary()]
@@ -195,9 +247,9 @@ def format_report(report: CorrelationReport, limit: int = 20) -> str:
         order = [m.value for m in Method]
         parts = [f"{k}={report.by_method[k]}" for k in order if report.by_method.get(k)]
         lines.append("  by method: " + ", ".join(parts))
-    if report.percent < 90:
+    if report.percent < FLOOR:
         lines.append(
-            "  WARNING: below 90%. Check the simulator dump flags — see §4.0 "
+            f"  WARNING: below {FLOOR:g}%. Check the simulator dump flags — see §4.0 "
             "(Verilator needs --no-inline and --trace-structs)."
         )
     if report.reconstructible:

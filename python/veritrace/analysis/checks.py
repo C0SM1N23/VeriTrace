@@ -35,6 +35,7 @@ from veritrace.clocks import Clock
 #: Every check name the tool can produce, for `--fail-on` and `checks.disable`.
 ALL_CHECKS: dict[str, str] = {
     stuck.CHECK: "signal frozen for longer than the threshold",
+    stuck.CHECK_CLOCK_STOPPED: "the clock stopped before the end of the run (§8.4)",
     xprop.CHECK: "root cause of an X",
     params.CHECK: "parameter left on a default the parent contradicts",
     protocol.CHECK: "protocol rule from a pack that did not hold (§8.14)",
@@ -53,7 +54,7 @@ ALL_CHECKS: dict[str, str] = {
 
 #: Group a check belongs to, so `--fail-on stuck,x,cdc` can name either.
 GROUP_ALIASES: dict[str, tuple[str, ...]] = {
-    "stuck": (stuck.CHECK,),
+    "stuck": (stuck.CHECK, stuck.CHECK_CLOCK_STOPPED),
     "x": (xprop.CHECK, "x_optimism"),
     "lint": tuple(lint.CHECKS),
     "cdc": ("cdc_no_sync",),
@@ -118,9 +119,12 @@ def run_all(
     no_clock = None if clock is not None else "no clock could be identified in this trace"
     no_rtl = None if graph is not None else "no RTL loaded"
 
+    # A threshold wider than the run cannot fire, and reporting that as "found
+    # nothing" is the silence P7 forbids: three of the four reference designs
+    # are shorter than §8.4's 100-cycle default.
     run(
         Group.STUCK.value,
-        no_clock,
+        no_clock or stuck.too_short(store, clock, config),
         lambda: stuck.scan(store, clock, graph, config),
     )
     run(

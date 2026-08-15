@@ -153,6 +153,11 @@ path = "coverage.dat"
 [checks]
 # Un testbench mare are multe semnale care legitim nu se misca intr-o rulare
 # care trece. 100 de cicluri (default) le raporteaza pe toate.
+#
+# Pragul taie in ambele sensuri: daca rularea e mai scurta decat el, detectorul
+# nu are cum sa raporteze nimic. Nu tace — spune exact asta, si in terminal si
+# in tab-ul Checks, unde poti incerca alta fereastra fara sa repornesti
+# serverul. `veritrace stuck ... --cycles 20` face acelasi lucru din shell.
 stuck_cycles = 400
 
 [ui]

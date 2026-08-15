@@ -9,6 +9,10 @@
 # that its simulator is on PATH first and says so plainly if it is not, because
 # the free editions are large installs nobody has all four of.
 
+# The same PATH the rest of this file assumes: with the venv on it, `python`
+# and `veritrace` both resolve. Overridable for a different interpreter.
+PY      ?= python
+
 DESIGN  ?= designs/fifo_buggy
 TOP     ?= tb_fifo_buggy
 SOURCES ?= $(notdir $(wildcard $(DESIGN)/*.sv))
@@ -216,11 +220,13 @@ test-all: test test-web
 ## The tier-A performance budget of §4.2, at the size the spec names.
 bench:
 	cargo run --release -p vt-trace --example bench -- 100 5000
+	$(PY) bench/pybench.py
 
 ## Tier B, "stress": 1 GB over 50k signals. Validation, not a daily gate — it
 ## needs ~2 GB of scratch space and about a minute.
 bench-stress:
 	cargo run --release -p vt-trace --example bench -- 1000 50000
+	$(PY) bench/pybench.py --tier b
 
 ## Re-simulate every reference design and rebuild its store.
 designs:

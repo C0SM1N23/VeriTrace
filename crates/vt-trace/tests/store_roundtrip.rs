@@ -64,6 +64,47 @@ fn value_at_returns_settled_value_not_intermediate_glitch() {
 }
 
 #[test]
+fn value_at_all_agrees_with_value_at_signal_by_signal() {
+    // The bulk read takes a different route to the same answer — the chunk
+    // index and one Parquet row group, rather than a whole decoded stream — so
+    // the only thing worth asserting is that the two never disagree. Including
+    // at a delta-cycle timestamp, where "the last write wins" is the rule that
+    // a row-group scan could get backwards.
+    let (_d, s, _) = convert(GLITCH);
+    let handles: Vec<u32> = (0..s.n_signals() as u32).collect();
+    for t in [0, 5, 10, 15, 20, 25] {
+        let bulk = s.value_at_all(&handles, t);
+        let one: Vec<_> = handles.iter().map(|&h| s.value_at(h, t).unwrap()).collect();
+        assert_eq!(bulk, one, "at t={t}");
+    }
+    // t=10 has three writes; both routes have to settle on the last.
+    assert_eq!(
+        s.value_at_all(&[s.handle("top.sum").unwrap()], 10)[0]
+            .as_ref()
+            .and_then(Value::as_u64),
+        Some(2)
+    );
+    // Before the first event of the trace there is nothing to report, not zero.
+    assert_eq!(s.value_at_all(&handles, -1), vec![None, None]);
+}
+
+#[test]
+fn value_at_all_does_not_pull_whole_streams_into_the_cache() {
+    // §4.2 budgets tier-B RAM at 1.5 GB and says mmap, not loading. A
+    // whole-trace scan touches every signal exactly once, so decoding and then
+    // retaining each stream would leave the entire design resident for a pass
+    // that never looks at it again. The narrow read is what makes that safe,
+    // and a later `value_at` still has to produce the same answer.
+    let (_d, s, _) = convert(GLITCH);
+    let handles: Vec<u32> = (0..s.n_signals() as u32).collect();
+    assert_eq!(s.value_at_all(&handles, 20), vec![
+        s.value_at(0, 20).unwrap(),
+        s.value_at(1, 20).unwrap(),
+    ]);
+    assert_eq!(u64_at(&s, "top.sum", 10), Some(2));
+}
+
+#[test]
 fn deltas_and_value_at_delta_expose_the_glitch() {
     let (_d, s, _) = convert(GLITCH);
     let h = s.handle("top.sum").unwrap();

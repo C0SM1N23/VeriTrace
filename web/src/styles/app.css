@@ -989,6 +989,78 @@ select:focus-visible {
   font-size: 11px;
 }
 
+/* §8.4's threshold, beside the answer it decides. */
+.checks-stuck {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+}
+
+.checks-cycles {
+  width: 76px;
+  padding: 2px 6px;
+  background: var(--bg-deep);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--text-bright);
+  font-size: 11px;
+}
+
+.checks-cycles:focus {
+  outline: none;
+  border-color: var(--text-dim);
+}
+
+/* The correlation crumb is a button because §7.2's rate is only actionable
+ * next to the names it summarises. It has to read as the rest of the top bar. */
+.crumb-button {
+  padding: 0;
+  background: none;
+  border: none;
+  border-bottom: 1px dotted var(--text-dim);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.crumb-button:hover {
+  color: var(--text-bright);
+}
+
+.correlation {
+  width: min(680px, 90vw);
+  max-height: 70vh;
+  overflow: auto;
+  padding: 14px 16px;
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-family: var(--font-chrome);
+  font-size: 12px;
+}
+
+.correlation h3 {
+  margin: 14px 0 6px;
+  color: var(--text-bright);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+}
+
+.correlation ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.correlation li {
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
 .tab-badge {
   margin-left: 5px;
   padding: 0 4px;

@@ -29,6 +29,59 @@ from veritrace.analysis.signals import canonical
 from veritrace.clocks import Clock
 
 CHECK = "stuck"
+#: §8.4's one exception, as its own check name. When the design is no longer
+#: being clocked every signal is frozen, and the finding worth having is that
+#: fact rather than the four hundred downstream of it — so it is reported
+#: instead of them, and `--fail-on` and `checks.disable` can name it apart from
+#: the per-signal rows it replaces.
+CHECK_CLOCK_STOPPED = "clock_stopped"
+
+#: The default threshold of §8.4: *"THRESHOLD default = 100 de cicluri de
+#: clock, configurabil."* Not scaled to the run — a threshold that moved with
+#: the trace would mean two runs of the same design disagreeing about what is
+#: stuck. It is reported instead, by `too_short` below.
+DEFAULT_CYCLES = 100
+
+
+def _threshold(config: Any, threshold_cycles: int | None) -> int:
+    if threshold_cycles is not None:
+        return threshold_cycles
+    return getattr(config, "stuck_cycles", DEFAULT_CYCLES)
+
+
+def too_short(
+    store: Any,
+    clock: Clock | None,
+    config: Any = None,
+    threshold_cycles: int | None = None,
+) -> str | None:
+    """Why the scan cannot report anything, or `None` when it can.
+
+    A threshold wider than the run makes the check structurally unable to fire:
+    the longest freeze a trace can contain is the trace itself. Printing
+    "nothing has been frozen" there reads as a verdict on the design when it is
+    a fact about the window — and a 50-cycle testbench against §8.4's 100-cycle
+    default is the ordinary case, not a corner one. P7: a check that could not
+    run says so.
+    """
+    if clock is None or clock.period is None:
+        return None
+    cycles = _threshold(config, threshold_cycles)
+    t0, t1 = store.time_range
+    # A stopped clock is reported whatever the window is — it is a fact about
+    # the run, not a signal measured against the threshold — so the scan has
+    # something to say here and must not be recorded as unable to run.
+    if not clock.is_toggling_at(t1):
+        return None
+    # The same comparison `scan` makes, against the widest gap the run allows.
+    if t1 - t0 > cycles * clock.period:
+        return None
+    ran = clock.cycles_between(t0 - 1, t1)
+    return (
+        f"the threshold is {cycles} cycles and the whole run is {ran} — nothing "
+        f"can have been frozen that long. Lower it with --cycles, or set "
+        f"checks.stuck_cycles in .veritrace.toml."
+    )
 
 
 def scan(
@@ -46,17 +99,44 @@ def scan(
     if clock is None or clock.period is None:
         return
 
-    cycles = threshold_cycles if threshold_cycles is not None else getattr(
-        config, "stuck_cycles", 100
-    )
+    cycles = _threshold(config, threshold_cycles)
     t0, t1 = store.time_range
     if not clock.is_toggling_at(t1):
+        # §8.4: *"daca design-ul nu mai e ceasuit, totul e inghetat si singurul
+        # finding util e acel fapt"*. Reporting nothing at all was the same
+        # silence as a clean run — the one thing this check must never look
+        # like — so the fact is now the finding.
+        stopped = clock.edges[-1] if clock.edges else t1
+        yield Finding(
+            group=Group.STUCK,
+            severity=Severity.ERROR,
+            check=CHECK_CLOCK_STOPPED,
+            title=f"the clock stopped at c{clock.cycle_of(stopped)}",
+            signal=clock.path,
+            time=stopped,
+            detail=(
+                f"no edge for the last {t1 - stopped} time unit(s); every signal is "
+                "frozen from here, so the per-signal scan would only list the design"
+            ),
+            # A clock that stops is a fact about the stimulus, not something the
+            # causal walk explains — an honest empty `[why]` beats one that
+            # errors on a testbench the graph does not contain (P7).
+            why=None,
+        )
         return
 
     threshold_t = cycles * clock.period
-    # One parallel scan for the whole trace (§4.1: rayon for whole-trace work).
+    # Two parallel scans for the whole trace, and no per-signal Python loop
+    # between them (§4.1: rayon is here for exactly this shape of work).
+    #
+    # The values used to be fetched one at a time, inside the loop below. That
+    # measured at 74% of the whole scan — a cold Parquet decode and a PyO3
+    # crossing per frozen signal — and put §8.4 three times over §4.2's 400 ms
+    # budget on a 5000-signal trace. Selecting first and fetching the survivors
+    # in one pass is the same answer for a fraction of the wall time.
     last = store.last_change_all(t1 + 1)
 
+    frozen_signals = []
     for meta in canonical(store, graph, config):
         h = meta.handle
         t_last = last[h] if h < len(last) else None
@@ -69,8 +149,11 @@ def scan(
         # is not frozen, it was never able to move.
         if sig is not None and sig.is_tie_off:
             continue
+        frozen_signals.append((meta, t_last, sig))
 
-        value = store.value_at(h, t1)
+    values = store.value_at_all([m.handle for m, _, _ in frozen_signals], t1)
+
+    for (meta, t_last, sig), value in zip(frozen_signals, values):
         frozen = clock.cycles_between(t_last, t1)
         # A signal whose only event is the opening dump never transitioned: it
         # is a constant in this run rather than something that froze. §8.4 wants

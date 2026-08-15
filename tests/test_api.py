@@ -465,6 +465,126 @@ def test_cone_needs_rtl(client, session_id):
     assert client.get(f"/session/{session_id}/cone", params={"signal": "tb.clk"}).status_code == 409
 
 
+def test_stuck_route_re_runs_at_another_threshold(checks_client):
+    """§8.4's window, tried without editing a file and restarting the server.
+
+    The right value depends on the run, so it has to be cheap enough to turn.
+    Only the stuck scan re-runs; the rest of the report is untouched.
+    """
+    client, sid = checks_client
+    wide = client.get(f"/session/{sid}/stuck", params={"cycles": 1_000_000}).json()
+    assert wide["findings"] == []
+    # And it says why it is empty, rather than reading as a clean design.
+    assert "1000000 cycles" in wide["unreachable"]
+
+    tight = client.get(f"/session/{sid}/stuck", params={"cycles": 20}).json()
+    assert tight["unreachable"] is None
+    assert len(tight["findings"]) > len(wide["findings"])
+    assert all(f["group"] == "stuck" for f in tight["findings"])
+    assert client.get(f"/session/{sid}/stuck", params={"cycles": 0}).status_code == 422
+
+
+def test_stuck_route_honours_suppressions(checks_client):
+    """A finding hidden in the Checks tab must not reappear at another window."""
+    client, sid = checks_client
+    target = client.get(f"/session/{sid}/stuck", params={"cycles": 20}).json()["findings"][0]
+    client.post(f"/session/{sid}/checks/{target['id']}/suppress", json={"reason": "known"})
+    try:
+        again = client.get(f"/session/{sid}/stuck", params={"cycles": 20}).json()
+        assert target["id"] not in [f["id"] for f in again["findings"]]
+    finally:
+        client.delete(f"/session/{sid}/checks/{target['id']}/suppress")
+
+
+def test_the_query_bar_takes_a_partial_name_like_the_terminal_does(checks_client):
+    """§7.2's suffix rule, applied to what a person typed rather than to a dump.
+
+    A `why(dut.full)` that worked in the terminal and not in the query bar
+    would be a rule the user has to remember rather than one the tool has.
+    """
+    client, sid = checks_client
+    body = client.post(f"/session/{sid}/query", json={"vtq": "why(u_dut.lock_r)"})
+    assert body.status_code == 200, body.text
+    assert body.json()["signal"].endswith(".u_dut.lock_r")
+
+    # And ambiguity is refused with the candidates, never resolved by guessing.
+    bad = client.post(f"/session/{sid}/query", json={"vtq": "why(nope_at_all)"})
+    assert bad.status_code == 404
+    assert "unknown signal" in bad.json()["detail"]
+
+
+def test_the_query_bar_runs_the_rest_of_the_vtq_table(checks_client):
+    """§10.1 lists eighteen signal-level commands and calls VTQ the query
+    language. The parser accepted all of them from the start; the executor
+    answered one, so `cone(...)` typed into the spine of the tool (§11.3) came
+    back "not supported" for an analysis the same session had a button for."""
+    client, sid = checks_client
+
+    def run(vtq: str):
+        r = client.post(f"/session/{sid}/query", json={"vtq": vtq})
+        return r.status_code, r.json()
+
+    code, body = run("cone(u_dut.lock_r, depth=2)")
+    assert code == 200, body
+    assert body["kind"] == "cone" and body["nodes"]
+    # A partial name resolves here the way it does in the terminal (§7.2).
+    assert body["signal"].endswith(".u_dut.lock_r")
+
+    assert run("fanout(u_dut.lock_r, depth=2)")[1]["direction"] == "fanout"
+    assert run("find(lock)")[1]["signals"]
+    assert run("lint(tb_checks)")[1]["findings"]
+    assert run("xtrace()")[1]["findings"]
+
+    code, body = run("stuck(min_duration=c50)")
+    assert code == 200 and body["cycles"] == 50
+    assert all(f["group"] == "stuck" for f in body["findings"])
+
+    # `hold` and `edges` are about one signal in a window, so both have to
+    # respect the window rather than answer about the whole run.
+    edges = run("edges(tb_checks.dut.u_dut.lock_r, c0:c400)")[1]["edges"]
+    assert edges and all(e["cycle"] is not None for e in edges)
+    spans = run("hold(tb_checks.dut.u_dut.lock_r, c10:c200)")[1]["spans"]
+    assert spans and spans[0]["from"] < spans[-1]["to"]
+
+
+def test_a_vtq_command_that_would_be_accepted_and_ignored_is_refused(checks_client):
+    """`stuck(after=...)` is in §10.1's table and the detector has no such
+    knob — it always measures back from the end of the run. Accepting the
+    argument and quietly dropping it is the one answer worse than refusing."""
+    client, sid = checks_client
+    r = client.post(f"/session/{sid}/query", json={"vtq": "stuck(after=c100)"})
+    assert r.status_code == 400
+    assert "accepted and ignored" in r.json()["detail"]
+    assert "min_duration" in r.json()["detail"]
+
+
+def test_a_vtq_command_that_needs_rtl_says_which_half_is_missing(client, session_id):
+    """§7.4: a dump with no RTL is a supported mode, not a stack trace."""
+    r = client.post(f"/session/{session_id}/query", json={"vtq": "cone(tb.clk)"})
+    assert r.status_code == 400
+    assert "needs the RTL" in r.json()["detail"]
+    # And one that does not need it still works.
+    ok = client.post(f"/session/{session_id}/query", json={"vtq": "find(clk)"})
+    assert ok.status_code == 200 and ok.json()["signals"]
+
+
+def test_correlation_route_carries_the_names_behind_the_rate(checks_client):
+    """§7.2's rate is only actionable next to the list it summarises."""
+    client, sid = checks_client
+    body = client.get(f"/session/{sid}/correlation").json()
+    assert body["matched"] <= body["total"]
+    assert body["summary"].endswith(f"({body['percent']}%)")
+    assert body["n_unmatched"] == len(body["unmatched"])
+    assert "exact" in body["by_method"]
+
+
+def test_correlation_route_is_404_without_rtl(client, session_id):
+    """§7.4: a fabricated 0% would be worse than saying there is nothing."""
+    r = client.get(f"/session/{session_id}/correlation")
+    assert r.status_code == 404
+    assert "no RTL" in r.json()["detail"]
+
+
 def test_checks_without_rtl_still_runs_stuck_and_says_what_it_skipped(client, session_id):
     """§7.4: a dump with no RTL is a supported mode, not a degraded one."""
     body = client.get(f"/session/{session_id}/checks").json()

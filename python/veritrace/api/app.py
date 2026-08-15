@@ -126,9 +126,23 @@ def _question(session: Session, text: str) -> tuple[str, int, str]:
             raise HTTPException(status_code=404, detail=str(e)) from e
         return question.signal, question.time, question.headline
 
-    if session.graph.get(q.signal) is None:
-        raise HTTPException(status_code=404, detail=f"unknown signal: {q.signal}")
-    return q.signal, _resolve_time(session, q), ""
+    # A partial name resolves the way §7.2 resolves one — unique suffix, or the
+    # candidates. The query bar is typed into by hand like the terminal is, and
+    # a `why(dut.full)` that worked in only one of the two would be a rule the
+    # user has to remember rather than a rule the tool has.
+    from veritrace.correlate.resolver import resolve_path
+
+    signal, candidates = resolve_path(session.graph, q.signal)
+    if signal is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"{q.signal} could be any of: {', '.join(candidates[:8])}"
+                if candidates
+                else f"unknown signal: {q.signal}"
+            ),
+        )
+    return signal, _resolve_time(session, q), ""
 
 
 def _subtrace_of(session: Session, text: str):
@@ -359,8 +373,33 @@ def create_app(
 
     @api.post("/session/{session_id}/query")
     def query(session_id: str, body: QueryBody) -> dict[str, Any]:
-        """§10.1: `why(...)`, at signal or transaction level (§8.16)."""
+        """§10.1's signal-level commands: `why(...)` and the rest of the table.
+
+        `why` is the one with its own grammar and its own result shape, so it
+        keeps its own branch; everything else goes to the dispatch table in
+        `analysis.signalq`, which calls the same modules the CLI and the REST
+        routes call. Before this, the parser accepted all eighteen commands of
+        §10.1 and the executor answered one — so `cone(top.ctrl.ready)` typed
+        into the query bar came back "not supported" for an analysis the same
+        session already had a button for.
+        """
+        from veritrace.analysis import signalq
+
         session = require(session_id)
+        text = (body.vtq or "").strip()
+        if not text.startswith("why"):
+            try:
+                pipeline = vtq.parse_pipeline(text)
+            except vtq.QueryError:
+                pipeline = None
+            if pipeline is not None and pipeline.name in signalq.COMMANDS:
+                try:
+                    return {"query": body.vtq, **signalq.run(session, pipeline)}
+                except vtq.QueryError as e:
+                    raise HTTPException(status_code=400, detail=str(e)) from e
+                except KeyError as e:
+                    raise HTTPException(status_code=404, detail=str(e)) from e
+
         signal, t, headline = _question(session, body.vtq)
         return {
             "query": body.vtq,
@@ -626,6 +665,59 @@ def create_app(
                 else None
             ),
         }
+
+    @api.get("/session/{session_id}/stuck")
+    def stuck_route(
+        session_id: str,
+        cycles: int = Query(default=..., ge=1, le=1_000_000),
+    ) -> dict[str, Any]:
+        """§8.4 at a threshold other than the configured one.
+
+        The good answer depends on the run — three of the four reference
+        designs are shorter than §8.4's 100-cycle default, so on those the
+        check cannot fire at all. Until now the only way to try a narrower
+        window was to edit `.veritrace.toml` and restart the server, which is
+        the wrong shape for a knob whose right value is discovered by turning
+        it. Only the stuck scan runs: it is one parallel pass over an already
+        warm time cache, not the whole check suite.
+        """
+        from veritrace.analysis import stuck as stuck_mod
+
+        session = require(session_id)
+        if session.clock is None:
+            return {
+                "cycles": cycles,
+                "findings": [],
+                "unreachable": "no clock could be identified in this trace",
+            }
+        found = sorted(
+            stuck_mod.scan(session.store, session.clock, session.graph, session.config, cycles),
+            key=lambda f: f.sort_key,
+        )
+        suppressed = set(session.suppressions())
+        return {
+            "cycles": cycles,
+            "n_cycles": session.clock.n_cycles,
+            "unreachable": stuck_mod.too_short(
+                session.store, session.clock, session.config, cycles
+            ),
+            "findings": [f.to_dict() for f in found if f.id not in suppressed],
+        }
+
+    @api.get("/session/{session_id}/correlation")
+    def correlation_route(session_id: str) -> dict[str, Any]:
+        """§7.2's rate, with the names behind it.
+
+        The status bar has shown the percentage since the first prompt; what it
+        could not do was answer the question the percentage provokes. A rate is
+        only actionable next to the list it summarises — and §7.2's own remedy,
+        the simulator dump flags of §4.0, is chosen by looking at *which*
+        signals are missing.
+        """
+        session = require(session_id)
+        if session.correlation is None:
+            raise HTTPException(status_code=404, detail="this session has no RTL")
+        return session.correlation.to_dict()
 
     @api.post("/session/{session_id}/checks/{finding_id}/suppress")
     def suppress(session_id: str, finding_id: str, body: SuppressBody) -> dict[str, Any]:

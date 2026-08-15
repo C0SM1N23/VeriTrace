@@ -184,6 +184,16 @@ impl TraceStore {
         self.inner.meta.source_sha256.clone()
     }
 
+    /// Size of the source dump when it was converted, in bytes.
+    ///
+    /// The O(1) half of the staleness check: `store.ensure` compares it before
+    /// reusing a store, so a dump regenerated without a newer timestamp is
+    /// reconverted instead of silently believed (§5.7).
+    #[getter]
+    fn source_bytes(&self) -> Option<u64> {
+        self.inner.meta.source_bytes
+    }
+
     fn signals(&self) -> Vec<Signal> {
         self.inner.signals.iter().map(to_py_signal).collect()
     }
@@ -337,6 +347,15 @@ impl TraceStore {
     /// parallelism this call exists for.
     fn last_change_all(&self, py: Python<'_>, t: i64) -> Vec<Option<i64>> {
         py.detach(|| self.inner.last_change_all(t))
+    }
+
+    /// `value_at(t)` for many signals, in one parallel pass.
+    ///
+    /// The scan runs detached for the same reason `last_change_all` does; only
+    /// the wrapping of the results into Python objects takes the GIL back.
+    fn value_at_all(&self, py: Python<'_>, handles: Vec<u32>, t: i64) -> Vec<Option<Value>> {
+        let got = py.detach(|| self.inner.value_at_all(&handles, t));
+        got.into_iter().map(|v| v.map(|inner| Value { inner })).collect()
     }
 
     /// Timestamps where this signal's settled value becomes 1.
