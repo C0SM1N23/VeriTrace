@@ -1,0 +1,49 @@
+# §8.37 — coverage of *intent*, not of lines.
+#
+# Each `covered_by` is `kind:reference`, and the references are things the tool
+# already produces: a cover point from §8.21, a formal property from §8.27, a
+# check from §8.4-§8.11. So an item is not a claim in a document — it is a link
+# to something that either holds or does not, and `veritrace scorecard --plan`
+# resolves every one of them.
+#
+# The last item is deliberately marked `covered` while the run does not show it.
+# A plan is a document and documents drift; the report is expected to say so
+# rather than repeat the claim.
+
+[[item]]
+id = "AXI-01"
+desc = "A write is answered with a response code the master reads"
+covered_by = ["fcov:bresp"]
+status = "covered"
+
+[[item]]
+id = "AXI-02"
+desc = "The write address holds until the slave accepts it"
+covered_by = ["formal:AXI_AWSTABLE"]
+status = "covered"
+
+[[item]]
+id = "AXI-03"
+desc = "Both transaction kinds occur, and each follows the other"
+covered_by = ["fcov:kind"]
+status = "planned"
+note = "the master alternates, so READ x READ never happens — stimgen closes it"
+
+[[item]]
+id = "AXI-04"
+desc = "An unaligned address is exercised"
+covered_by = ["fcov:unaligned"]
+status = "planned"
+
+[[item]]
+id = "AXI-05"
+desc = "No signal is left frozen for the whole run"
+covered_by = ["check:stuck"]
+status = "covered"
+
+[[item]]
+id = "AXI-06"
+desc = "The register file survives a reset mid-transaction"
+covered_by = ["test:tb_axi_lite_reset"]
+status = "planned"
+note = "no such testbench exists yet; the plan says so rather than the coverage number"

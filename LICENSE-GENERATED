@@ -1,0 +1,40 @@
+Files VeriTrace generates: CC0-1.0 OR MIT
+=========================================
+
+VeriTrace itself is MIT (see LICENSE). This file is about something else — the
+files VeriTrace *writes into your project*:
+
+  * SVA and Verilog checkers from `veritrace gen-sva`   (SPEC §8.22)
+  * stimulus testbenches from `veritrace stimgen`       (SPEC §8.32)
+  * formal harnesses, synthesis shims and any other source VeriTrace emits
+
+Those files land next to your RTL, get committed to your repository, and may
+end up compiled into your verification flow. So there must be no question about
+what license they carry.
+
+    SPDX-License-Identifier: CC0-1.0 OR MIT
+
+To the extent possible under law, the authors of VeriTrace waive all copyright
+and related or neighbouring rights to the output VeriTrace generates, under
+CC0 1.0 Universal (https://creativecommons.org/publicdomain/zero/1.0/). Where
+a public-domain dedication is not recognised or not convenient, the same files
+are alternatively available under the MIT license in LICENSE, and you may pick
+either at your option.
+
+In plain terms: **the output is yours.** Keep it, edit it, ship it, relicense
+it, and attribute nothing. VeriTrace's MIT terms — including the requirement to
+carry a copyright notice — apply to VeriTrace's own source, not to what it
+prints for you.
+
+Why this is spelled out (SPEC §1.8)
+-----------------------------------
+
+VeriTrace reads RTL and waveforms as *data*. It does not link into your design
+and nothing it computes ends up in a netlist, so the tool's license cannot
+reach your code by that route. `gen-sva` is the one exception worth naming:
+it emits source. An emitter with an unstated license invites the question of
+whether its output "inherits" the tool's terms. It does not, and this file is
+that answer in writing.
+
+Every generated file carries the SPDX line above in its header, so the answer
+travels with the file rather than living only here.

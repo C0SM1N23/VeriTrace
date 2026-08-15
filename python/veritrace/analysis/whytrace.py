@@ -70,6 +70,10 @@ class Reason(Enum):
     DEPTH_LIMIT = "depth_limit"
     BLACKBOX_IP = "blackbox_ip"
     NOT_TRACED = "not_traced"
+    #: §8.11b — the chain reached the first sample of an on-board capture. The
+    #: cause is before the window, which is a fact about the capture and not
+    #: about the design, so it is its own terminal.
+    CAPTURE_BOUNDARY = "capture_boundary"
     ASSIGNED = "assigned"
     HOLD = "hold"
 
@@ -97,6 +101,11 @@ X_TERMINALS = frozenset(
         Reason.X_FROM_ARITH,
         Reason.TRISTATE_Z,
         Reason.UNKNOWN_X,
+        # Two drivers disagreeing resolve to X, and the conflict *is* the
+        # origin — the walk stops there with a complete explanation. Leaving it
+        # out made every X caused by a multi-driver invisible to §8.5, which is
+        # the one X whose cause the tool can state with certainty.
+        Reason.CONFLICT,
     }
 )
 
@@ -107,6 +116,7 @@ X_TERMINAL_DETAIL: dict[Reason, str] = {
     Reason.X_FROM_ARITH: "arithmetic on an unknown operand",
     Reason.TRISTATE_Z: "tri-state net with no enable active",
     Reason.UNKNOWN_X: "unknown, and the cause is not in the trace",
+    Reason.CONFLICT: "more than one driver active at the same time",
 }
 
 
@@ -126,6 +136,10 @@ class CausalNode:
     detail: str = ""
     #: `m1.WRITE[7]` on a TXN_LINK node — §8.16.
     txn: str | None = None
+    #: True when the value was *computed* from the drivers instead of read from
+    #: the trace (§7.3). P2 applies here too: inference presented as measurement
+    #: is the one thing a causal chain must never do.
+    derived: bool = False
 
     def walk(self, seen: set[int] | None = None) -> Iterable["CausalNode"]:
         """Every distinct node, once.
@@ -166,6 +180,7 @@ class CausalNode:
                 "is_primary_path": self.is_primary_path,
                 "detail": self.detail,
                 "txn": self.txn,
+                "derived": self.derived,
                 "repeated": True,
                 "children": [],
             }
@@ -184,6 +199,7 @@ class CausalNode:
             "is_primary_path": self.is_primary_path,
             "detail": self.detail,
             "txn": self.txn,
+            "derived": self.derived,
             "repeated": False,
             "children": [c.to_dict(seen) for c in self.children],
         }
@@ -198,6 +214,9 @@ ROOT_REASONS = frozenset(
         Reason.UNDRIVEN,
         Reason.CONFLICT,
         Reason.BLACKBOX_IP,
+        # §8.11b: "the cause is before the capture window" is an answer — the
+        # honest one — not a walk that gave up halfway.
+        Reason.CAPTURE_BOUNDARY,
         Reason.UNINITIALIZED_REG,
         Reason.UNCONNECTED_PORT,
         Reason.OUT_OF_RANGE,
@@ -205,6 +224,23 @@ ROOT_REASONS = frozenset(
         Reason.TRISTATE_Z,
     }
 )
+
+
+def _spine(node: "CausalNode") -> list["CausalNode"]:
+    """The primary path, symptom first — the same one `root_cause` ends on.
+
+    A DAG has no single "the chain", so this is the branch the §8.1 heuristic
+    ranked first at every step: what the Causal tab opens on, and what a reader
+    is being pointed at. Every other branch is still under `root`.
+    """
+    out: list["CausalNode"] = []
+    cur: "CausalNode | None" = node
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        out.append(cur)
+        cur = next((c for c in cur.children if c.is_primary_path), None)
+    return out
 
 
 def root_cause(node: "CausalNode") -> "CausalNode | None":
@@ -220,6 +256,12 @@ def root_cause(node: "CausalNode") -> "CausalNode | None":
     while cur is not None:
         if cur.reason in ROOT_REASONS:
             best = cur
+        if cur.reason is Reason.CONFLICT:
+            # §8.1: more than one active driver is "bug in sine" — the answer,
+            # not a step towards one. Its children are the two drivers' inputs,
+            # shown for context; concluding "a is a primary input" from them
+            # would name something that is not the problem.
+            return cur
         cur = next((c for c in cur.children if c.is_primary_path), None)
     return best
 
@@ -386,10 +428,68 @@ def _relevant(e: Expr, read, out: list[SignalId]) -> None:
         case Concat(parts=ps):
             for p in ps:
                 _relevant(p, read, out)
-        case Slice(arg=a):
+        case Slice(arg=a, msb=m, lsb=l):
             _relevant(a, read, out)
+            # The index is a cause too. `mem[rd_ptr]` reading the wrong word is
+            # a `rd_ptr` bug as often as a memory bug, and before this the
+            # index never appeared in the chain at all. Constant bounds
+            # contribute nothing, so an ordinary `x[7:0]` is unaffected.
+            _relevant(m, read, out)
+            if not _same(m, l):
+                _relevant(l, read, out)
         case _:
             out.extend(refs(e))
+
+
+def _same(a: Expr, b: Expr) -> bool:
+    """Whether two sub-expressions are the identical node — an element select.
+
+    `mem[i]` elaborates to `Slice(mem, msb=i, lsb=i)`, so msb and lsb being the
+    same expression is what distinguishes selecting one element from taking a
+    range of bits.
+    """
+    return a is b or a == b
+
+
+def mem_selects(e: Expr, view: "TraceView") -> list[tuple[Signal, Expr]]:
+    """Every `mem[index]` in an expression, as (memory signal, index) — §5.6.
+
+    A dynamically indexed memory read is not an ordinary reference: the answer
+    is in one element, and that element was written at some earlier time. Both
+    facts have to be recovered before the walk can continue, so they are found
+    here and handled by `_mem_read` rather than falling into `relevant_refs`,
+    which would yield the array as a whole and explain nothing.
+    """
+    out: list[tuple[Signal, Expr]] = []
+
+    def walk(n: Expr) -> None:
+        match n:
+            case Slice(arg=Ref(signal=s), msb=m, lsb=l) if _same(m, l):
+                sig = view.signal(s)
+                if sig is not None and (sig.kind is Kind.MEM or sig.elements):
+                    out.append((sig, m))
+                    walk(m)  # the index has its own causes
+                    return
+                walk(m)
+            case Slice(arg=a, msb=m, lsb=l):
+                walk(a)
+                walk(m)
+                walk(l)
+            case Binary(lhs=l, rhs=r):
+                walk(l)
+                walk(r)
+            case Unary(arg=a) | Reduce(arg=a):
+                walk(a)
+            case Ternary(cond=c, then=t, other=o):
+                walk(c)
+                walk(t)
+                walk(o)
+            case Concat(parts=ps):
+                for p in ps:
+                    walk(p)
+
+    walk(e)
+    return out
 
 
 # --- X terminals (§8.5) ----------------------------------------------------
@@ -407,8 +507,19 @@ def _out_of_range(e: Expr, read: Callable[[SignalId], BV | None], view: "TraceVi
             sig = view.signal(s)
             if sig is None:
                 return False
-            # A memory indexes over its elements; anything else over its bits.
-            limit = max(sig.elements, default=sig.width - 1) if sig.elements else sig.width - 1
+            # A memory indexes over its *elements*, anything else over its bits.
+            # For a memory the bound is the declared depth and nothing else:
+            # `width` is one element (so `mem[8]` on a 64-entry array of bytes
+            # would read as out of range) and `elements` is only what the
+            # simulator chose to dump (so a truncated `--trace-max-array` would
+            # do the same). Without a declared depth no claim is made — calling
+            # a legal index illegal is worse than saying nothing.
+            if sig.kind is Kind.MEM or sig.elements:
+                if not sig.depth:
+                    return any(_out_of_range(x, read, view) for x in (m, l))
+                limit = sig.depth - 1
+            else:
+                limit = sig.width - 1
             for idx in (evaluate(m, read).to_int(), evaluate(l, read).to_int()):
                 if idx is not None and not 0 <= idx <= limit:
                     return True
@@ -565,6 +676,26 @@ class WhyResult:
     def to_dict(self) -> dict:
         return {
             "root": self.root.to_dict(),
+            # §13's own example is `--json | jq '.chain[0].loc'`: the spine from
+            # the symptom down to the root cause, flat, for a shell that should
+            # not have to walk a tree. The tree stays under `root` — this is the
+            # same nodes in the order someone reads them, not a second answer.
+            "chain": [
+                {
+                    "signal": n.signal.path(),
+                    "time": n.time,
+                    "value": n.value,
+                    "reason": n.reason.value,
+                    "loc": (
+                        {"file": n.loc.file, "line": n.loc.line, "col": n.loc.col}
+                        if n.loc
+                        else None
+                    ),
+                    "detail": n.detail,
+                    "derived": n.derived,
+                }
+                for n in _spine(self.root)
+            ],
             "stats": {
                 "nodes": self.nodes,
                 "ms": round(self.elapsed_ms, 2),
@@ -580,9 +711,14 @@ class WhyTracer:
         store,
         max_depth: int = MAX_DEPTH,
         txn_index: Any = None,
+        capture_start: int | None = None,
     ) -> None:
         self.graph = graph
         self.store = store
+        #: §8.11b. Set to the first sample time when the trace is an on-board
+        #: capture rather than a simulation: the window has a front edge, and a
+        #: chain that reaches it has run out of evidence, not out of design.
+        self.capture_start = capture_start
         self.view = TraceView(graph, store)
         self.max_depth = max_depth
         #: §8.16. `None` means no protocol pack matched this design, and the
@@ -613,9 +749,14 @@ class WhyTracer:
 
     # -- internals -------------------------------------------------------
 
-    def _node(self, sid, t, kind, reason, **kw) -> CausalNode:
+    def _node(self, sid, t, kind, reason, before: bool = False, **kw) -> CausalNode:
         self._count += 1
-        val = self.view.value(sid, t)
+        # §5.5: when a sequential parent explained this signal at its clock
+        # edge, the value that mattered is the one going *into* the edge. Showing
+        # the post-edge value here is the display half of "state is WAIT because
+        # next_state is WAIT" — the node would contradict the reasoning above it.
+        val = self.view.value(sid, t, before)
+        sig = self.view.signal(sid)
         return CausalNode(
             signal=sid,
             time=t,
@@ -623,23 +764,26 @@ class WhyTracer:
             kind=kind,
             reason=reason,
             last_change=self.view.last_change(sid, t),
+            # §7.3: this value was evaluated from the graph, not observed. The
+            # user has to be able to tell the two apart.
+            derived=sig is not None and sig.is_reconstructible,
             **kw,
         )
 
-    def _why(self, sid: SignalId, t: int, depth: int) -> CausalNode:
-        key = (sid.path(), t)
+    def _why(self, sid: SignalId, t: int, depth: int, before: bool = False) -> CausalNode:
+        key = (sid.path(), t, before)
         if key in self._memo:
             return self._memo[key]
         if depth > self.max_depth or self._count >= MAX_NODES:
-            return self._node(sid, t, NodeKind.TERMINAL, Reason.DEPTH_LIMIT)
+            return self._node(sid, t, NodeKind.TERMINAL, Reason.DEPTH_LIMIT, before=before)
         if sid.path() in self._stack:
             # Feedback is normal in RTL (§5.4); stop without memoising, since
             # the answer depends on where we entered the loop.
-            return self._node(sid, t, NodeKind.TERMINAL, Reason.CYCLE)
+            return self._node(sid, t, NodeKind.TERMINAL, Reason.CYCLE, before=before)
 
         self._stack.add(sid.path())
         try:
-            node = self._classify(sid, t, depth)
+            node = self._classify(sid, t, depth, before)
             self._link_transaction(node, sid, t, depth)
         finally:
             self._stack.discard(sid.path())
@@ -696,27 +840,34 @@ class WhyTracer:
                 c.is_primary_path = i == 0
         node.children.append(link)
 
-    def _classify(self, sid: SignalId, t: int, depth: int) -> CausalNode:
+    def _classify(self, sid: SignalId, t: int, depth: int, before: bool = False) -> CausalNode:
         sig = self.view.signal(sid)
         if sig is None:
-            return self._node(sid, t, NodeKind.TERMINAL, Reason.NOT_TRACED)
+            return self._node(sid, t, NodeKind.TERMINAL, Reason.NOT_TRACED, before=before)
 
+        path = sid.path()
         for prefix, module in self.graph.blackboxes.items():
-            if sid.path().startswith(prefix + "."):
-                n = self._node(sid, t, NodeKind.TERMINAL, Reason.BLACKBOX_IP, loc=sig.decl_loc)
+            # Inside the black box, or a wire coming out of it. The second case
+            # is the one that matters in practice: the IP's internals are rarely
+            # in the dump, but the net it drives always is, and without this it
+            # reads as an undriven wire rather than as a boundary (§7.4b).
+            if path.startswith(prefix + ".") or (
+                path in self.graph.blackbox_driven and prefix.rsplit(".", 1)[0] == sid.hier[0]
+            ):
+                n = self._node(sid, t, NodeKind.TERMINAL, Reason.BLACKBOX_IP, before=before, loc=sig.decl_loc)
                 n.detail = module
                 return n
 
         # 1. terminals, in the order of §8.1.
-        observed = self.view.value(sid, t)
+        observed = self.view.value(sid, t, before)
         unknown = observed is not None and not observed.known
         # Driven from outside the design: an unconnected input port, or a
         # signal only the testbench writes. Neither is a floating net, which is
         # what `UNDRIVEN` means.
         if not sig.drivers and (sig.kind is Kind.PORT_IN or sig.stimulus_only):
-            return self._node(sid, t, NodeKind.TERMINAL, Reason.PRIMARY_INPUT, loc=sig.decl_loc)
+            return self._node(sid, t, NodeKind.TERMINAL, Reason.PRIMARY_INPUT, before=before, loc=sig.decl_loc)
         if sig.kind is Kind.PARAM:
-            return self._node(sid, t, NodeKind.TERMINAL, Reason.CONSTANT, loc=sig.decl_loc)
+            return self._node(sid, t, NodeKind.TERMINAL, Reason.CONSTANT, before=before, loc=sig.decl_loc)
         # "Constant for the whole run" is §8.1's terminal, but only where the
         # RTL says the signal cannot change. A guarded register that happened
         # never to fire is the *symptom*, and stopping there answers nothing —
@@ -728,17 +879,40 @@ class WhyTracer:
         # sense and useless as an answer; §8.5 wants to know why it is X.
         if not unknown and sig.is_tie_off and sig.is_traced:
             if self.view.is_constant(sid, 0, t + 1):
-                return self._node(sid, t, NodeKind.TERMINAL, Reason.CONSTANT, loc=sig.decl_loc)
+                return self._node(sid, t, NodeKind.TERMINAL, Reason.CONSTANT, before=before, loc=sig.decl_loc)
+        # §8.11b: on an on-board capture the window is all there is. A value
+        # already settled at the first sample was decided before the trigger,
+        # and saying "undriven" or "constant" about it would be a claim the
+        # capture cannot support.
+        if self.capture_start is not None and sig.is_traced:
+            if self.view.is_constant(sid, self.capture_start, t + 1):
+                node = self._node(
+                    sid, t, NodeKind.TERMINAL, Reason.CAPTURE_BOUNDARY, before=before,
+                    loc=sig.decl_loc,
+                )
+                node.detail = (
+                    f"already settled at the first sample (c0); the cause is before the "
+                    f"window. Trigger on a change of {sid.name} next time, or probe its "
+                    "drivers: " + ", ".join(sorted({r.name for d in sig.drivers for r in refs(d.guard)})[:4])
+                    if sig.drivers
+                    else f"already settled at the first sample (c0); the cause is before the window"
+                )
+                return node
+
         if not sig.drivers:
             reason = Reason.UNKNOWN_X if unknown else Reason.UNDRIVEN
             if unknown and sig.unconnected:
                 reason = Reason.UNCONNECTED_PORT
-            return self._node(sid, t, NodeKind.TERMINAL, reason, loc=sig.decl_loc)
+            return self._node(sid, t, NodeKind.TERMINAL, reason, before=before, loc=sig.decl_loc)
 
         # 2. which driver was active, and when (§5.5, problem 2).
-        t_eff, before = effective_time(self.view, sig, t)
+        # `before` describes how *this* node's own value was asked for; the
+        # pair below describes how its causes must be read. Conflating the two
+        # makes a node display the value going into its edge instead of the one
+        # it settled at — the same §5.5 confusion, one level up.
+        t_eff, child_before = effective_time(self.view, sig, t)
 
-        read = lambda s: self.view.value(s, t_eff, before)  # noqa: E731
+        read = lambda s: self.view.value(s, t_eff, child_before)  # noqa: E731
 
         # 2b. §8.5. An X that originates here is the answer; an X inherited from
         # upstream is not, so only a specific terminal stops the walk. This is
@@ -746,21 +920,23 @@ class WhyTracer:
         if unknown:
             reason = classify_x(sig, sid, t, self.view, read)
             if reason is not Reason.UNKNOWN_X:
-                node = self._node(sid, t, NodeKind.TERMINAL, reason, loc=sig.decl_loc)
+                node = self._node(sid, t, NodeKind.TERMINAL, reason, before=before, loc=sig.decl_loc)
                 node.detail = X_TERMINAL_DETAIL[reason]
                 return node
 
         active = [d for d in sig.drivers if self._is_active(d, read)]
 
         if not active:
-            return self._hold(sig, sid, t, t_eff, read, depth)
+            return self._hold(sig, sid, t, t_eff, read, depth, child_before)
         if len(active) > 1:
             node = self._node(
                 sid, t, NodeKind.CONFLICT, Reason.CONFLICT, loc=active[0].loc
             )
             node.detail = f"{len(active)} drivers active at once"
             node.children = [
-                self._why(r, t_eff, depth + 1) for d in active for r in relevant_refs(d.value, read)
+                self._why(r, t_eff, depth + 1, child_before)
+                for d in active
+                for r in relevant_refs(d.value, read)
             ][: 8]
             return node
 
@@ -771,35 +947,126 @@ class WhyTracer:
         # too. `relevant_refs` on a true guard yields exactly those (for an OR
         # only the true operand, for an AND all of them).
         d = active[0]
-        node = self._node(sid, t, NodeKind.ASSIGNED, Reason.ASSIGNED, loc=d.loc)
+        node = self._node(sid, t, NodeKind.ASSIGNED, Reason.ASSIGNED, before=before, loc=d.loc)
         node.detail = to_text(d.value)
         if not isinstance(d.guard, Const):
             node.detail += f"   [guard: {to_text(d.guard)}]"
         causes = relevant_refs(d.value, read) + relevant_refs(d.guard, read)
-        node.children = self._children(causes, t_eff, depth)
+        # §5.6: a `mem[i]` read is answered by the element and by the write that
+        # put the value there, not by the array as a whole. Those come first —
+        # the data is the answer, the index is the supporting cast.
+        reads = [
+            self._mem_read(m, idx, read, t_eff, depth, child_before)
+            for m, idx in mem_selects(d.value, self.view)
+        ]
+        indexed = {m.path for m, _ in mem_selects(d.value, self.view)}
+        kids = self._children([c for c in causes if c.path() not in indexed], t_eff, depth, child_before)
+        if reads:
+            for k in kids:
+                k.is_primary_path = False
+            for i, r in enumerate(reads):
+                r.is_primary_path = i == 0
+            node.children = reads + kids
+        else:
+            node.children = kids
         return node
+
+    def _mem_read(self, mem: Signal, index: Expr, read, t: int, depth: int, before: bool = False) -> CausalNode:
+        """One `mem[i]` read, resolved to its element and to the write — §5.6.
+
+        Three steps the spec is explicit about: evaluate the index, make the
+        element the subject instead of the array, and **jump back to the last
+        write of that element**. The jump is what turns "the memory holds 0x40"
+        into "0x40 was written at c200 by the store at dma.sv:88", which is the
+        whole reason the case is called out separately.
+        """
+        idx = evaluate(index, read).to_int()
+        name = mem.id.name if idx is None else f"{mem.id.name}[{idx}]"
+        sid = SignalId(mem.id.hier, name)
+
+        if idx is None:
+            node = self._node(sid, t, NodeKind.TERMINAL, Reason.UNKNOWN_X, loc=mem.decl_loc)
+            node.detail = "the index is unknown here, so no element can be named"
+            return node
+
+        handle = mem.elements.get(idx)
+        if handle is None:
+            # §5.6 is explicit that this is said plainly rather than answered
+            # around: a chain built on an array nobody dumped is a guess.
+            node = self._node(sid, t, NodeKind.TERMINAL, Reason.NOT_TRACED, loc=mem.decl_loc)
+            node.detail = (
+                f"{mem.id.name} is not in the trace"
+                if not mem.elements
+                else f"{mem.id.name}[{idx}] is not in the trace ({len(mem.elements)} of "
+                f"{mem.depth or '?'} elements were dumped)"
+            )
+            node.detail += ". Verilator needs --trace-max-array N, Icarus an "
+            node.detail += "explicit $dumpvars on the elements."
+            return node
+
+        written = self.store.last_change_before(handle, t + 1)
+        val = self.store.value_at(handle, t)
+        node = CausalNode(
+            signal=sid,
+            time=written if written is not None else t,
+            value=val.bits if val is not None else "?",
+            kind=NodeKind.ASSIGNED,
+            reason=Reason.ASSIGNED,
+            loc=mem.decl_loc,
+            last_change=written,
+        )
+        self._count += 1
+        if written is None:
+            node.kind = NodeKind.TERMINAL
+            node.reason = Reason.UNDRIVEN
+            node.detail = f"{name} was never written in this run"
+            return node
+
+        # The walk continues from the *write*, not from the read. Everything
+        # below this node is about a different instant, which is exactly the
+        # answer someone is after.
+        node.detail = f"written at {name}"
+        writer = self._writer(mem, written, depth)
+        if writer is not None:
+            d, t_eff, read_w = writer
+            node.loc = d.loc
+            node.detail = to_text(d.value)
+            if not isinstance(d.guard, Const):
+                node.detail += f"   [guard: {to_text(d.guard)}]"
+            causes = relevant_refs(d.value, read_w) + relevant_refs(d.guard, read_w)
+            node.children = self._children(causes, t_eff, depth + 1)
+        return node
+
+    def _writer(self, mem: Signal, t: int, depth: int):
+        """The driver of `mem` that was enabled at `t`, with its read context."""
+        if depth >= self.max_depth or self._count >= MAX_NODES:
+            return None
+        t_eff, before = effective_time(self.view, mem, t)
+        read_w = lambda s: self.view.value(s, t_eff, before)  # noqa: E731
+        active = [d for d in mem.drivers if self._is_active(d, read_w)]
+        return (active[0], t_eff, read_w) if len(active) == 1 else None
 
     def _is_active(self, d: Driver, read) -> bool:
         g = evaluate(d.guard, read).truthy()
         return (not g.x) and bool(g.v)
 
-    def _hold(self, sig: Signal, sid, t, t_eff, read, depth) -> CausalNode:
+    def _hold(self, sig: Signal, sid, t, t_eff, read, depth, before: bool = False) -> CausalNode:
         """No driver fired: the signal kept its value.
 
         The question becomes "why was every guard false", which is the case that
         matters most in practice (§8.1).
         """
-        node = self._node(sid, t, NodeKind.HOLD, Reason.HOLD, loc=sig.decl_loc)
+        node = self._node(sid, t, NodeKind.HOLD, Reason.HOLD, before=before, loc=sig.decl_loc)
         node.detail = "held: no driver was enabled"
         culprits: list[SignalId] = []
         for d in sig.drivers:
             culprits.extend(falsifying_terms(d.guard, read))
         seen: set[str] = set()
         culprits = [c for c in culprits if not (c.path() in seen or seen.add(c.path()))]
-        node.children = self._children(culprits, t_eff, depth)
+        node.children = self._children(culprits, t_eff, depth, before)
         return node
 
-    def _children(self, causes: list[SignalId], t_eff: int, depth: int) -> list[CausalNode]:
+    def _children(self, causes: list[SignalId], t_eff: int, depth: int, before: bool = False) -> list[CausalNode]:
         """Recurse into causes, oldest last transition first (§8.1).
 
         The ordering is the heuristic; the set is complete either way.
@@ -811,7 +1078,7 @@ class WhyTracer:
                 s.path(),
             ),
         )
-        out = [self._why(c, t_eff, depth + 1) for c in ranked]
+        out = [self._why(c, t_eff, depth + 1, before) for c in ranked]
         for i, n in enumerate(out):
             n.is_primary_path = i == 0
         return out

@@ -440,3 +440,63 @@ def test_cdc_does_not_fire_within_one_clock_domain(tmp_path_factory):
 
     cdc = [f for f in report if f.check == "cdc_no_sync"]
     assert cdc == [], [f.title for f in cdc]
+
+
+# --- §8.9's structural row ---------------------------------------------------
+
+
+def test_a_ready_computed_from_valid_is_reported(tmp_path):
+    """§8.9: `ready` combinationally dependent on `valid` is a deadlock risk.
+
+    The trace cannot show it — every transfer in the fixture completes, because
+    the master never waits for ready. That is exactly why the check reads the
+    graph, and why it says so in the finding.
+    """
+    from veritrace.analysis import handshake
+    from veritrace.correlate.resolver import correlate
+    from veritrace.graph.elaborate import discover, elaborate
+    from veritrace.protocol import engine
+
+    design = DESIGNS / "handshake"
+    vtx = tmp_path / "hs.vtx"
+    convert(str(design / "dump.vcd"), str(vtx))
+    store = TraceStore(str(vtx))
+    el = elaborate(discover(design))
+    correlate(el.graph, {s.path: s.handle for s in store.signals()}, el.aliases)
+    analysis = engine.extract(store, None, None, None, use_cache=False)
+
+    found = list(handshake.scan(analysis, el.graph))
+    assert len(found) == 1, [f.title for f in found]
+    (f,) = found
+    assert f.signal.endswith("s_axi_wready")
+    assert "depends combinationally on" in f.title
+    # The path is evidence, not decoration.
+    assert any("path:" in n for n in f.notes)
+    # And the honesty note: a clean run does not clear a structural finding.
+    assert any("not observed in this run" in n for n in f.notes)
+
+
+def test_a_registered_ready_is_not_reported(tmp_path):
+    """The control, in the same design: `awready` comes out of a flop and
+    `arready` is a function of `rvalid`. Neither may be flagged, or the check
+    is noise."""
+    from veritrace.analysis import handshake
+    from veritrace.correlate.resolver import correlate
+    from veritrace.graph.elaborate import discover, elaborate
+    from veritrace.protocol import engine
+
+    design = DESIGNS / "handshake"
+    vtx = tmp_path / "hs2.vtx"
+    convert(str(design / "dump.vcd"), str(vtx))
+    store = TraceStore(str(vtx))
+    el = elaborate(discover(design))
+    correlate(el.graph, {s.path: s.handle for s in store.signals()}, el.aliases)
+    analysis = engine.extract(store, None, None, None, use_cache=False)
+
+    flagged = {f.signal for f in handshake.scan(analysis, el.graph)}
+    assert not any(s.endswith(("awready", "arready")) for s in flagged)
+
+    # And fixing the RTL silences it, because the check is about the source.
+    fixed = elaborate(discover(design), defines=["FIX_HANDSHAKE"])
+    correlate(fixed.graph, {s.path: s.handle for s in store.signals()}, fixed.aliases)
+    assert not list(handshake.scan(analysis, fixed.graph))

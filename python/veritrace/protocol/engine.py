@@ -148,6 +148,7 @@ def extract(
     # transactions out of a pack that declares none.
     interfaces = [i for i in detect.detect(store, out.packs, config) if not i.pack.is_memory]
     if not interfaces:
+        _ingest(out, config, store)
         out.elapsed_ms = (_time.perf_counter() - started) * 1000.0
         return out
 
@@ -169,9 +170,43 @@ def extract(
     else:
         out.extractions = [one(interfaces[0])]
 
+    _ingest(out, config, store)
     out.extractions.sort(key=lambda e: e.interface.name)
     out.elapsed_ms = (_time.perf_counter() - started) * 1000.0
     return out
+
+
+def _ingest(out: "ProtocolAnalysis", config: Any, store: Any) -> None:
+    """Fold in transactions somebody's monitor already recorded — §8.34.
+
+    Hooked here rather than at each call site so *every* consumer gets them:
+    the CLI, the session, the API and the coverage pass all go through
+    `extract`, and a second place to remember would be a second place to forget.
+
+    §8.34's precedence is applied by `ingest.merge`: where a monitor and a pack
+    describe the same interface, the monitor wins, because it is a statement of
+    what the team means by a transaction rather than a guess at it.
+    """
+    log = getattr(config, "ingest_cocotb_log", None)
+    db = getattr(config, "ingest_uvm_db", None)
+    if not log and not db:
+        return
+    from veritrace import ingest as ingest_mod
+
+    root = getattr(config, "root", None)
+    try:
+        streams = ingest_mod.read(
+            uvm_db=(root / db if root and db else db),
+            cocotb_log=(root / log if root and log else log),
+            patterns=getattr(config, "ingest_patterns", None) or None,
+            timescale=str(getattr(store, "timescale", "1ns")),
+        )
+    except (OSError, ValueError) as e:
+        # A missing log or a bad regex degrades to signal extraction and says so
+        # (P7); it must not take the session down.
+        out.errors.append(f"ingest: {e}")
+        return
+    ingest_mod.merge(out, streams)
 
 
 def _extract_one(

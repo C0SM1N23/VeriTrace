@@ -1,11 +1,22 @@
-//! Performance check against the tier-A budget in §4.2.
+//! Performance check against the budgets in §4.2.
 //!
-//!   cargo run --release --example bench -- [target_mb]
+//!   cargo run --release --example bench -- [target_mb] [n_signals]
 //!
-//! Generates a synthetic VCD of roughly `target_mb` megabytes, converts it, and
-//! times `value_at`. Exits non-zero if a threshold is missed, so it can gate a
-//! build the way §4.2 asks.
+//! Generates a synthetic VCD of roughly `target_mb` megabytes over `n_signals`
+//! signals, converts it, and times `value_at`. Exits non-zero if a threshold is
+//! missed, so it can gate a build the way §4.2 asks.
+//!
+//! Both tiers of §4.2 are reachable from here:
+//!
+//!   bench -- 100 5000      tier A, "typical"  — the budgets below
+//!   bench -- 1000 50000    tier B, "stress"   — convert < 45 s, open < 2 s
+//!
+//! The thresholds enforced are tier A's; tier B is a validation run whose
+//! numbers are read rather than gated, exactly as the spec frames it.
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::time::Instant;
 
 use vt_trace::query::TraceStore;
@@ -48,13 +59,24 @@ fn code_for(mut n: u32) -> String {
 
 /// Build a VCD of about `target_bytes`, shaped like a real design: a mix of
 /// scalars and buses, most signals quiet, a few very active.
-fn generate(target_bytes: usize, n_signals: usize) -> String {
+///
+/// Written straight to `path` instead of built in memory: the tier-B input of
+/// §4.2 is a gigabyte, and holding that as a `String` needs the whole thing
+/// resident before a single byte is parsed. Streaming it makes the stress tier
+/// runnable at all, and the machine measures conversion rather than its own
+/// allocator.
+fn generate(path: &Path, target_bytes: usize, n_signals: usize) -> u64 {
     let mut rng = Rng(0x1234_5678_9abc_def0);
     let widths: Vec<u32> =
         (0..n_signals).map(|i| if i % 3 == 0 { 1 } else { [4, 8, 16, 32][i % 4] }).collect();
     let codes: Vec<String> = (0..n_signals).map(|i| code_for(i as u32)).collect();
 
-    let mut s = String::with_capacity(target_bytes + 1 << 10);
+    let file = File::create(path).unwrap();
+    let mut w = BufWriter::with_capacity(1 << 20, file);
+    let mut written: u64 = 0;
+    // A small reusable buffer keeps the flush cadence independent of the
+    // record size, so the writer never sees a partial line.
+    let mut s = String::with_capacity(1 << 16);
     s.push_str("$timescale 1ps $end\n$scope module top $end\n");
     for i in 0..n_signals {
         if widths[i] == 1 {
@@ -69,9 +91,12 @@ fn generate(target_bytes: usize, n_signals: usize) -> String {
         }
     }
     s.push_str("$upscope $end\n$enddefinitions $end\n");
+    written += s.len() as u64;
+    w.write_all(s.as_bytes()).unwrap();
+    s.clear();
 
     let mut t: u64 = 0;
-    while s.len() < target_bytes {
+    while written < target_bytes as u64 {
         t += 1000;
         s.push_str(&format!("#{t}\n"));
         // A clock-like signal toggles every step; the rest are sparse.
@@ -94,22 +119,27 @@ fn generate(target_bytes: usize, n_signals: usize) -> String {
                 s.push_str(&format!("1{}\n0{}\n", codes[i], codes[i]));
             }
         }
+        written += s.len() as u64;
+        w.write_all(s.as_bytes()).unwrap();
+        s.clear();
     }
-    s
+    w.flush().unwrap();
+    written
 }
 
 fn main() {
-    let target_mb: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(50);
-    let n_signals = 5_000usize;
+    // `bench [MB] [signals]` — both tiers of §4.2 from one harness. Tier A is
+    // 100 MB over 5k signals, tier B 1000 MB over 50k, and neither was
+    // reachable while the signal count was a constant.
+    let mut args = std::env::args().skip(1);
+    let target_mb: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(50);
+    let n_signals: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(5_000);
 
     eprintln!("generating ~{target_mb} MB VCD over {n_signals} signals...");
-    let text = generate(target_mb * 1024 * 1024, n_signals);
-    let mb = text.len() as f64 / (1024.0 * 1024.0);
-
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("bench.vcd");
-    std::fs::write(&src, &text).unwrap();
-    drop(text);
+    let bytes = generate(&src, target_mb * 1024 * 1024, n_signals);
+    let mb = bytes as f64 / (1024.0 * 1024.0);
 
     // --- conversion -------------------------------------------------------
     let t0 = Instant::now();
@@ -168,6 +198,15 @@ fn main() {
     let consts = s.constant_signals(t_min, t_max);
     let scan_ms = t5.elapsed().as_secs_f64() * 1e3;
 
+    // §4.2 has two tiers with different numbers, and comparing a stress run
+    // against the typical budget is how a passing gate reads as a failure.
+    let stress = mb > 500.0 || s.n_signals() > 20_000;
+    let (tier, convert_budget, open_budget, scan_budget) = if stress {
+        ("tier B, stress", 45.0, 2.0, 3_000.0)
+    } else {
+        ("tier A, typical", BUDGET_CONVERT_S, 1.0, 400.0)
+    };
+
     println!();
     println!("  source VCD          {mb:>10.1} MB");
     println!("  signals             {:>10}", s.n_signals());
@@ -179,20 +218,30 @@ fn main() {
     println!("  open store           {open_s:>9.3} s");
     println!("  value_at (warm)      {value_at_us:>9.3} us  (budget {BUDGET_VALUE_AT_US:.0} us)");
     println!("  value_at (cold)      {cold_us:>9.1} us  (first touch of a signal)");
-    println!("  constant_signals     {scan_ms:>9.1} ms  ({} constant)", consts.len());
+    println!("  constant_signals     {scan_ms:>9.1} ms  (budget {scan_budget:.0} ms, {} constant)", consts.len());
     println!();
 
     let mut failed = false;
-    if convert_s > BUDGET_CONVERT_S {
-        eprintln!("FAIL: convert {convert_s:.2}s exceeds {BUDGET_CONVERT_S:.0}s");
+    if convert_s > convert_budget {
+        eprintln!("FAIL: convert {convert_s:.2}s exceeds {convert_budget:.0}s ({tier})");
         failed = true;
     }
     if value_at_us > BUDGET_VALUE_AT_US {
         eprintln!("FAIL: value_at {value_at_us:.3}us exceeds {BUDGET_VALUE_AT_US:.0}us");
         failed = true;
     }
+    if open_s > open_budget {
+        eprintln!("FAIL: open {open_s:.3}s exceeds {open_budget:.0}s ({tier})");
+        failed = true;
+    }
+    if scan_ms > scan_budget {
+        // Reported, not fatal: §4.2 gives the whole-trace scan a budget at both
+        // tiers, and a regression here is worth seeing without blocking a build
+        // on a machine slower than the one the numbers were taken on.
+        eprintln!("OVER: constant_signals {scan_ms:.0}ms exceeds {scan_budget:.0}ms ({tier})");
+    }
     if failed {
         std::process::exit(1);
     }
-    println!("within budget");
+    println!("within budget ({tier})");
 }

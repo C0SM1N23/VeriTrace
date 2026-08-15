@@ -26,45 +26,86 @@ reproducible chain that ends at a line of source.
 
 ## Install
 
+No wheel is published yet, so install from a checkout. You need Python
+3.12 – 3.14, a [Rust toolchain](https://rustup.rs) for the trace engine, and
+[Node](https://nodejs.org) for the interface.
+
 ```sh
-pip install veritrace
+git clone https://github.com/C0SM1N23/VeriTrace && cd VeriTrace
+python -m venv .venv               # or: uv venv --seed --python 3.12 .venv
+source .venv/bin/activate          # PowerShell: .venv\Scripts\Activate.ps1
+pip install -e . && (cd web && npm install && npm run build)
+veritrace --version
 ```
 
-Nothing else. The wheel carries the Rust trace engine and the web interface.
+The Rust extension links against a real interpreter, so the virtualenv has to be
+**activated** before `pip` runs — otherwise the build targets whatever Python is
+on `PATH`. `python -c "import sys; print(sys.executable)"` should print a path
+inside `.venv`; if it does not, the activation did not take.
 
-Python 3.12 – 3.14.
+**A simulator is a separate install** — VeriTrace reads waveforms, it does not
+produce them. Any of the four free ones works;
+[docs/SIMULATORS.md](docs/SIMULATORS.md) has the install line and the mandatory
+flags for each. Start with Icarus (`apt install iverilog`, `brew install
+icarus-verilog`, or the Windows installer from
+[bleyer.org](https://bleyer.org/icarus/)) — it is the one `veritrace run` drives
+for you, and it needs no flags.
+
+You do not need one for the next section: the reference dumps are committed.
 
 <details>
-<summary>From a checkout</summary>
+<summary>Why the Python range is pinned</summary>
 
-The Rust extension links against a real interpreter, so the virtualenv has to
-be **activated** before `pip` runs — otherwise the build targets whatever Python
-is on `PATH`.
+It is set by PyO3, which refuses to compile against a CPython newer than it
+knows about. `requires-python` in `pyproject.toml` and the `pyo3` version in
+`crates/vt-py/Cargo.toml` are kept in step, so pip declines an unsupported
+interpreter with a readable message instead of starting a source build that ends
+in a wall of Rust output.
+</details>
 
-```powershell
-uv venv --seed --python 3.12 .venv
-.venv\Scripts\Activate.ps1      # PowerShell — `activate` alone is the bash script
-python -m pip install -e .
-cd web; npm install; npm run build   # builds the UI into the package
+## Your first why-trace
+
+Straight from the checkout, no simulator involved — `designs/fifo_buggy` ships
+with the dump it produced:
+
 ```
+$ veritrace why designs/fifo_buggy/dump.vcd --rtl designs/fifo_buggy \
+      "why(tb_fifo_buggy.dut.full @ 455000)"
+
+converting designs/fifo_buggy/dump.vcd -> designs/fifo_buggy/dump.vcd.vtx
+tb_fifo_buggy.dut.full = 1   [assigned] at c45   fifo_buggy.sv:33
+     ((wr_ptr[32'd4:32'd4] != rd_ptr[32'd4:32'd4]) && (wr_ptr[32'd3:32'd0] == rd_ptr[32'd3:32'd0]))
+  -> tb_fifo_buggy.dut.rd_ptr = 00000   [assigned] at c45   fifo_buggy.sv:48
+       5'd0   [guard: !rd_rst_n]
+    -> tb_fifo_buggy.dut.rd_rst_n = 0   [constant] at c45   fifo_buggy.sv:30
+  -> tb_fifo_buggy.dut.wr_ptr = 10000   [hold] at c45   fifo_buggy.sv:26
+       held: no driver was enabled
+    -> tb_fifo_buggy.dut.rst_n = 1   [assigned] at c45   tb_fifo_buggy.sv:17
+         rst_n
+      -> tb_fifo_buggy.rst_n = 1   [primary_input] at c45   tb_fifo_buggy.sv:10
+    -> tb_fifo_buggy.dut.full = 1   [cycle] at c45
+    -> tb_fifo_buggy.dut.wr_en = 0   [assigned] at c45   tb_fifo_buggy.sv:18
+         wr_en
+      -> tb_fifo_buggy.wr_en = 0   [primary_input] at c45   tb_fifo_buggy.sv:11
+
+9 nodes in 10.4 ms
+```
+
+The FIFO reports full and never drains. Four levels down, `rd_rst_n` is a
+constant 0 at `fifo_buggy.sv:30` — the read side is held in reset, so `rd_ptr`
+never advances. Every line carries a file and a line number, and no signal was
+named by hand except the one that looked wrong.
+
+The same question in the interface, with the wave, the source and the tree
+moving together:
 
 ```sh
-# bash / zsh
-uv venv --seed --python 3.12 .venv
-source .venv/bin/activate
-pip install -e . && (cd web && npm install && npm run build)
+veritrace serve designs/fifo_buggy/dump.vcd --rtl designs/fifo_buggy
 ```
 
-`python -c "import sys; print(sys.executable)"` should print a path inside
-`.venv`. If it does not, the activation did not take and the build will use the
-wrong interpreter.
-
-The supported Python range is set by PyO3, which refuses to compile against a
-CPython newer than it knows about. `requires-python` in `pyproject.toml` and the
-`pyo3` version in `crates/vt-py/Cargo.toml` are kept in step, so pip declines
-an unsupported interpreter with a readable message instead of starting a source
-build that ends in a wall of Rust output.
-</details>
+Then press <kbd>w</kbd> on a signal, or type the query into the bar at the top.
+On your own design, `veritrace run rtl/` does the simulation first and writes a
+`.veritrace.toml` so nothing needs arguments after that.
 
 ## The first sixty seconds
 
@@ -598,6 +639,101 @@ fifo_buggy.sv:49 [branch]
 Three conjuncts, two of them routinely true, one never — and the assignment that
 makes it never. That is the injected bug, reached from a coverage hole.
 
+### Ask how complete it all is
+
+`veritrace scorecard` puts every measurement in one page. It computes nothing of
+its own: it reads what the other commands already emit, so a CI pipeline can
+assemble one out of four separate jobs. This is `designs/axi_lite`, for real:
+
+```
+$ veritrace scorecard designs/axi_lite/dump.vcd --rtl designs/axi_lite --top tb_axi_lite \
+      --mutation mut.json --formal formal.json --synth synth.json --plan designs/axi_lite/testplan.toml
+
+VERITRACE SCORECARD — tb_axi_lite @ 87b5b25
+
+   -  line coverage                       —   target >=90%
+        no coverage database was imported
+  XX  functional coverage               47%   target >=80%
+        7/15 bins, 8 hole(s) open
+  XX  mutation score                     0%   target >=70%
+        0/11 mutants killed, seed 7; 1 did not build and are not scored
+   !  formal                            4/7
+        held to bounded depth 20, never proved unconditionally; 3 not checkable as written
+  XX  protocol violations                 2   target 0
+        over 24 transaction(s) in this run
+  OK  synth-diff                  identical
+        21 top-level port(s) compared, RTL vs yosys (WSL (Ubuntu))
+  XX  deadlock/stuck                      8   target 0
+        open stuck and deadlock findings, out of 23 finding(s) in this run
+
+6 of 7 categories measured in this run. No line here says a design is verified —
+that is not a claim this tool makes.
+```
+
+Read the rows that are *not* green, because they are the honest ones. **Mutation
+score 0%**: the AXI testbench drives the bus and checks nothing, so not one of
+the eleven mutants was caught — the design may be fine and the testbench is not
+evidence either way. **Formal 4/7** says `held to bounded depth 20`, never
+"proved": a bounded model check that finds no counterexample in twenty steps has
+found none *in twenty steps*. And **line coverage** reads `—`, not 0%, because
+no database was imported — a number nobody measured is not a low score.
+
+A `testplan.toml` (§8.37) cross-references the same run against what you meant
+to verify, and says when the document has drifted:
+
+```
+VERIFICATION PLAN — testplan.toml   17% of items covered
+
+  missing   AXI-01     A write is answered with a response code the master reads
+              missing  fcov:bresp   2/4 bins
+              the plan says covered; this run does not show it
+  covered   AXI-02     The write address holds until the slave accepts it
+              hit      formal:AXI_AWSTABLE   HELD (bounded, depth=20)
+```
+
+The measurement always outranks the file. An item marked `covered` that this run
+cannot show is reported as missing, with that last line naming the disagreement.
+
+### Hand the whole screen to a colleague
+
+§13.8's rule for every team feature: **files and git, nothing else.** No server,
+no account, no cloud.
+
+```sh
+veritrace note "grant drops a cycle early" --signal top.u_dma.state --at c120 \
+    -f notes/dma_deadlock.vtnotes
+veritrace share dump.vcd -o notes/dma_deadlock.vtsession
+```
+
+Annotations are one line each in `notes/*.vtnotes` — reviewable in the pull
+request that fixes the bug, and findable with `grep`:
+
+```
+top.u_dma.state @ 12500 :: never leaves ARB — grant drops a cycle early
+rtl/dma.sv:42 :: this `if` should test busy too
+```
+
+A `.vtsession` carries the layout, the cursors, the annotations and the question
+you were asking. It does **not** carry the dump — that is referenced by hash,
+because your colleague already has the gigabytes and what they lack is the
+certainty that it is the same run:
+
+```sh
+$ veritrace restore dma_deadlock.vtsession dump.vcd
+layout    -> dump.vcd.vtx.session.json
+notes     -> notes/dma_deadlock.vtnotes
+query        why(top.u_dma.state @ 12500)
+
+veritrace serve dump.vcd
+```
+
+Opening it re-asks the question against *their* dump rather than replaying your
+answer, so what they see is computed from the data in front of them. If the hash
+does not match, the layout is still applied — it is the useful half either way —
+and the mismatch is stated, because bookmarks from another run point at times
+that do not exist in theirs. The file is plain sorted JSON with no timestamp in
+it, so committing it next to the bug it explains produces no churn.
+
 ## The `.vtx` store
 
 A directory of Parquet plus one binary index, so the data is usable without this
@@ -633,6 +769,8 @@ veritrace init                      # detect everything, write .veritrace.toml
 veritrace serve [trace] --rtl src/  # the interface
 veritrace triage sim.log            # log -> root causes
 veritrace why   trace "why(sig @ cN)"       [--json|--do|--gtkw|--wcfg|--surfer]
+veritrace why   trace "top.ctrl.ready == 0 @ c1247"    # the wrapper is optional
+veritrace why   trace "..." --json | jq '.chain[0].loc'   # the spine, flat
 veritrace why   trace "why(txn.iface.WRITE[n].not_issued)"
 veritrace cone  trace sig --depth N --direction fanin|fanout|both [--active-only]
 veritrace stuck trace --cycles N
@@ -646,6 +784,8 @@ veritrace export trace --why "why(sig)" -o bug.html   # standalone report, no ne
 veritrace diff  good.vcd bad.vcd [--align cycle|handshake|retire] [--ignore "*_cnt"]
 veritrace fsm   [trace] [signal] [--svg d.svg]        # state machines; no trace needed
 veritrace gen-sva trace --iface top.dut.m_axi --target verilator|portable -o chk.sv
+veritrace packs [--trace dump.vcd]   # protocol packs loaded, and what each matched
+veritrace import-capture ila.csv --format vivado-ila|signaltap --scope top.dut
 veritrace plugins                    # what analysis plugins this project has
 
 veritrace mutate --rtl rtl/ --top tb [--run "make sim"] [--sample N --seed S]
@@ -656,6 +796,17 @@ veritrace stimgen --rtl rtl/ --top dut --cover-holes fcov.json --target sv|cocot
 veritrace timing report.rpt [trace] --rtl rtl/   # Vivado's paths, over your run
 veritrace saif  trace -o activity.saif [--gating]
 veritrace wavedrom trace --signals "a,b,c" --range c120:c150 [--svg --light]
+
+veritrace ingest --cocotb-log sim.log --trace dump.fst   # transactions a monitor recorded
+veritrace ingest --uvm-tr-db uvm_tr.dat --trace dump.fst
+veritrace record trace --rtl rtl/ --seed N --simulator icarus --simulator-version 12.0
+veritrace history ["SELECT commit_sha, p99_latency FROM txn_metrics JOIN runs USING (run_id)"]
+veritrace reproduce --run-id N --rtl rtl/       # the exact command, or why it is not identical
+veritrace scorecard trace --rtl rtl/ [--mutation m.json --formal f.json --plan testplan.toml]
+
+veritrace note "..." [--signal S --at cN | --loc file.sv:42] [-f notes/x.vtnotes]
+veritrace share trace -o notes/bug.vtsession   # layout + notes + query, dump by hash
+veritrace restore notes/bug.vtsession trace    # ...on the other machine
 
 veritrace check trace --fail-on stuck,x,cdc,protocol,deadlock,memory,integrity  # the CI gate
 veritrace probes sig --format vivado|quartus
@@ -684,7 +835,10 @@ the tool stops finding them.
 |---|---|
 | `designs/fifo_async` | a clean synchronous FIFO — the baseline, 100% correlated |
 | `designs/fifo_buggy` | the same FIFO with `rd_rst_n` tied low, plus the log it produces |
-| `designs/lanes` | a for-generate and an instance array — the correlation stress case |
+| `designs/lanes` | a for-generate and an instance array — the correlation stress case, and the one memory deeper than it is wide |
+| `designs/cpu_top` | a two-stage RV32I subset with a register file read by a dynamic index — §5.6's own case, plus three injected bugs ([README](designs/cpu_top/README.md)) |
+| `designs/handshake` | a `ready` computed from `valid`: the one bug in this repo that **no waveform can show** ([README](designs/handshake/README.md)) |
+| `designs/multidriver` | two continuous assignments on one net: §8.1's `CONFLICT`, and an X that clears inside reset and comes back ([README](designs/multidriver/README.md)) |
 | `designs/checks` | **eleven deliberate flaws**, one per check ([README](designs/checks/README.md)) |
 | `designs/axi_lite` | a correct AXI4-Lite master and slave — the transaction fixture ([README](designs/axi_lite/README.md)) |
 | `designs/axi_arb` | two masters, an arbiter and real starvation ([README](designs/axi_arb/README.md)) |
@@ -696,6 +850,8 @@ the tool stops finding them.
 | `designs/synth_mismatch` | an incomplete sensitivity list: the RTL and the netlist genuinely disagree, and no RTL run can show it ([README](designs/synth_mismatch/README.md)) |
 | `designs/formal` | an AXI rule a solver breaks in four steps, and a branch proved unreachable ([README](designs/formal/README.md)) |
 | `designs/axi_lite/timing_summary.rpt` | a Vivado timing report with one violated path the run never switches — §8.30's false priority |
+| `designs/axi_lite/testplan.toml` | §8.37's coverage of intent, with one item the plan claims and the run does not show |
+| `designs/cocotb` | a real cocotb monitor — its log is what §8.34 ingests, with no protocol pack and no signal scan |
 
 ## Status
 
@@ -734,13 +890,49 @@ tier-A budget:
 
 ### FST support
 
-Off by default. `fstapi` compiles libfst from C and needs zlib plus libclang; on
-Linux that is `zlib1g-dev` and `libclang-dev`, on Windows it additionally wants
-a vcpkg install. VCD — the primary target — needs nothing extra.
+Off by default, and **partly broken on Windows** — measured, not assumed.
+
+`fstapi` compiles GTKWave's libfst from C and needs zlib plus libclang. On Linux
+that is `zlib1g-dev` and `libclang-dev`; on Windows it additionally wants vcpkg
+(`zlib`, `pthreads` and `mman`, triplet `x64-windows-static-md`) and a
+`LIBCLANG_PATH`. VCD — the primary target — needs none of it.
 
 ```sh
 cargo build --features vt-trace/fst
+maturin develop --features fst        # to reach it from Python
 ```
+
+**What actually happens on Windows/MSVC:** the value data reads correctly, and
+the *hierarchy* does not. `fstReaderRecreateHierFile` duplicates the file
+descriptor and hands it to `gzdopen` after "flushing" an input stream —
+undefined behaviour that glibc tolerates and the MSVC CRT does not; the scratch
+file libfst writes beside the dump comes out zero bytes long. So every signal
+name is lost while all 302 events of the fixture arrive intact.
+
+The reader **refuses** rather than converting anonymous events into a store that
+looks fine:
+
+```
+$ veritrace convert dump.fst
+Error: the FST hierarchy could not be read: the file declares 29 variable(s)
+and libfst returned 0. The value data is intact, so this is a limitation of the
+bundled libfst on this platform, not a corrupt dump — convert the same run to
+VCD instead.
+```
+
+`crates/vt-trace/tests/fst.rs` holds both halves of the contract: where the
+hierarchy reads, the FST store must match the VCD store signal for signal and
+event for event (§14.2's round-trip); where it does not, the failure must name
+the hierarchy. `designs/fifo_async/dump.fst` is the fixture — 1.2 KB, the same
+run as `dump.vcd`, produced with `vvp sim.vvp -fst`.
+
+**Icarus keeps the `$dumpfile` name whatever the format**, so `-fst` writes FST
+content into a file called `dump.vcd`. Rename it, or the extension lies.
+
+One more thing libfst does on Windows: it unpacks the hierarchy into a scratch
+file beside your dump and then unlinks it while the handle is still open, which
+Windows refuses — so a zero-byte `dump.fst.hier_<pid>_<addr>` is left behind on
+every read. `.gitignore` covers them; nothing in the tool depends on them.
 
 ### A note on `$dumpvars`
 
@@ -749,6 +941,31 @@ does not allow and only Icarus accepts. The reference testbenches guard it with
 `` `ifdef __ICARUS__ ``. VeriTrace also defines `VERITRACE` during elaboration,
 so `` `ifndef VERITRACE `` hides anything else from the graph without affecting
 simulation.
+
+## Documentation
+
+| | |
+|---|---|
+| [docs/SIMULATORS.md](docs/SIMULATORS.md) | installing each of the four, and the flags that are not optional |
+| [docs/PACKS.md](docs/PACKS.md) | teaching VeriTrace a bus it does not know — one TOML file, no code |
+| [docs/PLUGINS.md](docs/PLUGINS.md) | an analysis of your own that touches neither the core nor the UI |
+| [docs/INSTALARE.md](docs/INSTALARE.md) | the install and first-run guide, in Romanian |
+| `designs/*/README.md` | what bug each reference design carries, and which check is supposed to find it |
+
+## License
+
+**MIT** — see [LICENSE](LICENSE). Permissive for a concrete reason, not an
+ideological one: VeriTrace reads your RTL and your waveforms as *data*. It does
+not link into your design, and nothing it computes reaches a netlist, so its
+license cannot travel into your code by any route. Nobody should need legal
+review to run a debugger.
+
+**Everything VeriTrace generates is yours** —
+[LICENSE-GENERATED](LICENSE-GENERATED). Checkers from `gen-sva`, testbenches
+from `stimgen` and every other source file it emits are released under
+`CC0-1.0 OR MIT`, and each one carries that line in its own header. Keep them,
+edit them, ship them, relicense them, attribute nothing. The tool's MIT terms
+apply to the tool, never to its output.
 
 ## Development
 
@@ -759,5 +976,12 @@ make bench       # the tier-A budget
 make designs     # re-simulate every reference design
 ```
 
-**688 tests**: 71 Rust, 509 Python, 38 Vitest, 70 Playwright — with the
+**991 tests**: 72 Rust, 774 Python, 45 Vitest, 100 Playwright — 76 Rust with `--features fst` — with the
 acceptance criterion of each stage tested rather than asserted.
+
+Two of those suites are the ones worth knowing about. `tests/test_golden.py`
+reads an `expected.toml` beside each reference design and checks that `why()`
+lands on the root cause written there (§14.1) — adding a design means adding
+data, not code. `tests/test_properties.py` generates random 4-state values and
+checks the expression evaluator against a deliberately naive reference (§14.2),
+which is where the cases nobody thinks of come from.

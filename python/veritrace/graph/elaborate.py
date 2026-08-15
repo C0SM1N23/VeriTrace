@@ -59,6 +59,22 @@ class Diag:
     def is_error(self) -> bool:
         return self.severity == "error"
 
+    def downgraded(self) -> "Diag":
+        """The same diagnostic as a note, with why it stopped being an error.
+
+        §7.4b's rule: a module with no source is a boundary the tool is honest
+        about, not a failure. Keeping it an error would make a design that uses
+        encrypted IP — which is most designs that touch DDR or PCIe — open with
+        a wall of red about something nobody can fix.
+        """
+        return Diag(
+            code=self.code,
+            severity="note",
+            message=f"{self.message} — treated as a BLACKBOX_IP boundary (§7.4b)",
+            loc=self.loc,
+            symbol=self.symbol,
+        )
+
     def named_signal(self) -> str | None:
         """The signal this diagnostic is about, as a hierarchical path.
 
@@ -92,6 +108,10 @@ class Elaboration:
     parameters: dict[str, dict[str, "ParamValue"]] = field(default_factory=dict)
     #: Instance path -> module name, so the parameter tree can name each level.
     instances: dict[str, str] = field(default_factory=dict)
+    #: Sources withheld because they carry an encrypted P1735 block (§7.4b).
+    #: Reported, never silently dropped: "the tool could not see inside this" is
+    #: a different statement from "there was nothing there".
+    protected: list[Path] = field(default_factory=list)
 
     @property
     def errors(self) -> list[Diag]:
@@ -136,6 +156,30 @@ def _width(sym) -> tuple[int, bool]:
         if elem is not None:
             return int(getattr(elem, "bitWidth", 1) or 1), signed
     return int(getattr(t, "bitWidth", 1) or 1), signed
+
+
+def _depth(sym) -> int:
+    """Declared element count of an unpacked array; 0 when it is not one.
+
+    Needed because an *element index* is bounded by this and by nothing else
+    (§5.6). Deriving the bound from the element width instead calls `mem[8]`
+    out of range on a 64-entry memory of bytes, and deriving it from the
+    elements that reached the trace does the same as soon as a simulator
+    truncates the dump (Verilator's `--trace-max-array` defaults to 32).
+    """
+    t = getattr(sym, "type", None)
+    if t is None or not getattr(t, "isUnpackedArray", False):
+        return 0
+    # slang reports the flattened bit count and the element type; their ratio
+    # is the element count, and it survives multi-dimensional arrays where a
+    # range would only describe the outermost dimension.
+    elem = getattr(t, "elementType", None)
+    total = int(getattr(t, "bitstreamWidth", 0) or 0)
+    per = int(getattr(elem, "bitWidth", 0) or 0) if elem is not None else 0
+    if total and per:
+        return total // per
+    rng = getattr(t, "range", None)
+    return int(getattr(rng, "width", 0) or 0) if rng is not None else 0
 
 
 class _Elaborator:
@@ -203,6 +247,7 @@ class _Elaborator:
                 kind=_kind_of(sym, direction),
                 decl_loc=self.loc(sym),
                 has_initializer=getattr(sym, "initializer", None) is not None,
+                depth=_depth(sym),
             )
         )
 
@@ -394,12 +439,20 @@ class _Elaborator:
                 if target is not None:
                     target.unconnected = True
                 continue
-            outer_expr = _connected_expr(expr)
+            outer_expr, element = _connected_expr(expr)
             if outer_expr is None:
                 continue
             inner = self.sym_of(getattr(port, "internalSymbol", None) or port)
             outer = self.sym_of(outer_expr.getSymbolReference())
             if inner is None or outer is None or inner == outer:
+                continue
+            if element is not None:
+                # `.dout(lane_dout[i])` — one *element* of an array, and the
+                # index is a constant because the generate loop is elaborated.
+                # Recorded as `lane_dout[2] == g_lane[2].u_fifo.dout` so the
+                # correlator can find the word without tying the whole array to
+                # one lane (§7.1).
+                self.aliases.append((inner.path(), f"{outer.path()}[{element}]"))
                 continue
             self.aliases.append((inner.path(), outer.path()))
             # Deferred: the module body has not been visited yet, so the inner
@@ -480,25 +533,46 @@ def _to_diag(d, sm, engine) -> Diag:
     return Diag(code=code, severity=severity, message=message, loc=loc, symbol=symbol)
 
 
-def _connected_expr(expr):
-    """The outer signal of a port connection, or `None` if it is not one.
+def _connected_expr(expr) -> tuple[object | None, int | None]:
+    """`(outer signal, element index)` of a port connection.
 
     An *output* connection arrives as an `Assignment` writing the port into the
     outer signal, so the name is on its left; an input connection is the name
     itself. Missing the wrapper makes every output port invisible to both the
     alias table and the graph.
 
-    Only a whole-signal connection qualifies. `.dout(arr[i])` ties the port to
-    one element, and treating that as an equivalence for the whole array maps
-    every lane onto lane 0 (§7.1).
+    `.dout(arr[i])` connects one *element*, and the index comes back with it.
+    Treating that as an equivalence for the whole array would map every lane
+    onto lane 0 (§7.1); dropping it entirely — which is what happened before —
+    left the array uncorrelated instead.
     """
     if expr is None:
-        return None
+        return None, None
     if str(expr.kind).rsplit(".", 1)[-1] == "Assignment":
         expr = getattr(expr, "left", None)
         if expr is None:
-            return None
-    return expr if str(expr.kind).rsplit(".", 1)[-1] in ("NamedValue", "HierarchicalValue") else None
+            return None, None
+
+    element: int | None = None
+    if str(expr.kind).rsplit(".", 1)[-1] == "ElementSelect":
+        selector = getattr(expr, "selector", None)
+        value = getattr(selector, "constant", None) if selector is not None else None
+        # Only a constant index names one element. A dynamic one selects a
+        # different word every cycle and is not an equivalence at all.
+        if value is None:
+            return None, None
+        try:
+            element = int(str(value))
+        except ValueError:
+            return None, None
+        expr = getattr(expr, "value", None)
+        if expr is None:
+            return None, None
+
+    kind = str(expr.kind).rsplit(".", 1)[-1]
+    if kind not in ("NamedValue", "HierarchicalValue"):
+        return None, None
+    return expr, element
 
 
 def _definition_name(sym) -> str:
@@ -526,6 +600,23 @@ def _signal_events(timing) -> Iterable[object]:
     return ()
 
 
+#: IEEE P1735. Every vendor writes the same directive: Xilinx, Intel, Synopsys
+#: and Cadence all emit `` `pragma protect begin_protected ``.
+PROTECT = re.compile(rb"`pragma\s+protect\s+begin_protected", re.I)
+#: Read only the head of a file — the directive is in the header, and an
+#: encrypted IP can be megabytes of base64 nobody needs to scan.
+PROTECT_SCAN = 64 * 1024
+
+
+def is_protected(path: Path) -> bool:
+    """Whether `path` carries an encrypted P1735 block."""
+    try:
+        with open(path, "rb") as f:
+            return PROTECT.search(f.read(PROTECT_SCAN)) is not None
+    except OSError:
+        return False
+
+
 def elaborate(
     files: Sequence[str | Path],
     incdirs: Sequence[str | Path] = (),
@@ -543,6 +634,14 @@ def elaborate(
     missing = [str(p) for p in paths if not p.exists()]
     if missing:
         raise FileNotFoundError(f"no such RTL file(s): {', '.join(missing)}")
+
+    # §7.4b: encrypted IP is licensed content, and slang neither can nor should
+    # parse it. A protected file is withheld from the compilation, which leaves
+    # its modules unresolved — and an unresolved instance is already a
+    # BLACKBOX_IP terminal, so the boundary needs no second mechanism. The rest
+    # of the design stays completely analysable.
+    protected = [p for p in paths if is_protected(p)]
+    paths = [p for p in paths if p not in protected]
 
     # slang's own Driver already knows how to take include paths, defines and a
     # top module as command-line options, and how to load and parse sources.
@@ -570,6 +669,7 @@ def elaborate(
     sm = drv.sourceManager
     engine = pyslang.DiagnosticEngine(sm)
     raw = list(comp.getAllDiagnostics())
+    analysis_error = ""
     if analyse:
         # slang's dataflow pass is where `InferredLatch` and the multi-driver
         # findings come from. §8.11 says to aggregate an existing front end
@@ -577,9 +677,22 @@ def elaborate(
         # better than any pattern match over the statement tree would be.
         try:
             raw += list(drv.runAnalysis(comp).getDiagnostics())
-        except Exception:  # noqa: BLE001 - lint is a bonus, never a blocker (P7)
-            pass
+        except Exception as e:  # noqa: BLE001 - lint is a bonus, never a blocker (P7)
+            # Degrading is fine; degrading in silence is not. Without this line
+            # the inferred-latch and multi-driver checks simply produce nothing
+            # and the Checks tab looks like a clean design.
+            analysis_error = f"the dataflow analysis did not run: {e}"
     diags = [_to_diag(d, sm, engine) for d in raw]
+    if analysis_error:
+        diags.append(
+            Diag(
+                code="AnalysisUnavailable",
+                severity="note",
+                message=analysis_error + " — inferred latches and multi-driver "
+                "conflicts are not reported for this design",
+                loc=SourceLoc("", 0, 0),
+            )
+        )
 
     el = _Elaborator(sm)
     root = comp.getRoot()
@@ -590,12 +703,24 @@ def elaborate(
         el.visit_scope(inst.body)
     el.finish()
 
+    # §7.4b: an instantiation of a module with no source is a *boundary*, not an
+    # error. Recovered from the syntax tree, and the diagnostic is downgraded to
+    # match — a design that legitimately uses encrypted IP must not open with a
+    # wall of red.
+    unknown = _unknown_modules(diags)
+    if unknown:
+        _blackbox_boundary(paths, unknown, el.graph, el.graph.top)
+        diags = [
+            d.downgraded() if _UNKNOWN.search(d.message) else d for d in diags
+        ]
+
     return Elaboration(
         graph=el.graph,
         diagnostics=diags,
         aliases=el.aliases,
         parameters=el.parameters,
         instances=el.instances,
+        protected=protected,
     )
 
 
@@ -615,3 +740,119 @@ def discover(root: str | Path) -> list[Path]:
         for p in r.rglob("*")
         if p.suffix in RTL_SUFFIXES and p.is_file() and WORK_DIR not in p.parts
     )
+
+
+# --- §7.4b: modules with no source ------------------------------------------
+#
+# slang reports an instantiation of a module it cannot find as an *error* and
+# builds no symbol for it, so the elaborated AST has nothing to attach to. The
+# **syntax** tree still parses fine, and that is where the instance name and its
+# port connections are — so the boundary is recovered from there.
+#
+# What this buys is the difference between two very different statements. A wire
+# driven by an IP nobody can see reads as `never assigned` without this, which is
+# what a floating net reads as; with it, why-trace stops at the boundary and says
+# whose boundary it is.
+
+#: `secret_phy u_phy (.clk(clk), .ready(phy_ready));`
+_UNKNOWN = re.compile(r"unknown module '([^']+)'")
+
+
+def _unknown_modules(diags: list["Diag"]) -> set[str]:
+    return {m.group(1) for d in diags if (m := _UNKNOWN.search(d.message))}
+
+
+def _blackbox_boundary(
+    paths: list[Path], unknown: set[str], graph: DesignGraph, top: str
+) -> None:
+    """Register instances of `unknown` modules, and what they drive.
+
+    Walks the syntax tree rather than the elaborated one, because for these
+    modules there is no elaborated one. Only the *names* are taken — the type,
+    the instance and the signals connected to it — which is all §7.4b claims to
+    know about licensed content.
+    """
+    from pyslang import syntax as S
+
+    for path in paths:
+        try:
+            tree = S.SyntaxTree.fromText(
+                path.read_text(encoding="utf-8", errors="replace"), str(path)
+            )
+        except Exception:  # noqa: BLE001 - slang raises several unrelated types
+            continue
+        stack = [tree.root]
+        while stack:
+            node = stack.pop()
+            for child in node:
+                if isinstance(child, S.SyntaxNode):
+                    stack.append(child)
+            if node.kind != S.SyntaxKind.HierarchyInstantiation:
+                continue
+            module = str(node.type.valueText if hasattr(node.type, "valueText") else node.type)
+            if module not in unknown:
+                continue
+            for inst in node.instances:
+                name = getattr(getattr(inst, "decl", None), "name", None)
+                if name is None:
+                    continue
+                scope = f"{top}.{name.valueText}" if top else str(name.valueText)
+                graph.blackboxes[scope] = module
+                for signal in _connected(inst, top, graph):
+                    graph.blackbox_driven.add(signal)
+
+
+def _connected(inst: object, top: str, graph: DesignGraph) -> list[str]:
+    """Signals of the enclosing scope wired to this instance.
+
+    A named connection carries an expression; only a plain identifier is taken.
+    An expression like `.a(x & y)` connects several signals and none of them is
+    *the* driver, so claiming one would be worse than claiming none.
+
+    Direction cannot be read off an encrypted module, so it is inferred from the
+    design instead: a wire the black box drives is one **nothing else drives**.
+    A clock and a reset go *into* the IP and are driven from outside it, and
+    marking those would stop why-trace at the clock — which explains nothing.
+    """
+    out: list[str] = []
+    conns = getattr(inst, "connections", None) or ()
+    for conn in conns:
+        expr = getattr(conn, "expr", None) or getattr(conn, "expression", None)
+        text = str(expr).strip() if expr is not None else ""
+        if not text or not text.replace("_", "").isalnum():
+            continue
+        path = f"{top}.{text}" if top else text
+        sig = graph.get(path)
+        if sig is None or sig.drivers or sig.kind is Kind.PORT_IN:
+            continue
+        out.append(path)
+    return out
+
+
+def declares(sources: "Sequence[str | Path]", module: str) -> Path | None:
+    """The source file that declares `module`, or `None`.
+
+    Matched on the parsed declaration rather than on the file name: a module
+    called `fifo` is not reliably in `fifo.sv`. Two callers need this — §8.35
+    inserts cover statements into that file, and §8.29 replaces it with a
+    netlist — and both would get the wrong file by guessing.
+    """
+    from pyslang import syntax as S
+
+    for source in sources:
+        path = Path(source)
+        try:
+            tree = S.SyntaxTree.fromText(
+                path.read_text(encoding="utf-8", errors="replace"), str(path)
+            )
+        except Exception:  # noqa: BLE001 - slang raises several unrelated types
+            continue
+        stack = [tree.root]
+        while stack:
+            node = stack.pop()
+            if node.kind == S.SyntaxKind.ModuleDeclaration and node.header.name.valueText == module:
+                return path
+            for child in node:
+                if isinstance(child, S.SyntaxNode):
+                    stack.append(child)
+    return None

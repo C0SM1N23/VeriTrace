@@ -499,3 +499,83 @@ def test_why_without_a_question_says_what_to_type():
     got = CliRunner().invoke(main, ["why"])
     assert got.exit_code != 0
     assert "why needs a question" in got.output
+
+
+# --- §5.7 in the terminal ----------------------------------------------------
+
+
+def test_analysis_commands_warn_when_the_rtl_moved_on(tmp_path):
+    """§5.7's check, on the path a CI job and a script actually take.
+
+    The session had it; `veritrace why` did not, so the one place a stale dump
+    survives longest was also the one place nothing said so. A warning, never a
+    refusal — the spec is explicit that the answer is still offered.
+    """
+    from veritrace.api.sessions import LayoutFile, sha256_files
+
+    src = DESIGNS / "fifo_buggy"
+    work = tmp_path / "proj"
+    work.mkdir()
+    for name in ("dump.vcd", "fifo_buggy.sv", "tb_fifo_buggy.sv"):
+        shutil.copy(src / name, work / name)
+    vtx = work / "dump.vcd.vtx"
+    convert(str(work / "dump.vcd"), str(vtx))
+
+    rtl = sorted(work.glob("*.sv"))
+    from veritrace import TraceStore
+
+    layout = LayoutFile.for_trace(vtx)
+    data = layout.load()
+    data["provenance"] = {
+        "trace_sha256": TraceStore(str(vtx)).source_sha256,
+        "rtl_sha256": sha256_files(rtl),
+    }
+    layout.save(data)
+
+    runner = CliRunner()
+    args = [str(vtx), "--rtl", str(work), "why(tb_fifo_buggy.dut.full @ 455000)"]
+    clean = runner.invoke(main, ["why", *args])
+    assert clean.exit_code == 0
+    assert "has changed" not in clean.output
+
+    (work / "fifo_buggy.sv").write_text(
+        (work / "fifo_buggy.sv").read_text() + "\n// edited after the run\n"
+    )
+    stale = runner.invoke(main, ["why", *args])
+    assert stale.exit_code == 0, "a stale dump is a warning, not a refusal (§5.7)"
+    assert "the RTL has changed since this trace was made" in stale.output
+    # And the answer is still there, which is the half §5.7 insists on keeping.
+    assert "tb_fifo_buggy.dut.full" in stale.output
+
+
+def test_a_question_about_a_value_that_never_occurred_says_so(tmp_path):
+    vtx = tmp_path / "d.vtx"
+    convert(str(DESIGNS / "fifo_buggy" / "dump.vcd"), str(vtx))
+    runner = CliRunner()
+    out = runner.invoke(
+        main,
+        [
+            "why",
+            str(vtx),
+            "--rtl",
+            str(DESIGNS / "fifo_buggy"),
+            "why(tb_fifo_buggy.dut.full == 0 @ c45)",
+        ],
+    )
+    assert out.exit_code == 0
+    assert "the question assumed" in out.output
+
+
+def test_the_rest_api_accepts_a_raw_dump(tmp_path):
+    """§13: every entry point converts on the way in. The REST route was the
+    one that did not, and it reported a real file as missing."""
+    from fastapi.testclient import TestClient
+
+    from veritrace.api import create_app
+
+    raw = tmp_path / "dump.vcd"
+    shutil.copy(DESIGNS / "fifo_buggy" / "dump.vcd", raw)
+    with TestClient(create_app()) as c:
+        r = c.post("/session", json={"trace_path": str(raw)})
+        assert r.status_code == 200, r.text
+        assert r.json()["n_signals"] > 0

@@ -47,6 +47,10 @@ def default_layout() -> dict[str, Any]:
         "bookmarks": [],
         "cursors": [],
         "zoom": None,
+        # The causal question on screen. Part of the layout because P5 lists the
+        # query history as state that survives a reload, and because §13.8's
+        # `.vtsession` is mostly this one string — the tree under it is derived.
+        "query": "",
         # §11.4: a suppressed finding, and the mandatory reason for it. Without
         # the reason the list becomes a graveyard nobody dares to empty.
         "suppressions": {},
@@ -164,6 +168,9 @@ class Session:
     integrity_error: str = ""
     coverage: Any = None
     coverage_error: str = ""
+    #: §8.37's verification plan, when the project has a `testplan.toml`.
+    plan: Any = None
+    plan_error: str = ""
     #: Causal answers, keyed by `(signal, time)`. §8.2's minimisation, §8.3's
     #: repro and §12's report all re-ask the question the Causal tab has just
     #: answered; without this, pressing Replay rebuilds a tree that is already
@@ -180,7 +187,14 @@ class Session:
         if got is None:
             if len(self._why) >= WHY_CACHE:
                 self._why.clear()
-            got = WhyTracer(self.graph, self.store, txn_index=self.txn_index).why(signal, t)
+            start = (
+                self.store.time_range[0]
+                if getattr(self.config, "capture", False)
+                else None
+            )
+            got = WhyTracer(
+                self.graph, self.store, txn_index=self.txn_index, capture_start=start
+            ).why(signal, t)
             self._why[key] = got
         return got
 
@@ -202,9 +216,15 @@ class Session:
     ) -> Session:
         from veritrace import config as cfg
 
+        from veritrace import store as store_mod
+
         path = Path(trace_path)
         if not path.exists():
             raise FileNotFoundError(f"no such trace: {path}")
+        # §13: every entry point accepts a raw dump and converts it on the way
+        # in. Without this the REST API was the one door that did not, and it
+        # reported a real `.vcd` as a missing file.
+        path = store_mod.ensure(path)
         store = TraceStore(str(path))
         session = cls(
             session_id=session_id_for(path),
@@ -213,7 +233,11 @@ class Session:
             layout_file=LayoutFile.for_trace(path),
             rtl_paths=[str(p) for p in (rtl_paths or [])],
             top=top,
-            config=cfg.load_or_empty(path.parent),
+            # The project the server was started in decides its own settings;
+            # the trace's directory is only the fallback for a dump kept outside
+            # it. `cli._load` resolves it the same way, so the CLI and the
+            # interface never disagree about which config is in force.
+            config=cfg.load() or cfg.load_or_empty(path.parent),
         )
         if rtl_paths:
             session._load_rtl([Path(p) for p in rtl_paths], top)
@@ -257,6 +281,8 @@ class Session:
                 getattr(self.config, "root", None) or self.trace_path.parent
             ),
         )
+        # After the checks, because §8.37 items cite them (`check:stuck`).
+        self._plan()
         return self.report
 
     def _extract(self) -> None:
@@ -328,6 +354,25 @@ class Session:
         except Exception as e:  # noqa: BLE001 - one scan must not close the trace
             self.integrity = None
             self.integrity_error = str(e)
+
+    def _plan(self) -> None:
+        """§8.37 — the verification plan, cross-referenced against this run.
+
+        Found by convention next to the config, because a plan nobody has to
+        wire up is one that gets kept current. Absent is normal and silent.
+        """
+        from veritrace import plan as plan_mod
+
+        root = getattr(self.config, "root", None)
+        path = Path(root or ".") / "testplan.toml"
+        if not path.exists():
+            return
+        try:
+            self.plan = plan_mod.link(
+                plan_mod.load(path), coverage=self.coverage, checks=self.report
+            )
+        except Exception as e:  # noqa: BLE001 - a plan is a bonus, never a blocker (P7)
+            self.plan_error = str(e)
 
     def _coverage(self) -> None:
         """§8.21 and §8.12, on session open.
@@ -498,7 +543,12 @@ class SessionRegistry:
         rtl_paths: list[str] | None = None,
         top: str | None = None,
     ) -> Session:
-        sid = session_id_for(Path(trace_path))
+        from veritrace import store as store_mod
+
+        # Keyed on the store, not on what was typed: `dump.vcd` and the
+        # `dump.vcd.vtx` it converts to are one session, or opening the same
+        # trace by its two names would build the graph twice.
+        sid = session_id_for(store_mod.ensure(Path(trace_path)))
         existing = self._sessions.get(sid)
         if existing is not None:
             # Re-opening with RTL when the session was opened without it should

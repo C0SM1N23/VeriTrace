@@ -16,6 +16,7 @@ from typing import Any
 from veritrace import tools
 from veritrace.export import sva
 from veritrace.formal import harness, sby
+from veritrace.graph.elaborate import declares
 from veritrace.formal.model import FormalReport, Reachability
 from veritrace.protocol.model import Interface
 
@@ -145,7 +146,7 @@ def reach(
 
     # The file the DUT is declared in gets the covers; every other source is
     # staged unchanged.
-    home = _declares(sources, dut.module)
+    home = declares(sources, dut.module)
     if home is None:
         raise tools.ToolError(f"no source in this set declares module {dut.module}")
     clock = next(
@@ -266,21 +267,6 @@ def _endmodule(data: bytes, module: str) -> int | None:
             continue
         at = span(data, node.endmodule)
         return at[0] if at else None
-    return None
-
-
-def _declares(sources: list[Path], module: str) -> Path | None:
-    """The source file that declares `module`.
-
-    Matched on the parsed declaration rather than on the file name: a module
-    called `fifo` is not reliably in `fifo.sv`, and guessing wrong would insert
-    the covers into a file the design never reads — which reads as "unreachable"
-    for every hole.
-    """
-    for source in sources:
-        for node in _modules(Path(source).read_bytes()):
-            if node.header.name.valueText == module:
-                return Path(source)
     return None
 
 

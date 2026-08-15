@@ -52,6 +52,12 @@ TEMPLATES: dict[str, str] = {
     "cycle": "{sig} feeds back into itself; the walk stopped here rather than loop.",
     "depth_limit": "The walk hit its depth limit at {sig}; the cause is further upstream.",
     "not_traced": "{sig} is neither in the trace nor derivable from the RTL.",
+    # §8.11b — the capture is a window, and this is its front edge. The sentence
+    # says where the evidence stops, not what the design did.
+    "capture_boundary": (
+        "{sig} was already settled when the capture began, so its cause is "
+        "before the trigger window."
+    ),
 }
 
 #: Used when a reason has no entry. Deliberately dull, and it names the reason

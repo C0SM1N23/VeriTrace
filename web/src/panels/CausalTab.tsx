@@ -24,6 +24,8 @@ const REASON_TEXT: Record<string, string> = {
   depth_limit: "depth limit reached",
   blackbox_ip: "inside an IP with no source",
   not_traced: "not in the trace and not derivable",
+  // §8.11b — an on-board capture is a window, and this is its front edge.
+  capture_boundary: "already settled when the capture began",
   hold: "held: no driver was enabled",
   assigned: "assigned by an active driver",
   // §8.16 — the chain crossed into the transaction layer.
@@ -288,7 +290,18 @@ function Card({ node, depth }: { node: CausalNode; depth: number }) {
           ) : (
             <>
               <span className="card-sig mono">{node.signal}</span>
-              <span className="card-val mono">= {node.value}</span>
+              {/* §7.3: a value the graph computed because the signal never
+                  reached the dump is drawn differently from one that was
+                  measured. Presenting inference as observation is the one
+                  thing P2 does not allow. */}
+              <span className={`card-val mono${node.derived ? " derived" : ""}`}>
+                = {node.value}
+              </span>
+              {node.derived && (
+                <span className="card-derived" title="not in the trace — evaluated from the RTL">
+                  derived
+                </span>
+              )}
             </>
           )}
         </div>

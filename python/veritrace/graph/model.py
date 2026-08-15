@@ -235,6 +235,11 @@ class Signal:
     #: For a memory: element index -> trace handle. Simulators dump `mem[0]`,
     #: `mem[1]` and so on, never the array as a whole (§5.6).
     elements: dict[int, int] = field(default_factory=dict)
+    #: Declared element count of a memory, 0 for anything else. The *only*
+    #: honest bound on an element index (§5.6): `width` describes one element
+    #: and `elements` describes what the simulator chose to dump, so neither
+    #: says how many entries the RTL declared.
+    depth: int = 0
     #: `logic [3:0] x = 4'd7;` — the declaration initialiser. Present means the
     #: signal has a power-on value that synthesis may not honour (§8.11).
     has_initializer: bool = False
@@ -288,6 +293,10 @@ class DesignGraph:
     signals: dict[str, Signal] = field(default_factory=dict)
     #: Instance path -> module name, for BLACKBOX_IP reporting (§7.4b).
     blackboxes: dict[str, str] = field(default_factory=dict)
+    #: Signals of the *enclosing* scope that a black box drives. Without this a
+    #: wire coming out of encrypted IP reads as undriven, which is what a
+    #: floating net reads as — two very different statements about a design.
+    blackbox_driven: set[str] = field(default_factory=set)
     top: str = ""
     #: src path -> dst paths. Built on first `fanout` call and dropped by `add`,
     #: so it can never answer from a stale graph.

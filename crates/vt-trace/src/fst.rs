@@ -148,6 +148,27 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Trace> {
         }
     }
 
+    // The header says how many variables the file declares. If the hierarchy
+    // iterator produced fewer, libfst could not inflate the hierarchy block —
+    // and the values still arrive, so the result would be a store full of
+    // events belonging to signals with no names. That is worse than no answer:
+    // it converts, it reports success, and everything above it is nonsense.
+    //
+    // Seen on Windows/MSVC: `fstReaderRecreateHierFile` duplicates the file
+    // descriptor and hands it to `gzdopen`, having "flushed" an input stream —
+    // undefined behaviour that glibc tolerates and the MSVC CRT does not. The
+    // scratch file it writes beside the dump comes out zero bytes long.
+    let declared = r.var_count() as usize;
+    if trace.signals.len() < declared {
+        return Err(Error::Fst(format!(
+            "the FST hierarchy could not be read: the file declares {declared} variable(s) \
+             and libfst returned {}. The value data is intact, so this is a limitation of \
+             the bundled libfst on this platform, not a corrupt dump — convert the same \
+             run to VCD instead.",
+            trace.signals.len()
+        )));
+    }
+
     // Values. Without an explicit mask the reader emits nothing.
     r.set_mask_all();
     let mut t_min: Option<i64> = None;

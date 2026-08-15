@@ -267,6 +267,30 @@ def detect(
     return chosen
 
 
+def near_misses(store: Any, pack: Pack, limit: int = 3) -> list[tuple[str, list[str]]]:
+    """`(scope + prefix, suffixes that were not found)`, best candidates first.
+
+    A pack that matches nothing looks exactly like a protocol the design does
+    not use, and the cause is almost always one suffix spelled differently. This
+    is what turns that into a sentence — for `veritrace packs --trace`, and for
+    anyone writing a pack against docs/PACKS.md.
+
+    An empty `missing` list is a *complete* match that lost the specificity
+    contest in `detect` — AXI4's required signals are all present in an AXI4-Lite
+    design. Reporting it as "not in this trace" would be false, so it is kept.
+    """
+    out: list[tuple[int, str, list[str]]] = []
+    for scope, names in _scope_index(store).items():
+        for prefix in _prefixes(names, pack):
+            missing = [s for s in pack.detect.required_suffixes if (prefix + s).lower() not in names]
+            # Nothing found at all is not a near miss — it is a scope that has
+            # nothing to do with this bus.
+            if len(missing) < len(pack.detect.required_suffixes):
+                out.append((len(missing), f"{scope}.{prefix}".rstrip("."), missing))
+    out.sort(key=lambda x: (x[0], x[1]))
+    return [(where, missing) for _, where, missing in out[:limit]]
+
+
 def _glob(text: str, pattern: str) -> bool:
     return fnmatch.fnmatchcase(text, pattern)
 

@@ -77,6 +77,23 @@ class _Union:
         return groups
 
 
+def _element_of(path: str) -> tuple[str | None, int]:
+    """`top.arr[2]` -> `("top.arr", 2)`; anything else -> `(None, -1)`.
+
+    Only a trailing numeric subscript counts. An instance name such as
+    `g_lane[2]` sits mid-path and is part of the hierarchy, not a selection.
+    """
+    if not path.endswith("]"):
+        return None, -1
+    open_at = path.rfind("[")
+    if open_at <= 0:
+        return None, -1
+    inner = path[open_at + 1 : -1]
+    if not inner.lstrip("-").isdigit():
+        return None, -1
+    return path[:open_at], int(inner)
+
+
 def correlate(
     graph: DesignGraph,
     trace_paths: dict[str, int],
@@ -92,7 +109,15 @@ def correlate(
     # Equivalence classes, so a port and the net connected to it can stand in
     # for one another.
     uf = _Union()
+    element_aliases: dict[str, dict[int, str]] = defaultdict(dict)
     for a, b in aliases or []:
+        # `arr[2] == inst.port` is not an equivalence between two whole signals:
+        # unioning them would tie the entire array to one lane. It is an
+        # equivalence between one *element* and that port, kept aside.
+        base, idx = _element_of(b)
+        if base is not None:
+            element_aliases[normalize(base)][idx] = normalize(a)
+            continue
         uf.union(normalize(a), normalize(b))
     classes = uf.members()
 
@@ -105,6 +130,14 @@ def correlate(
         if handle is None:
             # A memory has no signal of its own; correlate its words.
             sig.elements = dict(by_element.get(normalize(sig.path), {}))
+            # An array wired to instance ports — `.dout(lane_dout[i])` — has one
+            # element per instance and no signal of its own in the dump either.
+            # The elaborator records each connection as `lane_dout[2] ==
+            # g_lane[2].u_fifo.dout`, so the words are found through the
+            # equivalence classes rather than by name (§7.1).
+            for idx, other in element_aliases.get(normalize(sig.path), {}).items():
+                if idx not in sig.elements and other in exact:
+                    sig.elements[idx] = exact[other]
             if sig.elements:
                 method = Method.ELEMENTS
         counts[method.value] += 1

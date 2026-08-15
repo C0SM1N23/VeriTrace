@@ -271,6 +271,33 @@ def test_prefix_inference_finds_a_bus_nobody_declared_a_prefix_for(axi_arb):
     assert any("valid" in s for i in found for s in i.signals)
 
 
+def test_a_near_miss_names_the_suffix_that_was_not_found(axi_lite):
+    """The pack author's whole debugging loop (docs/PACKS.md): one suffix spelt
+    differently rejects the interface, and silence is indistinguishable from a
+    bus the design does not have."""
+    store, *_ = axi_lite
+    typo = pack.loads(
+        'name = "House AXI"\n'
+        "[detect]\n"
+        'required_suffixes = ["awvalid", "awready", "awaddress"]\n'
+        'prefix_strip = [""]\n'
+        "[[channel]]\n"
+        'name = "AW"\nvalid = "awvalid"\nready = "awready"\n'
+        "[[transaction]]\n"
+        'name = "WRITE"\nstart = "AW"\n'
+    )
+    near = detect.near_misses(store, typo)
+    assert near and all(missing == ["awaddress"] for _where, missing in near)
+
+
+def test_a_pack_that_lost_on_specificity_is_not_reported_as_absent(axi_lite):
+    # Every signal AXI4 requires is present in an AXI4-Lite design; it loses the
+    # tie to the more specific pack. Saying "not in this trace" would be false.
+    store, *_ = axi_lite
+    (axi4,) = [p for p in pack.discover() if p.slug == "axi4"]
+    assert any(missing == [] for _where, missing in detect.near_misses(store, axi4))
+
+
 def test_a_scope_can_be_excluded_from_detection(axi_arb):
     store, _clock, _analysis, _ = axi_arb
     cfg = Config.empty()

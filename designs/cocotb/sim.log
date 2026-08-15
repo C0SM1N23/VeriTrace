@@ -1,0 +1,50 @@
+     -.--ns INFO     gpi                                ..mbed\gpi_embed.cpp:94   in _embed_init_python              Using Python 3.12.4 interpreter at K:\VeriTrace\.venv\Scripts\python.exe
+     -.--ns INFO     gpi                                ..\gpi\GpiCommon.cpp:79   in gpi_print_registered_impl       VPI registered
+     0.00ns INFO     cocotb                             Running on Icarus Verilog version 12.0 (devel)
+     0.00ns INFO     cocotb                             Seeding Python random module with supplied seed 1234
+     0.00ns INFO     cocotb                             Initialized cocotb v2.0.1 from K:\VeriTrace\.venv\Lib\site-packages\cocotb
+     0.00ns INFO     cocotb                             Running tests
+     0.00ns INFO     cocotb.regression                  running axi_mon.traffic (1/1)
+                                                            Eight writes and eight read-backs, so the log has both kinds.
+    40.00ns INFO     cocotb.axil_slave                  axi_mon WRITE_BEGIN addr=0x0 data=0xa0 strb=0xf
+    60.00ns INFO     cocotb.axil_slave                  axi_mon WRITE_END addr=0x0 resp=0
+    60.00ns INFO     cocotb.axil_slave                  axi_mon READ_BEGIN addr=0x0
+    80.00ns INFO     cocotb.axil_slave                  axi_mon READ_END addr=0x0 data=0xa0 resp=0
+    80.00ns INFO     cocotb.axil_slave                  axi_mon WRITE_BEGIN addr=0x4 data=0xa1 strb=0xf
+   100.00ns INFO     cocotb.axil_slave                  axi_mon WRITE_END addr=0x4 resp=0
+   100.00ns INFO     cocotb.axil_slave                  axi_mon READ_BEGIN addr=0x4
+   120.00ns INFO     cocotb.axil_slave                  axi_mon READ_END addr=0x4 data=0xa1 resp=0
+   120.00ns INFO     cocotb.axil_slave                  axi_mon WRITE_BEGIN addr=0x0 data=0xa2 strb=0xf
+   140.00ns INFO     cocotb.axil_slave                  axi_mon WRITE_END addr=0x0 resp=0
+   140.00ns INFO     cocotb.axil_slave                  axi_mon READ_BEGIN addr=0x0
+   160.00ns INFO     cocotb.axil_slave                  axi_mon READ_END addr=0x0 data=0xa2 resp=0
+   160.00ns INFO     cocotb.axil_slave                  axi_mon WRITE_BEGIN addr=0x4 data=0xa3 strb=0xf
+   180.00ns INFO     cocotb.axil_slave                  axi_mon WRITE_END addr=0x4 resp=0
+   180.00ns INFO     cocotb.axil_slave                  axi_mon READ_BEGIN addr=0x4
+   200.00ns INFO     cocotb.axil_slave                  axi_mon READ_END addr=0x4 data=0xa3 resp=0
+   200.00ns INFO     cocotb.axil_slave                  axi_mon WRITE_BEGIN addr=0x0 data=0xa4 strb=0xf
+   220.00ns INFO     cocotb.axil_slave                  axi_mon WRITE_END addr=0x0 resp=0
+   220.00ns INFO     cocotb.axil_slave                  axi_mon READ_BEGIN addr=0x0
+   240.00ns INFO     cocotb.axil_slave                  axi_mon READ_END addr=0x0 data=0xa4 resp=0
+   240.00ns INFO     cocotb.axil_slave                  axi_mon WRITE_BEGIN addr=0x4 data=0xa5 strb=0xf
+   260.00ns INFO     cocotb.axil_slave                  axi_mon WRITE_END addr=0x4 resp=0
+   260.00ns INFO     cocotb.axil_slave                  axi_mon READ_BEGIN addr=0x4
+   280.00ns INFO     cocotb.axil_slave                  axi_mon READ_END addr=0x4 data=0xa5 resp=0
+   280.00ns INFO     cocotb.axil_slave                  axi_mon WRITE_BEGIN addr=0x0 data=0xa6 strb=0xf
+   300.00ns INFO     cocotb.axil_slave                  axi_mon WRITE_END addr=0x0 resp=0
+   300.00ns INFO     cocotb.axil_slave                  axi_mon READ_BEGIN addr=0x0
+   320.00ns INFO     cocotb.axil_slave                  axi_mon READ_END addr=0x0 data=0xa6 resp=0
+   320.00ns INFO     cocotb.axil_slave                  axi_mon WRITE_BEGIN addr=0x4 data=0xa7 strb=0xf
+   340.00ns INFO     cocotb.axil_slave                  axi_mon WRITE_END addr=0x4 resp=0
+   340.00ns INFO     cocotb.axil_slave                  axi_mon READ_BEGIN addr=0x4
+   360.00ns INFO     cocotb.axil_slave                  axi_mon READ_END addr=0x4 data=0xa7 resp=0
+   440.00ns INFO     cocotb.axil_slave                  axi_mon DONE
+   440.00ns INFO     cocotb.regression                  axi_mon.traffic passed
+   440.00ns INFO     cocotb.regression                  **************************************************************************************
+                                                        ** TEST                          STATUS  SIM TIME (ns)  REAL TIME (s)  RATIO (ns/s) **
+                                                        **************************************************************************************
+                                                        ** axi_mon.traffic                PASS         440.00           0.00     184475.59  **
+                                                        **************************************************************************************
+                                                        ** TESTS=1 PASS=1 FAIL=0 SKIP=0                440.00           0.01      63504.14  **
+                                                        **************************************************************************************
+VCD info: dumping is suppressed.

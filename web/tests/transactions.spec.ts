@@ -106,30 +106,55 @@ test("clicking a transaction filters Wave to its interface and jumps to it", asy
   expect(rows.some((p) => p.endsWith("awvalid"))).toBeTruthy();
 });
 
-test("the list a click-through replaced can be brought back", async ({ page }) => {
+test("the list a click-through replaced can be brought back", async ({ page, request }) => {
   // §11.4b's focus is meant to help, not to cost someone the list they spent
   // ten minutes assembling. Every other move in the app is additive or
   // reversible; this one used to be a one-way door with no undo, and the
   // replacement was persisted, so a reload did not recover it either.
+  //
+  // The starting list is chosen here rather than inherited from whatever the
+  // previous test left behind: a click-through focuses on `m0`, so seeding with
+  // `m1` rows makes "the list changed" a real observation instead of a race
+  // against another spec's debounced layout save.
+  const listed = await (await request.get(`${BACKEND}/session/${sessionId}/signals`)).json();
+  const seed = (listed.signals as { handle: number; path: string }[])
+    .filter((s: { path: string }) => s.path.includes("m1"))
+    .slice(0, 3)
+    .map((s: { handle: number; path: string }) => ({
+      kind: "signal",
+      handle: s.handle,
+      path: s.path,
+    }));
+  expect(seed.length).toBeGreaterThan(0);
+  await request.put(`${BACKEND}/session/${sessionId}/layout`, {
+    data: { signals: seed, groups: [], radix: {}, bookmarks: [], cursors: [], zoom: null },
+  });
+
   await open(page);
   await page.locator('[data-testid="tab-1"]').click();
   const before = await page.$$eval('[data-testid="signal-row"]', (r) =>
     r.map((x) => x.getAttribute("data-path") ?? ""),
   );
-  expect(before.length).toBeGreaterThan(0);
+  expect(before).toEqual(seed.map((r: { path: string }) => r.path));
 
   await page.locator('[data-testid="tab-8"]').click();
+  // Wait for the band list to be on screen before clicking into it: the tab
+  // switch re-renders it, and clicking a band that is still being laid out
+  // focuses nothing, which used to fail this test roughly one full run in two.
+  await expect(page.locator('[data-testid^="txn-band-"]').first()).toBeVisible();
   await page.locator('[data-testid^="txn-band-"]').nth(3).click();
   await page.locator('[data-testid="tab-1"]').click();
+
+  // The way back is on screen, not a shortcut nobody would guess — and its
+  // appearance is also the signal that the focus actually happened, so it is
+  // awaited before the two lists are compared.
+  const back = page.locator('[data-testid="signal-focus-back"]');
+  await expect(back).toBeVisible();
 
   const focused = await page.$$eval('[data-testid="signal-row"]', (r) =>
     r.map((x) => x.getAttribute("data-path") ?? ""),
   );
   expect(focused).not.toEqual(before);
-
-  // The way back is on screen, not a shortcut nobody would guess.
-  const back = page.locator('[data-testid="signal-focus-back"]');
-  await expect(back).toBeVisible();
   await back.click();
   const restored = await page.$$eval('[data-testid="signal-row"]', (r) =>
     r.map((x) => x.getAttribute("data-path") ?? ""),

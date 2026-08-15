@@ -13,6 +13,7 @@ from pathlib import Path
 
 from veritrace import diff as diff_mod
 from veritrace import simulate
+from veritrace.graph.elaborate import declares
 from veritrace.synth.model import Instance, SynthDiff
 from veritrace.synth.yosys import Netlist, synthesise
 
@@ -49,9 +50,14 @@ def run(
         rtl_trace = rtl.dump
     out.rtl_trace = Path(rtl_trace)
 
-    # Step 3. The netlist replaces the RTL; the testbench is byte-identical.
+    # Step 3. The netlist replaces **only the file that declared the DUT**; the
+    # rest of the design stays as it was and the testbench is byte-identical.
+    # Replacing everything breaks any testbench that instantiates more than the
+    # one module being synthesised, which is most of them.
+    home = declares(sources, dut.module)
+    rest = [s for s in sources if home is None or Path(s).resolve() != home.resolve()]
     gate = simulate.icarus(
-        [netlist.path, *testbench], top, work / "gate", defines, incdirs,
+        [netlist.path, *rest, *testbench], top, work / "gate", defines, incdirs,
         timeout=timeout, run_dir=run_dir,
     )
     out.gate_trace = gate.dump

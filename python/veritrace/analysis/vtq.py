@@ -73,6 +73,17 @@ _WHY = re.compile(
     re.X | re.I,
 )
 
+#: The same question without the wrapper, which is how §13 writes it on the
+#: command line: `veritrace why dump.fst --rtl src/ "top.ctrl.ready == 0 @ c1247"`.
+#: Requiring `why(...)` there meant the spec's own example was rejected — while
+#: the error message quoted it back as the way to do it.
+_BARE = re.compile(
+    r"""^\s*(?P<signal>[\w.\[\]$\\]+)\s*
+        (?:(?P<op>==|!=)\s*(?P<value>[^@]+?)\s*)?
+        (?:@\s*(?P<cycle>c)?(?P<time>-?\d+)\s*)?$""",
+    re.X | re.I,
+)
+
 #: txn.<iface>.<KIND>[<n>][.<aspect>], where the interface may itself be dotted.
 _TXN_TARGET = re.compile(
     r"^txn\.(?P<iface>[\w.]+?)\.(?P<kind>[A-Za-z_]\w*)\[(?P<index>\d+)\]"
@@ -110,9 +121,28 @@ def _txn_ref(text: str) -> TxnRef | None:
     )
 
 
+def _looks_bare(text: str) -> bool:
+    """Whether `text` is §13's unwrapped question rather than a typo.
+
+    A hierarchical path, a time or a comparison — any one of them means someone
+    asked something. A lone word does not: `veritrace why why` should be an
+    error about the query, not a hunt for a signal called `why`.
+    """
+    if "(" in text or "|" in text:
+        return False  # some other query form, with its own parser and errors
+    return "." in text or "@" in text or "==" in text or "!=" in text
+
+
 def parse(text: str) -> WhyQuery:
-    """Parse a `why(...)` query, at signal or transaction level."""
+    """Parse a `why(...)` query, at signal or transaction level.
+
+    The bare form of §13 (`top.ctrl.ready == 0 @ c1247`) is accepted too, but
+    only when it cannot be another kind of query — `stalls(m0)` and friends have
+    to keep reaching their own parsers with their own error messages.
+    """
     m = _WHY.match(text or "")
+    if m is None and _looks_bare(text or ""):
+        m = _BARE.match(text)
     if not m:
         raise QueryError(
             "Only `why(signal @ time)` and `why(txn.iface.TYPE[n].not_issued)` "
@@ -128,6 +158,52 @@ def parse(text: str) -> WhyQuery:
         is_cycle=bool(m.group("cycle")),
         txn=_txn_ref(signal) if signal.startswith("txn.") else None,
     )
+
+
+def expectation(q: WhyQuery, observed: str) -> str | None:
+    """The note to print when the question assumed a value the trace disagrees with.
+
+    §8.1 carries `expected` for a reason: asking why a signal is 0 when it was
+    never 0 is a different question, and answering the one that *was* true
+    without a word is how someone spends an afternoon reading the wrong chain.
+    `None` means the question and the trace agree, or no value was given.
+    """
+    if q.value is None or not observed:
+        return None
+    want = _bits(q.value, len(observed))
+    got = observed.strip().lower()
+    if want is None:
+        return None
+    matches = (want == got) if q.op == "==" else (want != got)
+    if matches:
+        return None
+    verb = "is not" if q.op == "==" else "is"
+    return f"note: the question assumed {q.signal} {verb} {q.value}; the trace says {observed}"
+
+
+def _bits(text: str, width: int) -> str | None:
+    """A written value as canonical binary digits, or None if it is not one."""
+    t = text.strip().lower().replace("_", "")
+    if not t:
+        return None
+    if "'" in t:  # 4'b1010, 8'hff, 5'd9
+        _, _, rest = t.partition("'")
+        base, digits = (rest[0], rest[1:]) if rest[:1] in "bodh" else ("d", rest)
+    elif t.startswith("0x"):
+        base, digits = "h", t[2:]
+    elif t.startswith("0b"):
+        base, digits = "b", t[2:]
+    else:
+        base, digits = "d", t
+    try:
+        if base == "b":
+            # x and z survive as themselves: comparing them numerically would be
+            # a lie, and they are exactly the values worth asking about.
+            return digits.rjust(width, "0") if set(digits) <= set("01xz") else None
+        n = int(digits, {"h": 16, "o": 8, "d": 10}[base])
+    except (ValueError, KeyError):
+        return None
+    return format(n, "b").rjust(width, "0")
 
 
 # --- the general call form ---------------------------------------------------

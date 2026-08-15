@@ -77,6 +77,10 @@ class Config:
     # [trace]
     trace: str | None = None
     ignore: list[str] = field(default_factory=list)
+    #: §8.11b — this trace is an on-board capture, not a simulation. A window
+    #: has a front edge, and a causal chain that reaches it has run out of
+    #: evidence rather than out of design.
+    capture: bool = False
 
     # [ui]
     row_height: str = "compact"
@@ -93,6 +97,15 @@ class Config:
 
     # [triage]
     log_patterns: dict[str, str] = field(default_factory=dict)
+
+    # [ingest] — §8.34. A monitor that already records transactions makes the
+    # signal-level extraction redundant for its interface, so naming its log
+    # here is the whole configuration a team with one has to write.
+    ingest_cocotb_log: str | None = None
+    ingest_uvm_db: str | None = None
+    #: Same mechanism as `[triage] patterns`: named regexes, first match wins.
+    #: Empty means the built-in cocotb forms.
+    ingest_patterns: dict[str, str] = field(default_factory=dict)
 
     # [protocol] — §8.14. Empty `packs` means "try every pack on the search
     # path", which is what makes interface detection automatic; naming them is
@@ -187,6 +200,7 @@ def load(start: Path | str = ".") -> Config | None:
     triage = _table(data, "triage")
     proto = _table(data, "protocol")
     cov = _table(data, "coverage")
+    ing = _table(data, "ingest")
     defines = _table(design, "defines")
 
     return Config(
@@ -202,6 +216,7 @@ def load(start: Path | str = ".") -> Config | None:
         reset_active=str(reset.get("active") or "low"),
         trace=trace.get("default") or None,
         ignore=list(trace.get("ignore") or []),
+        capture=bool(trace.get("capture") or False),
         row_height=str(ui.get("row_height") or "compact"),
         radix_globs={str(k): str(v) for k, v in _table(ui, "radix").items()},
         default_tab=ui.get("default_tab") or None,
@@ -212,6 +227,9 @@ def load(start: Path | str = ".") -> Config | None:
         protocol_packs=[str(x) for x in (proto.get("packs") or [])],
         protocol_ignore=[str(x) for x in (proto.get("ignore") or [])],
         coverage_path=(str(cov.get("path")) if cov.get("path") else None),
+        ingest_cocotb_log=(str(ing.get("cocotb_log")) if ing.get("cocotb_log") else None),
+        ingest_uvm_db=(str(ing.get("uvm_db")) if ing.get("uvm_db") else None),
+        ingest_patterns={str(k): str(v) for k, v in _table(ing, "patterns").items()},
     )
 
 

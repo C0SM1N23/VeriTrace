@@ -1,0 +1,21 @@
+# §14.1's `gen_array`: no bug, correlation on generate blocks and instance
+# arrays. It is also the only reference design whose memory is deeper than it
+# is wide, which is what makes the index bound of §5.6 testable at all.
+design = "lanes"
+top = "tb_lanes"
+bug = "none"
+# Two memories are legitimately absent from the dump (the testbench dumps only
+# `mem[0]` of two lanes), so the bar is not 99. The array wired to the instance
+# ports — `lane_dout[i]` — *is* expected to correlate, element by element.
+correlation_min = 97
+
+[[why]]
+question = "why(tb_lanes.dut.g_lane[2].u_fifo.dout @ 200000)"
+# 64 entries of 8 bits: index 8 is legal. Calling it out of range — which is
+# what deriving the bound from the element width does — stops the chain at one
+# node with a confident, wrong answer.
+not_reason = "out_of_range"
+# The memory is not in the dump, and that has to be said rather than answered
+# around.
+reaches = "tb_lanes.dut.g_lane[2].u_fifo.mem[8]"
+detail_contains = "not in the trace"

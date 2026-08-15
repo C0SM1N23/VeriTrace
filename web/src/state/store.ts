@@ -232,6 +232,8 @@ export interface WaveState {
   stepEdge: (dir: 1 | -1) => Promise<void>;
   runWhy: (signalPath: string, t: number) => Promise<void>;
   runQueryText: (vtq: string) => Promise<void>;
+  /** Re-ask the question stored in the layout, without moving the user. */
+  restoreQuery: (vtq: string) => Promise<void>;
   openSource: (file: string, line?: number) => Promise<void>;
   selectCausal: (node: CausalNode) => void;
   clearCausal: () => void;
@@ -295,6 +297,9 @@ export function layoutFrom(s: WaveState): Layout {
     // ruler mode and row density, not just which signals were on screen.
     rulerMode: s.rulerMode,
     rowH: s.rowH,
+    // The question, not the answer: the tree is derivable from it, and this is
+    // the one field §13.8's `.vtsession` is really about.
+    query: s.causal?.query ?? "",
   };
 }
 
@@ -496,6 +501,9 @@ export const useWave = create<WaveState>((set, get) => ({
       // the checks, and the tab strip cannot show them before they are here.
       // The report is computed when the session opens, so this is one read.
       void get().loadChecks();
+      // P5 and §13.8: the question is part of the screen, so it is asked again.
+      const restored = typeof layout.query === "string" ? layout.query.trim() : "";
+      if (restored && status.has_rtl) void get().restoreQuery(restored);
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e), ready: false });
     }
@@ -623,6 +631,7 @@ export const useWave = create<WaveState>((set, get) => ({
     try {
       const res = await runQuery(s.session, `why(${signalPath} @ ${Math.round(t)})`);
       set({ causal: res, causalBusy: false, activeNode: nodeId(res.root) });
+      schedulePersist(get);
       const loc = res.root.loc;
       if (loc) void get().openSource(loc.file, loc.line);
     } catch (e) {
@@ -679,6 +688,7 @@ export const useWave = create<WaveState>((set, get) => ({
     try {
       const res = await runQuery(s.session, text);
       set({ causal: res, causalBusy: false, activeNode: nodeId(res.root), cursor: res.time });
+      schedulePersist(get);
       if (res.root.loc) void get().openSource(res.root.loc.file, res.root.loc.line);
     } catch (e) {
       set({
@@ -689,7 +699,31 @@ export const useWave = create<WaveState>((set, get) => ({
     }
   },
 
-  clearCausal: () =>
+  /**
+   * Re-ask the saved question when a session opens (P5, §13.8).
+   *
+   * Re-running beats storing the tree: the answer has to come from *this* dump,
+   * and a restored session that painted a colleague's tree over your data would
+   * be the one lie this tool cannot afford.
+   *
+   * It deliberately does not move the user. §11.4b gives the server the last
+   * word on which tab a session opens on, so a restored session is a question
+   * with its answer already waiting, not a hijacked landing page — and a query
+   * that no longer resolves (the dump moved on) stays quiet, because nobody in
+   * this session asked it.
+   */
+  restoreQuery: async (text) => {
+    const s = get();
+    if (!s.session) return;
+    try {
+      const res = await runQuery(s.session, text);
+      set({ causal: res, activeNode: nodeId(res.root) });
+    } catch {
+      /* silent by design — see above */
+    }
+  },
+
+  clearCausal: () => {
     set({
       causal: null,
       causalError: null,
@@ -697,7 +731,10 @@ export const useWave = create<WaveState>((set, get) => ({
       subtrace: null,
       repro: null,
       replay: false,
-    }),
+    });
+    // Clearing has to be persisted too, or the question comes back on reload.
+    schedulePersist(get);
+  },
 
   // --- §8.2, §8.3, §11.5 — subtrace, repro, replay ---------------------
 

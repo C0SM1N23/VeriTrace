@@ -199,3 +199,20 @@ def test_unknown_method_counts_are_reported(tmp_path):
     _, _, rep = run(tmp_path, LANES_RTL, DESIGNS / "lanes" / "dump.vcd", "lanes2")
     assert rep.by_method.get(Method.EXACT.value, 0) > 50
     assert sum(rep.by_method.values()) == rep.total
+
+
+def test_an_array_wired_to_instance_ports_correlates_element_by_element(tmp_path):
+    """§7.1's port-renaming row, for the case where the outer name is indexed.
+
+    `.dout(lane_dout[i])` in a generate loop gives every lane its own element of
+    one array. Treating that as an equivalence for the whole array would map
+    every lane onto lane 0; ignoring it — which is what happened before — left
+    the array uncorrelated and the signal missing from the interface.
+    """
+    el, store, _rep = run(tmp_path, LANES_RTL, DESIGNS / "lanes" / "dump.vcd", "lanes")
+    arr = el.graph.get("tb_lanes.dut.lane_dout")
+    assert arr is not None and arr.trace_handle is None, "fixture changed shape"
+    assert len(arr.elements) >= 2, "the array was not correlated through its ports"
+    # And each element points at the port of *its own* lane, not lane 0's.
+    for idx, handle in arr.elements.items():
+        assert f"g_lane[{idx}]" in store.signal(handle).path

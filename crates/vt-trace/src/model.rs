@@ -180,6 +180,40 @@ impl ValueColumn {
         }
     }
 
+    /// Move `other`'s rows onto the end of this column.
+    ///
+    /// The X/Z plane is stored lazily — it stays empty until a signal is first
+    /// unknown — so the two columns can disagree about whether it exists. Both
+    /// directions are filled in here, which is what keeps the row counts of
+    /// `a` and `b` in step after a parallel parse.
+    pub fn append(&mut self, other: &mut ValueColumn) {
+        match (self, other) {
+            (
+                ValueColumn::Bits { words, a, b, .. },
+                ValueColumn::Bits { a: oa, b: ob, .. },
+            ) => {
+                let self_rows = a.len() / *words;
+                let other_rows = oa.len() / *words;
+                if !ob.is_empty() && b.is_empty() {
+                    b.resize(self_rows * *words, 0);
+                }
+                a.append(oa);
+                if !b.is_empty() {
+                    if ob.is_empty() {
+                        b.resize(b.len() + other_rows * *words, 0);
+                    } else {
+                        b.append(ob);
+                    }
+                }
+            }
+            (ValueColumn::Real(col), ValueColumn::Real(o)) => col.append(o),
+            (ValueColumn::Str(col), ValueColumn::Str(o)) => col.append(o),
+            // Two columns of different kinds cannot describe one stream: the
+            // kind comes from the declaration, which both sides shared.
+            _ => {}
+        }
+    }
+
     pub fn push(&mut self, v: &Value) {
         match (self, v) {
             (ValueColumn::Bits { width, words, a, b }, Value::Bits { a: va, b: vb, .. }) => {
@@ -322,6 +356,33 @@ impl EventStream {
 
     pub fn is_empty(&self) -> bool {
         self.times.is_empty()
+    }
+
+    /// Move `other`'s events onto the end of this stream.
+    ///
+    /// Used to stitch the chunks of a parallel parse back together. The only
+    /// subtlety is the seam: if the last event here and the first event there
+    /// share a timestamp, the delta indices of §5.5 have to continue counting
+    /// instead of restarting at zero, or `value_at` would return the wrong one
+    /// of the two writes as the settled value.
+    pub fn append(&mut self, other: &mut EventStream) {
+        if other.is_empty() {
+            return;
+        }
+        if let (Some(&last_t), Some(&first_t)) = (self.times.last(), other.times.first()) {
+            if last_t == first_t {
+                let bump = self.deltas.last().copied().unwrap_or(0).saturating_add(1);
+                for i in 0..other.times.len() {
+                    if other.times[i] != first_t {
+                        break;
+                    }
+                    other.deltas[i] = other.deltas[i].saturating_add(bump);
+                }
+            }
+        }
+        self.times.append(&mut other.times);
+        self.deltas.append(&mut other.deltas);
+        self.values.append(&mut other.values);
     }
 
     /// Append a transition, assigning its delta index within `t`.

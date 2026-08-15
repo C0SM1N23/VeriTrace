@@ -1,0 +1,244 @@
+$date
+	Sat Aug 15 11:18:40 2026
+$end
+$version
+	Icarus Verilog
+$end
+$timescale
+	1ps
+$end
+$scope module tb_handshake $end
+$var wire 1 ! wready $end
+$var wire 1 " rvalid $end
+$var wire 32 # rdata [31:0] $end
+$var wire 1 $ bvalid $end
+$var wire 1 % awready $end
+$var wire 1 & arready $end
+$var reg 32 ' araddr [31:0] $end
+$var reg 1 ( arvalid $end
+$var reg 32 ) awaddr [31:0] $end
+$var reg 1 * awvalid $end
+$var reg 1 + bready $end
+$var reg 1 , clk $end
+$var reg 1 - rready $end
+$var reg 1 . rst_n $end
+$var reg 32 / wdata [31:0] $end
+$var reg 1 0 wvalid $end
+$scope module dut $end
+$var wire 1 , clk $end
+$var wire 1 . rst_n $end
+$var wire 32 1 s_axi_araddr [31:0] $end
+$var wire 1 & s_axi_arready $end
+$var wire 1 ( s_axi_arvalid $end
+$var wire 32 2 s_axi_awaddr [31:0] $end
+$var wire 1 * s_axi_awvalid $end
+$var wire 1 + s_axi_bready $end
+$var wire 1 - s_axi_rready $end
+$var wire 32 3 s_axi_wdata [31:0] $end
+$var wire 1 ! s_axi_wready $end
+$var wire 1 0 s_axi_wvalid $end
+$var reg 1 4 busy $end
+$var reg 1 % s_axi_awready $end
+$var reg 1 $ s_axi_bvalid $end
+$var reg 32 5 s_axi_rdata [31:0] $end
+$var reg 1 " s_axi_rvalid $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+$comment Show the parameter values. $end
+$dumpall
+$end
+#0
+$dumpvars
+bx 5
+x4
+b10100101 3
+b1000000 2
+b1000000 1
+00
+b10100101 /
+0.
+1-
+0,
+1+
+0*
+b1000000 )
+0(
+b1000000 '
+x&
+x%
+x$
+bx #
+x"
+0!
+$end
+#5000
+1&
+0%
+b0 #
+b0 5
+0"
+0$
+04
+1,
+#10000
+0,
+#12000
+1.
+#15000
+1%
+1*
+1,
+#20000
+0,
+#25000
+0!
+14
+10
+0*
+1,
+#30000
+0,
+#35000
+04
+0%
+00
+1,
+#40000
+0,
+#45000
+1%
+1(
+1,
+#50000
+0,
+#55000
+0&
+b1000000 #
+b1000000 5
+1"
+0(
+1,
+#60000
+0,
+#65000
+1&
+0"
+1*
+1,
+#70000
+0,
+#75000
+0!
+14
+10
+0*
+1,
+#80000
+0,
+#85000
+0%
+04
+00
+1,
+#90000
+0,
+#95000
+1%
+1(
+1,
+#100000
+0,
+#105000
+0&
+1"
+0(
+1,
+#110000
+0,
+#115000
+1&
+0"
+1*
+1,
+#120000
+0,
+#125000
+0!
+14
+10
+0*
+1,
+#130000
+0,
+#135000
+04
+0%
+00
+1,
+#140000
+0,
+#145000
+1%
+1(
+1,
+#150000
+0,
+#155000
+0&
+1"
+0(
+1,
+#160000
+0,
+#165000
+1&
+0"
+1*
+1,
+#170000
+0,
+#175000
+0!
+14
+10
+0*
+1,
+#180000
+0,
+#185000
+0%
+04
+00
+1,
+#190000
+0,
+#195000
+1%
+1(
+1,
+#200000
+0,
+#205000
+0&
+1"
+0(
+1,
+#210000
+0,
+#215000
+1&
+0"
+1,
+#220000
+0,
+#225000
+1,
+#230000
+0,
+#235000
+1,
+#240000
+0,
+#245000
+1,

@@ -90,11 +90,15 @@ def _survives_reset(store: Any, handle: int, first_x: int, settle: int) -> bool:
     separates the two is whether the X is still present after the reset window:
     an X that clears is the design initialising, an X that persists is a bug.
     The reported time stays the first appearance, which is what §8.5 asks for.
+
+    "Still present" means *anywhere* after the window, not at one sampled
+    instant. Sampling only `settle` loses every X that clears during reset and
+    comes back later — a driver conflict or an out-of-range index does not wait
+    for reset to be over, and those were silently absent from the report.
     """
     if first_x >= settle:
         return True
-    value = store.value_at(handle, settle)
-    return value is not None and not value.is_two_state()
+    return store.first_x_from(handle, settle) is not None
 
 
 def scan(

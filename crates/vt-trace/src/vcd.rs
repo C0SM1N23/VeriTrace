@@ -15,6 +15,8 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::Path;
 
+use rayon::prelude::*;
+
 use crate::model::{EventStream, Kind, Scope, Signal, SignalId, Time, Timescale, Trace};
 use crate::value::{parse_vcd_scalar, parse_vcd_vector, Value};
 use crate::{Error, Result};
@@ -163,11 +165,131 @@ pub(crate) fn array_index_of(name: &str) -> Option<i64> {
 
 pub fn parse_file(path: impl AsRef<Path>) -> Result<Trace> {
     let f = File::open(path)?;
-    parse_reader(BufReader::with_capacity(1 << 20, f))
+    // Mapped rather than read: the value-change section is then a byte slice
+    // several threads can walk at once, and the pages a worker touches are the
+    // only ones that become resident.
+    match unsafe { memmap2::Mmap::map(&f) } {
+        Ok(m) => parse_bytes(&m),
+        // A mapping can fail for a file on an odd filesystem; the streaming
+        // path still works and gives the same answer, only slower.
+        Err(_) => parse_reader(BufReader::with_capacity(1 << 20, f)),
+    }
 }
 
 pub fn parse_str(s: &str) -> Result<Trace> {
-    parse_reader(io::Cursor::new(s.as_bytes()))
+    parse_bytes(s.as_bytes())
+}
+
+/// Smallest value-change section worth splitting. Below this the threads cost
+/// more than they save, and every unit test stays on one deterministic path.
+const PARALLEL_MIN_BYTES: usize = 4 << 20;
+
+/// Parse a whole VCD held in memory, in parallel over the value changes.
+///
+/// §4.2 budgets conversion at "< 45 s (paralel, rayon)" for a gigabyte, and the
+/// parse was the serial half of it. Splitting is safe because the section has
+/// exactly one structure: a sequence of `#time` blocks. Cutting only at a
+/// newline followed by `#` gives every worker a self-contained run of blocks
+/// that starts by setting its own time, and appending the workers' streams in
+/// chunk order reproduces the serial result event for event — including the
+/// delta indices of §5.5, which `EventStream::append` renumbers across a seam.
+pub fn parse_bytes(data: &[u8]) -> Result<Trace> {
+    let split = match header_end(data) {
+        Some(i) if data.len() - i >= PARALLEL_MIN_BYTES => i,
+        _ => return parse_reader(io::Cursor::new(data)),
+    };
+
+    // Declarations are small and strictly sequential, so they stay serial.
+    let mut lx = Lexer::new(io::Cursor::new(&data[..split]));
+    let mut trace = Trace::default();
+    let mut codes = CodeTable::default();
+    let mut stack: Vec<u32> = Vec::new();
+    let mut stream_width: Vec<u32> = Vec::new();
+    read_declarations(&mut lx, &mut trace, &mut codes, &mut stack, &mut stream_width)?;
+
+    let n = rayon::current_num_threads().clamp(1, 64);
+    let bounds = split_at_timestamps(data, split, n);
+    if bounds.len() < 2 {
+        return parse_reader(io::Cursor::new(data));
+    }
+
+    let kinds: Vec<Kind> = trace.signals.iter().map(|s| s.kind).collect();
+    let mut per_chunk: Vec<Result<(Vec<EventStream>, ChangeState)>> = Vec::new();
+    bounds
+        .par_windows(2)
+        .map(|w| {
+            let mut streams: Vec<EventStream> = stream_width
+                .iter()
+                .enumerate()
+                .map(|(i, &wd)| EventStream::new(wd, kinds.get(i).copied().unwrap_or(Kind::Wire)))
+                .collect();
+            let mut st = ChangeState::default();
+            let mut lx = Lexer::new(io::Cursor::new(&data[w[0]..w[1]]));
+            parse_changes(&mut lx, &mut streams, &codes, &stream_width, &mut st)?;
+            Ok((streams, st))
+        })
+        .collect_into_vec(&mut per_chunk);
+
+    let mut first: Option<Time> = None;
+    let mut t_max = Time::MIN;
+    let mut saw_time = false;
+    for chunk in per_chunk {
+        let (mut streams, st) = chunk?;
+        for (dst, src) in trace.streams.iter_mut().zip(streams.iter_mut()) {
+            dst.append(src);
+        }
+        if st.saw_time {
+            saw_time = true;
+            first = first.or(st.first);
+            t_max = t_max.max(st.t_max);
+        }
+    }
+    trace.t_min = first.unwrap_or(0);
+    trace.t_max = if saw_time { t_max } else { trace.t_min };
+    Ok(trace)
+}
+
+/// Byte offset just past `$enddefinitions ... $end`, if the file has one.
+fn header_end(data: &[u8]) -> Option<usize> {
+    let at = find(data, b"$enddefinitions")?;
+    let end = find(&data[at..], b"$end")? + at;
+    Some(end + 4)
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Chunk boundaries for the value-change section: `n` roughly equal pieces,
+/// each starting at a `#` that begins a line.
+fn split_at_timestamps(data: &[u8], start: usize, n: usize) -> Vec<usize> {
+    let mut out = vec![start];
+    if n <= 1 {
+        return vec![start, data.len()];
+    }
+    let step = (data.len() - start) / n;
+    let mut at = start;
+    for _ in 1..n {
+        at += step;
+        if at >= data.len() {
+            break;
+        }
+        // Forward to the next line that opens a timestamp. A `#` anywhere else
+        // is part of a value or an identifier, so the newline is what makes the
+        // boundary unambiguous.
+        match data[at..].windows(2).position(|w| w[0] == b'\n' && w[1] == b'#') {
+            Some(off) => {
+                let cut = at + off + 1;
+                if cut > *out.last().unwrap() {
+                    out.push(cut);
+                    at = cut;
+                }
+            }
+            None => break,
+        }
+    }
+    out.push(data.len());
+    out
 }
 
 pub fn parse_reader<R: Read>(r: R) -> Result<Trace> {
@@ -178,10 +300,24 @@ pub fn parse_reader<R: Read>(r: R) -> Result<Trace> {
     // reopens them to declare array words), so entries are found-or-created.
     let mut stack: Vec<u32> = Vec::new();
     let mut stream_width: Vec<u32> = Vec::new();
-    let mut t: Time = 0;
-    let mut saw_time = false;
-    let mut first_time: Option<Time> = None;
+    if read_declarations(&mut lx, &mut trace, &mut codes, &mut stack, &mut stream_width)? {
+        let mut st = ChangeState::default();
+        parse_changes(&mut lx, &mut trace.streams, &codes, &stream_width, &mut st)?;
+        trace.t_min = st.first.unwrap_or(0);
+        trace.t_max = if st.saw_time { st.t_max } else { trace.t_min };
+    }
+    Ok(trace)
+}
 
+/// Everything up to `$enddefinitions`. Returns whether that marker was reached,
+/// so a header-only slice and a whole file share one implementation.
+fn read_declarations<R: Read>(
+    lx: &mut Lexer<R>,
+    trace: &mut Trace,
+    codes: &mut CodeTable,
+    stack: &mut Vec<u32>,
+    stream_width: &mut Vec<u32>,
+) -> Result<bool> {
     while lx.next()? {
         let line = lx.line;
         if lx.tok.is_empty() {
@@ -191,18 +327,18 @@ pub fn parse_reader<R: Read>(r: R) -> Result<Trace> {
             b'$' => {
                 let kw = String::from_utf8_lossy(&lx.tok[1..]).to_string();
                 match kw.as_str() {
-                    "date" => trace.date = Some(read_text(&mut lx, line)?),
-                    "version" => trace.version = Some(read_text(&mut lx, line)?),
+                    "date" => trace.date = Some(read_text(lx, line)?),
+                    "version" => trace.version = Some(read_text(lx, line)?),
                     "comment" => {
-                        read_text(&mut lx, line)?;
+                        read_text(lx, line)?;
                     }
                     "timescale" => {
-                        let text = read_text(&mut lx, line)?;
+                        let text = read_text(lx, line)?;
                         trace.timescale = parse_timescale(&text)
                             .ok_or_else(|| err(line, format!("bad timescale {text:?}")))?;
                     }
                     "scope" => {
-                        let parts = read_tokens(&mut lx, line)?;
+                        let parts = read_tokens(lx, line)?;
                         let kind = parts.first().cloned().unwrap_or_else(|| "module".into());
                         let name = parts.get(1).cloned().unwrap_or_default();
                         let parent = stack.last().copied();
@@ -220,11 +356,11 @@ pub fn parse_reader<R: Read>(r: R) -> Result<Trace> {
                         stack.push(idx);
                     }
                     "upscope" => {
-                        read_tokens(&mut lx, line)?;
+                        read_tokens(lx, line)?;
                         stack.pop();
                     }
                     "var" => {
-                        let parts = read_tokens(&mut lx, line)?;
+                        let parts = read_tokens(lx, line)?;
                         if parts.len() < 4 {
                             return Err(err(line, "$var needs type, width, code and name"));
                         }
@@ -265,7 +401,11 @@ pub fn parse_reader<R: Read>(r: R) -> Result<Trace> {
                         });
                     }
                     "enddefinitions" => {
-                        read_tokens(&mut lx, line)?;
+                        read_tokens(lx, line)?;
+                        // Declarations are over. What follows is value changes,
+                        // and one implementation of those serves both the serial
+                        // reader and the parallel one (`parse_bytes`).
+                        return Ok(true);
                     }
                     // Value-carrying sections. Their contents are ordinary value
                     // changes, handled by the main loop; the closing $end is a
@@ -273,19 +413,64 @@ pub fn parse_reader<R: Read>(r: R) -> Result<Trace> {
                     "dumpall" | "dumpvars" | "dumpon" | "dumpoff" | "end" => {}
                     _ => {
                         // Unknown section: skip to its $end if it has one.
-                        read_text(&mut lx, line)?;
+                        read_text(lx, line)?;
                     }
+                }
+            }
+            // A value change before `$enddefinitions` is not legal VCD; nothing
+            // reaches here in a well-formed file, and skipping beats guessing.
+            _ => {}
+        }
+    }
+
+    Ok(false)
+}
+
+/// Time bookkeeping while walking the value-change section.
+#[derive(Default, Clone)]
+struct ChangeState {
+    t: Time,
+    saw_time: bool,
+    first: Option<Time>,
+    t_max: Time,
+}
+
+/// The value-change section: `#time`, scalar and vector changes.
+///
+/// Extracted so the serial reader and each worker of `parse_bytes` run the
+/// *same* grammar. A second copy would be a second place for the delta-cycle
+/// rule of §5.5 to drift.
+fn parse_changes<R: Read>(
+    lx: &mut Lexer<R>,
+    streams: &mut [EventStream],
+    codes: &CodeTable,
+    stream_width: &[u32],
+    st: &mut ChangeState,
+) -> Result<()> {
+    while lx.next()? {
+        let line = lx.line;
+        if lx.tok.is_empty() {
+            continue;
+        }
+        match lx.tok[0] {
+            b'$' => {
+                // `$dumpvars`/`$dumpall`/`$dumpon`/`$dumpoff` wrap ordinary
+                // changes and their `$end` is a no-op; anything else is skipped
+                // to its own `$end`.
+                let kw = String::from_utf8_lossy(&lx.tok[1..]).to_string();
+                if !matches!(kw.as_str(), "dumpall" | "dumpvars" | "dumpon" | "dumpoff" | "end") {
+                    read_text(lx, line)?;
                 }
             }
             b'#' => {
                 let s = std::str::from_utf8(&lx.tok[1..]).map_err(|_| err(line, "bad time"))?;
-                t = s.parse().map_err(|_| err(line, format!("bad time {s:?}")))?;
-                saw_time = true;
-                if first_time.is_none() {
-                    first_time = Some(t);
+                st.t = s.parse().map_err(|_| err(line, format!("bad time {s:?}")))?;
+                st.saw_time = true;
+                if st.first.is_none() {
+                    st.first = Some(st.t);
                 }
-                if t > trace.t_max {
-                    trace.t_max = t;
+                if st.t > st.t_max {
+                    st.t_max = st.t;
                 }
             }
             b'b' | b'B' | b'r' | b'R' | b's' | b'S' => {
@@ -311,7 +496,7 @@ pub fn parse_reader<R: Read>(r: R) -> Result<Trace> {
                     }
                     _ => Value::Str(String::from_utf8_lossy(&digits).to_string()),
                 };
-                trace.streams[stream].push(t, &v);
+                streams[stream].push(st.t, &v);
             }
             _ => {
                 // Scalar change: value character followed by the code with no
@@ -326,17 +511,12 @@ pub fn parse_reader<R: Read>(r: R) -> Result<Trace> {
                     continue;
                 }
                 if let Some(stream) = codes.get(code) {
-                    trace.streams[stream as usize].push(t, &v);
+                    streams[stream as usize].push(st.t, &v);
                 }
             }
         }
     }
-
-    trace.t_min = first_time.unwrap_or(0);
-    if !saw_time {
-        trace.t_max = trace.t_min;
-    }
-    Ok(trace)
+    Ok(())
 }
 
 /// Read tokens until `$end`, returning them joined by single spaces.

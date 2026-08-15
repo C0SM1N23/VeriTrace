@@ -1,0 +1,101 @@
+$date
+	Sat Aug 15 09:54:24 2026
+$end
+$version
+	Icarus Verilog
+$end
+$timescale
+	1ps
+$end
+$scope module tb_multidriver $end
+$var wire 1 ! tied_off $end
+$var wire 1 " y $end
+$var reg 1 # a $end
+$var reg 1 $ b $end
+$var reg 1 % clk $end
+$var reg 1 & rst_n $end
+$scope module dut $end
+$var wire 1 # a $end
+$var wire 1 $ b $end
+$var wire 1 % clk $end
+$var wire 1 & rst_n $end
+$var wire 1 ! tied_off $end
+$var wire 1 " y $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+$comment Show the parameter values. $end
+$dumpall
+$end
+#0
+$dumpvars
+0&
+0%
+0$
+0#
+0"
+0!
+$end
+#5000
+1%
+#10000
+0%
+#15000
+1%
+#20000
+0%
+1&
+#25000
+1%
+#30000
+0%
+x"
+1#
+#35000
+1%
+#40000
+0%
+1"
+1$
+#45000
+1%
+#50000
+0%
+#55000
+1%
+#60000
+0%
+#65000
+1%
+#70000
+0%
+#75000
+1%
+#80000
+0%
+x"
+0#
+#85000
+1%
+#90000
+0%
+#95000
+1%
+#100000
+0%
+#105000
+1%
+#110000
+0%
+#115000
+1%
+#120000
+0%
+#125000
+1%
+#130000
+0%
+#135000
+1%
+#140000
+0%

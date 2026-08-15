@@ -676,6 +676,24 @@ select:focus-visible {
   font-size: var(--fs-data);
 }
 
+/* §7.3 — a derived value is dotted-underlined and labelled, so it can never be
+   mistaken for something the simulator actually wrote. */
+.card-val.derived {
+  border-bottom: 1px dotted currentColor;
+}
+
+.card-derived {
+  margin-left: 6px;
+  padding: 0 4px;
+  border: 1px dotted var(--text-dim);
+  border-radius: var(--radius);
+  color: var(--text-dim);
+  font-family: var(--font-chrome);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
 .card-meta,
 .card-reason {
   color: var(--text-dim);
@@ -2692,4 +2710,92 @@ select:focus-visible {
 .signal-focus .link {
   margin-left: auto;
   white-space: nowrap;
+}
+
+/* --- §8.37, the verification plan, inside TAB 7 --------------------------- */
+/*
+ * Below the two coverage sections rather than beside them: it is a different
+ * kind of statement — what was *meant* to be tested — and reading it against
+ * the two percentages above is the point.
+ */
+.cov-plan {
+  border-top: 1px solid var(--line);
+}
+
+.cov-plan-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-chrome);
+}
+
+.cov-plan-table td {
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+.plan-id {
+  font-family: var(--font-data);
+  color: var(--text-bright);
+  white-space: nowrap;
+}
+
+.plan-desc {
+  color: var(--text);
+  width: 100%;
+}
+
+/* The evidence column. Monochrome like the rest (§11.1): a state reads from the
+ * word and from weight, not from colour, which is reserved for causality. */
+.plan-state {
+  display: inline-block;
+  min-width: 62px;
+  font-family: var(--font-data);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+
+.plan-covered {
+  color: var(--text-bright);
+  font-weight: 600;
+}
+
+.plan-missing {
+  color: var(--sig-x);
+}
+
+.plan-link {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.plan-link code {
+  font-family: var(--font-data);
+  color: var(--text);
+}
+
+/* A plan is a document and documents drift. Where the file claims more than the
+ * run shows, the row says so rather than repeating the claim. */
+.plan-drift {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--warn);
+}
+
+.plan-note {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.cov-score {
+  margin-left: auto;
+  font-family: var(--font-data);
+  color: var(--text-bright);
 }

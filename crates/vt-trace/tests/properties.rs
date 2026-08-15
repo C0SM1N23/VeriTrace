@@ -290,3 +290,49 @@ proptest! {
         }
     }
 }
+
+/// The parallel parse must be indistinguishable from the serial one.
+///
+/// `parse_bytes` splits the value-change section across threads once it is
+/// large enough (§4.2 budgets conversion as a parallel job). Every guarantee
+/// downstream — file order, delta indices, `value_at` returning the settled
+/// value — depends on the two paths agreeing exactly, so this compares them
+/// event for event on an input big enough to actually be split.
+#[test]
+fn parallel_parse_matches_the_serial_parse() {
+    // Above the 4 MB threshold, with delta cycles and repeated timestamps at
+    // the boundaries where the chunks are stitched back together.
+    let mut text = String::from("$timescale 1ps $end\n$scope module top $end\n");
+    let codes = ["!", "\"", "#", "$"];
+    for (i, c) in codes.iter().enumerate() {
+        text.push_str(&format!("$var wire 8 {c} s{i} [7:0] $end\n"));
+    }
+    text.push_str("$upscope $end\n$enddefinitions $end\n");
+    let mut t = 0i64;
+    while text.len() < 6 * 1024 * 1024 {
+        t += 10;
+        text.push_str(&format!("#{t}\n"));
+        for (i, c) in codes.iter().enumerate() {
+            text.push_str(&format!("b{:b} {}\n", (t as usize + i) & 0xff, c));
+        }
+        // A glitch: two writes at one timestamp, so the delta numbering has to
+        // survive being cut here.
+        text.push_str(&format!("b1010 {}\nb0101 {}\n", codes[0], codes[0]));
+        // And the same timestamp written twice, which is what makes a seam
+        // land in the middle of one instant.
+        text.push_str(&format!("#{t}\nb1111 {}\n", codes[1]));
+    }
+
+    let parallel = vcd::parse_bytes(text.as_bytes()).unwrap();
+    let serial = vcd::parse_reader(std::io::Cursor::new(text.as_bytes())).unwrap();
+
+    assert_eq!(parallel.streams.len(), serial.streams.len());
+    assert_eq!((parallel.t_min, parallel.t_max), (serial.t_min, serial.t_max));
+    for (i, (p, s)) in parallel.streams.iter().zip(serial.streams.iter()).enumerate() {
+        assert_eq!(p.times, s.times, "stream {i}: times");
+        assert_eq!(p.deltas, s.deltas, "stream {i}: delta indices");
+        assert_eq!(p.len(), s.len(), "stream {i}: event count");
+    }
+    // And the values themselves, through the store the rest of the tool reads.
+    assert_eq!(reconstruct::from_trace(&parallel), reconstruct::from_trace(&serial));
+}

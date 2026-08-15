@@ -401,9 +401,58 @@ impl TraceStore {
     /// A write landing exactly on `start` is what establishes the value for the
     /// range, so it does not make the range non-constant.
     pub fn is_constant(&self, h: Handle, start: Time, end: Time) -> Result<bool> {
+        // Answered from the index whenever the window opens at or before the
+        // stream's first event, which is what the whole-trace scan of §8.4
+        // always asks. That is the difference between reading the index and
+        // decoding the time column of every signal in the trace: 7.6 s of the
+        // tier-B budget went into the latter.
+        if let Some((first, second)) = self.bounds(h) {
+            if start < first {
+                // The window opens before the stream does, so the first event
+                // is itself a transition inside it.
+                return Ok(first >= end);
+            }
+            if start < second {
+                // Every event at `first` is behind the window; the next one to
+                // fall inside it is the second distinct timestamp.
+                return Ok(second >= end);
+            }
+        }
         let times = self.times(h)?;
         let k = times.partition_point(|&x| x <= start);
         Ok(k >= times.len() || times[k] >= end)
+    }
+
+    /// `(first event, second distinct timestamp)` for a signal's stream, from
+    /// the index alone. `None` when the stream has no events at all.
+    fn bounds(&self, h: Handle) -> Option<(Time, Time)> {
+        let stream = self.signals.get(h as usize)?.stream_id;
+        let (lo, hi) = self.index.chunks_of(stream);
+        if lo >= hi {
+            return None;
+        }
+        let mut first = Time::MAX;
+        let mut second = Time::MAX;
+        for i in lo..hi {
+            let e = self.index.entry(i);
+            if e.n_rows == 0 {
+                continue;
+            }
+            // Chunks of one stream are stored in time order, but a fold that
+            // does not assume it costs nothing and cannot be wrong.
+            if e.t_first < first {
+                second = second.min(first);
+                first = e.t_first;
+            } else if e.t_first < second {
+                second = e.t_first;
+            }
+            second = second.min(e.t_second);
+        }
+        if first == Time::MAX {
+            None
+        } else {
+            Some((first, second))
+        }
     }
 
     /// Settled transitions in `[start, end)`.
@@ -441,13 +490,26 @@ impl TraceStore {
 
     /// First time the signal carries an X bit, if ever.
     pub fn first_x(&self, h: Handle) -> Result<Option<Time>> {
+        self.first_x_from(h, Time::MIN)
+    }
+
+    /// First time at or after `t` that the signal carries an X bit.
+    ///
+    /// §8.5 needs this rather than `first_x`: every register is X before its
+    /// first write, so a scan anchored at zero reports the reset window and
+    /// nothing else. Anchoring it after reset separates "the design was
+    /// initialising" from "this is still broken" — and an X that clears and
+    /// comes back (a driver conflict, a bad index) is only visible this way.
+    pub fn first_x_from(&self, h: Handle, t: Time) -> Result<Option<Time>> {
         let d = self.data(h)?;
         if d.values.is_two_state() {
             return Ok(None);
         }
-        for i in 0..d.len() {
+        // The value settled *at* `t` counts even when it was written earlier.
+        let start = d.idx_at(t).unwrap_or(0);
+        for i in start..d.len() {
             if d.values.row_has_x(i) {
-                return Ok(Some(d.times[i]));
+                return Ok(Some(d.times[i].max(t)));
             }
         }
         Ok(None)

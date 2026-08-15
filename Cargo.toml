@@ -5,3 +5,5 @@ members = ["crates/vt-trace", "crates/vt-py"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# §1.8 — same license as the Python side; see LICENSE.
+license = "MIT"

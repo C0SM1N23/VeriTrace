@@ -1,0 +1,29 @@
+# §14.1 — what this design is supposed to produce. The golden regression suite
+# reads it (tests/test_golden.py); nothing else does.
+#
+# TOML rather than the spec's `expected.yaml`: every other data file in this
+# project is TOML (packs, config, testplan), `tomllib` is in the standard
+# library, and a hand-rolled YAML reader would be a parser to maintain for four
+# shapes of value.
+#
+# A clean synchronous FIFO. No injected bug: this is the design that proves the
+# tool stays quiet when there is nothing to say, and the one that exercises
+# §5.6's dynamically indexed memory read.
+design = "fifo_async"
+top = "tb_fifo_sync"
+bug = "none"
+correlation_min = 99
+
+# §5.6: `rd_data = mem[rd_ptr]`. The answer has to name the element, not the
+# array, and it has to jump back to the cycle the element was written.
+[[why]]
+question = "why(tb_fifo_sync.dut.rd_data)"
+reaches = "tb_fifo_sync.dut.mem[3]"
+# The read is at c47; the value got there at c43. Without the time jump the
+# chain explains the wrong instant, which is what §5.6 exists to prevent.
+jumps_back = true
+not_reason = "out_of_range"
+
+[checks]
+# A correct design produces no X source.
+forbidden_groups = ["x_sources"]

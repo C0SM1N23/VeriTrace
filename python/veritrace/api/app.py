@@ -584,6 +584,9 @@ def create_app(
             }
         return {
             **session.coverage.to_dict(),
+            # §8.37 renders in this tab, so it arrives with it. A second endpoint
+            # would be a second thing to keep in step with the session.
+            "plan": session.plan.to_dict() if session.plan is not None else None,
             "errors": [session.coverage_error] if session.coverage_error else [],
         }
 

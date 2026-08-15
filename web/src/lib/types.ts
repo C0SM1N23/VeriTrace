@@ -56,6 +56,8 @@ export interface Layout {
   /** View preferences stored alongside the layout. */
   rulerMode?: "time" | "cycle";
   rowH?: number;
+  /** The causal question this screen is about (P5, and §13.8's `share`). */
+  query?: string;
 }
 
 export interface SessionStatus {
@@ -203,6 +205,8 @@ export interface CausalNode {
   detail: string;
   /** `m1.WRITE[7]` on a txn_link node. */
   txn: string | null;
+  /** §7.3 — computed from the RTL because the signal is not in the trace. */
+  derived?: boolean;
   /**
    * The answer is a DAG: the same question reached twice is one node. A repeat
    * arrives as a stub with no children, rendered as a back-reference.
@@ -766,6 +770,33 @@ export interface Hole {
   note: string;
 }
 
+/** §8.37 — one item of the verification plan, and how its references resolved. */
+export interface PlanLink {
+  kind: string;
+  ref: string;
+  state: "hit" | "missing" | "unknown";
+  detail: string;
+}
+
+export interface PlanItem {
+  id: string;
+  desc: string;
+  /** What the file claims. */
+  status: "planned" | "covered" | "waived";
+  /** What this run shows, which is not always the same — see `Item.evidence`. */
+  evidence: string;
+  note: string;
+  links: PlanLink[];
+}
+
+export interface TestPlan {
+  path: string | null;
+  n: number;
+  score: number | null;
+  items: PlanItem[];
+  errors: string[];
+}
+
 export interface CoverageReport {
   functional: FunctionalCoverage[];
   code: CodeCoverage | null;
@@ -774,6 +805,8 @@ export interface CoverageReport {
   /** Set only when a database was found and would not parse — see the note on
    *  `CoverageReport.code_error` in `coverage/model.py`. */
   code_error: string | null;
+  /** §8.37, when the project has a `testplan.toml` next to its config. */
+  plan: TestPlan | null;
   errors: string[];
   ms: number;
 }

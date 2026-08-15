@@ -14,6 +14,7 @@ import tomli_w
 from veritrace import __version__
 from veritrace.config import WORK_DIR
 from veritrace.export import viewers
+from veritrace.ingest.capture import FORMATS as _CAPTURE_FORMATS
 from veritrace.stim.emit import TARGETS as _STIM_TARGETS
 
 EXCLUDED_DIRS = {".git", "node_modules", "target", ".venv", "venv", "__pycache__", "build", "dist"}
@@ -315,7 +316,12 @@ def _load(
     trace = _default_trace(trace, flag="a trace path")
     ctx = Context(
         store=TraceStore(str(trace)),
-        config=cfg.load_or_empty(trace.parent),
+        # The project you are standing in decides its own settings; the trace's
+        # directory is only the fallback for a dump kept outside it. The other
+        # way round lets a trace's *location* pick the packs, the ignore list and
+        # the ingest log — which is how a cocotb log named in the project config
+        # went unread because the waveform lived one directory over.
+        config=cfg.load() or cfg.load_or_empty(trace.parent),
         trace_path=trace,
     )
     if files:
@@ -332,7 +338,40 @@ def _load(
                 raise click.ClickException(f"could not elaborate the RTL: {e}") from e
             click.echo(f"  warning: could not elaborate the RTL: {e}", err=True)
     ctx.clock = clocks.resolve(ctx.store, ctx.graph, ctx.config)
+    _warn_if_rtl_moved(ctx, files)
     return ctx
+
+
+def _warn_if_rtl_moved(ctx: "Context", files: list[Path]) -> None:
+    """§5.7, in the terminal — not only in the server.
+
+    *"Daca modifici RTL-ul dupa simulare si apoi rulezi why-trace pe dump-ul
+    vechi, primesti raspunsuri gresite cu incredere totala."* The session records
+    the hash on first open; every analysis command has to check it, because a
+    CI job and a script never go through the server at all — and those are
+    exactly where a stale dump survives longest.
+    """
+    from veritrace.api.sessions import LayoutFile, sha256_files
+
+    if ctx.graph is None or not files or ctx.trace_path is None:
+        return
+    try:
+        stored = LayoutFile.for_trace(ctx.trace_path).load().get("provenance") or {}
+        if stored.get("trace_sha256") != ctx.store.source_sha256:
+            return  # a different run: nothing to compare against
+        was = stored.get("rtl_sha256")
+        now = sha256_files(files)
+        if was and was != now:
+            click.echo(
+                f"  warning: the RTL has changed since this trace was made "
+                f"({was[:12]}… -> {now[:12]}…). Line numbers and causal chains "
+                "may not match what was simulated (§5.7).",
+                err=True,
+            )
+    except OSError:
+        # Provenance is a safety net; failing to read it must not stop the
+        # command the user actually asked for (P7).
+        pass
 
 
 def _at(ctx: Context, when: str | None) -> int:
@@ -579,16 +618,32 @@ def why(trace, query, rtl, top, as_json, output, **flags):
     ):
         return
 
+    # §8.1's `expected`: if the question named a value the trace disagrees with,
+    # say so before the chain rather than answering a different question.
+    note = _expectation_note(query, result)
     if as_json:
         payload = {"query": query, "time": at, **result.to_dict()}
         if headline:
             payload["headline"] = headline
+        if note:
+            payload["note"] = note
         click.echo(json.dumps(payload, indent=2))
         return
+    if note:
+        click.echo(note + "\n", err=True)
     if headline:
         click.echo(headline + "\n")
     _print_chain(result.root, ctx.clock)
     click.echo(f"\n{result.nodes} nodes in {result.elapsed_ms:.1f} ms")
+
+
+def _expectation_note(query: str, result) -> str | None:
+    from veritrace.analysis import vtq
+
+    try:
+        return vtq.expectation(vtq.parse(query), result.root.value)
+    except vtq.QueryError:
+        return None
 
 
 def _need_query(command: str, query: str | None) -> str:
@@ -637,7 +692,12 @@ def _ask(ctx: "Context", query: str | None):
         )
         ctx.transactions()
 
-    result = WhyTracer(ctx.graph, ctx.store, txn_index=ctx.txn_index).why(signal, at)
+    # §8.11b: on a capture the first sample is a wall, not a fact about the
+    # design, and the walk has to say so instead of calling a value constant.
+    start = ctx.store.time_range[0] if getattr(ctx.config, "capture", False) else None
+    result = WhyTracer(
+        ctx.graph, ctx.store, txn_index=ctx.txn_index, capture_start=start
+    ).why(signal, at)
     return signal, at, headline, result
 
 
@@ -681,8 +741,11 @@ def _print_chain(node, clock, depth: int = 0, seen: set | None = None) -> None:
             click.echo("  " * (depth + 1) + f"   {node.detail}")
     else:
         where = f"   {node.loc}" if node.loc else ""
+        # §7.3: a value computed from the graph is marked, never shown as if it
+        # had been measured.
+        value = f"~{node.value} (derived)" if node.derived else node.value
         click.echo(
-            f"{marker}{node.signal} = {node.value}   [{node.reason.value}] at {at}"
+            f"{marker}{node.signal} = {value}   [{node.reason.value}] at {at}"
             + ("   (as above)" if repeat else where)
         )
         if node.detail and not repeat:
@@ -932,6 +995,10 @@ def run(
     except simulate.SimulationError as e:
         raise click.ClickException(str(e)) from e
     say(f"simulated with Icarus Verilog in {got.seconds:.1f} s")
+    # §12's header wants the simulation command, and nothing else in the tool
+    # ever learns it. Written beside the waveform so `export` — run minutes or
+    # days later, in another process — can put it in the report.
+    _remember_command(got.dump, got.command)
     if got.injected:
         say("  no $dumpfile in your sources, so the whole design was dumped")
     for w in got.warnings[:3]:
@@ -979,18 +1046,58 @@ def _rel(path: Path) -> str:
         return str(path)
 
 
+def _under(path: Path, root: Path) -> str:
+    """`path` as said from `root` — the anchor every path in the config uses."""
+    try:
+        return Path(path).resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return Path(path).resolve().as_posix()
+
+
+def _source_globs(files: list[Path], root: Path) -> list[Path]:
+    """One glob per directory the sources came from.
+
+    `**/*.sv` from the project root would sweep in `.veritrace/` and any vendor
+    tree beside it; naming the directories that actually hold RTL keeps the next
+    run reading the same files this one did.
+    """
+    dirs = sorted({f.resolve().parent for f in files})
+    return [d / "*.sv" for d in dirs] + [d / "*.v" for d in dirs]
+
+
 def _write_config_if_missing(base: Path, top: str, files: list[Path], got) -> None:
     """Keep `init`'s promise without asking for a second command (§13.4b).
+
+    Written at the **project root as the user means it**: the working directory
+    when the sources are under it — `veritrace run rtl/` is run from the project,
+    not from `rtl` — and the source directory otherwise, which is the only
+    sensible home for `veritrace run /somewhere/else`.
+
+    That distinction is the whole promise. `config.find` searches *upward*, so a
+    file left in `rtl/` after `veritrace run rtl/` is invisible from where the
+    user is standing, and the next command answers "No trace given".
 
     Never overwrites: a project that already configured itself has decided
     things this cannot re-derive.
     """
-    out = base / ".veritrace.toml"
-    if out.exists():
+    here = Path.cwd().resolve()
+    root = here if base.resolve().is_relative_to(here) else base.resolve()
+    out = root / ".veritrace.toml"
+    if out.exists() or (base / ".veritrace.toml").exists():
         return
     clock = guess_clock(files) or "clk"
     reset = guess_reset(files) or ("rst_n", "low")
-    config = build_config(top, ["**/*.sv", "**/*.v"], clock, reset[0], reset[1], _rel(got.dump))
+    # Every path in the file is resolved against the file's own directory, so
+    # that is what they have to be relative to. Anchoring them on the working
+    # directory instead is how `rtl/dump.vcd` became `rtl/rtl/dump.vcd`.
+    config = build_config(
+        top,
+        [_under(d, root) for d in _source_globs(files, root)],
+        clock,
+        reset[0],
+        reset[1],
+        _under(got.dump, root),
+    )
     try:
         with out.open("wb") as fh:
             tomli_w.dump(config, fh)
@@ -1776,7 +1883,12 @@ def convert(source: Path, output: Path | None) -> None:
             "(needs zlib and libclang), or dump VCD instead."
         )
 
-    n_events = _native.convert(str(source), str(out))
+    try:
+        n_events = _native.convert(str(source), str(out))
+    except ValueError as e:
+        # A dump the engine cannot read is a message, not a stack trace: the
+        # reader already says which half failed and what to do instead.
+        raise click.ClickException(str(e)) from e
     store = _native.TraceStore(str(out))
     t0, t1 = store.time_range
     click.echo(
@@ -2074,6 +2186,7 @@ def export_report(trace, query, rtl, top, output, with_repro):
         trace_path=ctx.trace_path,
         rtl_sha256=sha256_files(sources) if sources else None,
         top=getattr(ctx.graph, "top", "") or "",
+        command=_recall_command(ctx.trace_path),
     )
     report_mod.write(page, Path(output))
     size = f"{page.bytes / 1024:.0f} KB"
@@ -2127,6 +2240,76 @@ def plugins(root):
         click.echo(f"\n{len(errors)} file(s) could not be loaded:")
         for name, why in errors.items():
             click.echo(f"  {name}: {why}")
+
+
+@main.command()
+@click.option("--root", type=click.Path(exists=True, file_okay=False, path_type=Path),
+              default=None, help="Project to look in (default: the one you are standing in).")
+@click.option("--trace", type=click.Path(path_type=Path), default=None,
+              help="Also say which packs match this dump, and why the others do not.")
+def packs(root, trace):
+    """What protocol packs are loaded, and what could not load (§8.15).
+
+    \b
+      veritrace packs
+      veritrace packs --trace dump.vcd
+
+    Looked for in `packs/` beside your `.veritrace.toml`, then the project root,
+    then the built-ins — nearest first, so `packs/axi4.vtp.toml` shadows the
+    built-in AXI4 pack by file name. See docs/PACKS.md.
+    """
+    from veritrace import config as cfg
+    from veritrace.protocol import detect as detect_mod
+    from veritrace.protocol import pack as pack_mod
+
+    base = root
+    if base is None:
+        conf = cfg.load()
+        base = conf.root if conf is not None else Path.cwd()
+
+    errors: list[str] = []
+    found = pack_mod.discover(base, errors)
+    click.echo("looked in: " + ", ".join(str(p) for p in pack_mod.search_path(base)))
+    click.echo(f"\n{len(found)} pack(s):")
+    for p in sorted(found, key=lambda x: x.name.lower()):
+        parts = [f"{len(p.channels)} channel(s)", f"{len(p.transactions)} transaction(s)"]
+        if p.rules:
+            parts.append(f"{len(p.rules)} rule(s)")
+        if p.cover:
+            parts.append(f"{len(p.cover)} cover point(s)")
+        click.echo(f"  {p.name:<16} {p.version:<6} {', '.join(parts)}")
+        click.echo(f"    needs {', '.join(p.detect.required_suffixes)}")
+
+    if trace is not None:
+        from veritrace import TraceStore
+        from veritrace import store as store_mod
+
+        store = TraceStore(str(store_mod.ensure(_default_trace(trace, flag="a trace path"))))
+        matched = {i.pack.name: i for i in detect_mod.detect(store, found)}
+        click.echo("")
+        for p in sorted(found, key=lambda x: x.name.lower()):
+            hit = matched.get(p.name)
+            if hit is not None:
+                click.echo(f"  {p.name:<16} matched {hit.name} ({hit.scope})")
+                continue
+            # A pack that matches nothing looks the same as a protocol the design
+            # does not speak. Naming the suffix that was missing is the whole
+            # difference between "not this bus" and "your pack has a typo".
+            near = detect_mod.near_misses(store, p)
+            if not near:
+                click.echo(f"  {p.name:<16} not in this trace")
+            for where, missing in near:
+                why = (
+                    f"no {', '.join(missing)}"
+                    if missing
+                    else "complete, but a more specific pack claimed these wires"
+                )
+                click.echo(f"  {p.name:<16} {where}: {why}")
+
+    if errors:
+        click.echo(f"\n{len(errors)} pack(s) could not be loaded:")
+        for e in errors:
+            click.echo(f"  {e}")
 
 
 @main.command("gen-sva")
@@ -2710,6 +2893,11 @@ def formal(rtl, top, packs, iface, mode, depth, engine, reset_active_high, no_wh
     files, incdirs, defines, top = _resolve_rtl(rtl, top)
     if not files:
         raise click.ClickException("This needs RTL. Pass --rtl <file|dir>.")
+    # A testbench is not part of the design under proof: it is not synthesisable,
+    # and handing it to yosys makes the whole run come back "unknown" — a result
+    # that looks like a failed proof rather than like a build that never started.
+    # Same rule `mutate` uses for what it will not mutate.
+    design = [f for f in files if not (f.name.startswith("tb_") or f.stem.endswith("_tb"))]
     try:
         elaboration = elaborate(files, incdirs, defines, top)
         found = harness.interfaces(elaboration, pack_mod.resolve(list(packs)))
@@ -2729,7 +2917,7 @@ def formal(rtl, top, packs, iface, mode, depth, engine, reset_active_high, no_wh
         try:
             reports.append(
                 run_prove(
-                    elaboration, target, files, work / _slug(target.name),
+                    elaboration, target, design or files, work / _slug(target.name),
                     mode, depth, engine, timeout, not reset_active_high,
                 )
             )
@@ -3153,6 +3341,625 @@ def _format_timing(report, limit: int, only_violated: bool) -> str:
     elif not report.correlated:
         out.append("\nNo trace given, so nothing is said about which paths matter. Pass one.")
     return "\n".join(out)
+
+
+@main.command()
+@click.option("--cocotb-log", type=click.Path(exists=True, path_type=Path), default=None,
+              help="A cocotb monitor's log. Parsed with [ingest] patterns, or the built-ins.")
+@click.option("--uvm-tr-db", "uvm_db", type=click.Path(exists=True, path_type=Path), default=None,
+              help="A uvm_text_tr_database file (+UVM_TR_RECORD).")
+@click.option("--trace", type=click.Path(path_type=Path), default=None,
+              help="The waveform the monitor ran against, for timescale and for the UI.")
+@rtl_options
+@click.option("--serve", is_flag=True, help="Open the interface on the result.")
+@click.option("--port", default=8765, type=int, help="Port for --serve.")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def ingest(cocotb_log, uvm_db, trace, rtl, top, serve, port, as_json):
+    """Transactions your monitor already recorded (§8.34).
+
+    \b
+      veritrace ingest --cocotb-log sim.log --trace dump.fst --rtl rtl/
+      veritrace ingest --uvm-tr-db uvm_tr.dat --trace dump.fst
+
+    A UVM or cocotb monitor has already written down what a transaction is.
+    Re-deriving it from wires is twice the work and can disagree with whoever
+    wrote the monitor, so it is read instead — and once read it gets latency,
+    stalls, deadlock, integrity and transaction-level why-trace for free,
+    because none of those care where a transaction came from.
+    """
+    from veritrace import ingest as ingest_mod
+
+    if not cocotb_log and not uvm_db:
+        raise click.ClickException("Nothing to ingest. Pass --cocotb-log or --uvm-tr-db.")
+
+    ctx = _load(trace, rtl, top) if trace else None
+    timescale = str(ctx.store.timescale) if ctx else "1ns"
+    patterns = dict(getattr(ctx.config, "ingest_patterns", {}) or {}) if ctx else {}
+    try:
+        streams = ingest_mod.read(uvm_db, cocotb_log, patterns or None, timescale)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    if not streams:
+        raise click.ClickException(
+            "No transaction matched. The log is read with `[ingest] patterns` from "
+            ".veritrace.toml, or the built-in cocotb forms — add one that fits yours."
+        )
+
+    if as_json:
+        click.echo(json.dumps(
+            {"streams": [e.interface.to_dict() | {"n": len(e.transactions)} for e in streams],
+             "transactions": [t.to_dict() for e in streams for t in e.transactions]},
+            indent=2, default=str,
+        ))
+        return
+
+    click.echo(_format_ingest(streams, cocotb_log or uvm_db))
+    if serve:
+        if not trace:
+            raise click.ClickException("--serve needs --trace: the interface shows a waveform.")
+        _remember_ingest(ctx, cocotb_log, uvm_db)
+        click.echo("\nRecorded in .veritrace.toml, so `veritrace serve` keeps using it.")
+        click.get_current_context().invoke(
+            serve, traces=(trace,), host="127.0.0.1", port=port, browser=True, rtl=rtl, top=top
+        )
+
+
+def _format_ingest(streams, source) -> str:
+    total = sum(len(e.transactions) for e in streams)
+    out = [f"{total} transaction(s) from {source}, no signal extraction involved:"]
+    for e in streams:
+        kinds: dict[str, int] = {}
+        for t in e.transactions:
+            kinds[t.kind] = kinds.get(t.kind, 0) + 1
+        shape = ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))
+        out.append(f"  {e.interface.name:24} {len(e.transactions):5}  ({shape})")
+        done = [t for t in e.transactions if t.closed and t.duration()]
+        if done:
+            lat = sorted(t.duration() for t in done)
+            out.append(
+                f"    latency: min {lat[0]}, median {lat[len(lat) // 2]}, max {lat[-1]} ticks"
+            )
+        if e.open_transactions:
+            out.append(f"    {len(e.open_transactions)} never closed in the log")
+        fields = sorted({k for t in e.transactions for k in t.fields})
+        if fields:
+            out.append(f"    fields: {', '.join(fields)}")
+    out.append(
+        "\nThese are the monitor's own transactions. Everything downstream — latency,"
+        "\ndeadlock, integrity, why(txn...) — works on them unchanged (§8.34)."
+    )
+    return "\n".join(out)
+
+
+def _remember_ingest(ctx, cocotb_log: Path | None, uvm_db: Path | None) -> None:
+    """Write the log's path into `.veritrace.toml` so `serve` finds it again.
+
+    §13.4's rule: the trace is named once. The same applies to the log — a team
+    whose monitor writes it every run should not re-type the path.
+    """
+    import tomli_w
+
+    root = getattr(ctx.config, "root", None) or Path.cwd()
+    path = getattr(ctx.config, "path", None) or (root / ".veritrace.toml")
+    data = {}
+    if Path(path).exists():
+        import tomllib
+
+        data = tomllib.loads(Path(path).read_text(encoding="utf-8"))
+    section = data.setdefault("ingest", {})
+    if cocotb_log:
+        section["cocotb_log"] = str(Path(cocotb_log).resolve().relative_to(Path(root).resolve()))
+    if uvm_db:
+        section["uvm_db"] = str(Path(uvm_db).resolve().relative_to(Path(root).resolve()))
+    Path(path).write_text(tomli_w.dumps(data), encoding="utf-8")
+
+
+# --- §13.6 regression database, §8.36 scorecard, §8.37 test plan -----------
+
+
+@main.command()
+@click.argument("trace", type=click.Path(path_type=Path), required=False, default=None)
+@rtl_options
+@click.option("--db", "db_path", type=click.Path(path_type=Path), default=None,
+              help="The DuckDB file (default: regressions.duckdb next to the config).")
+@click.option("--tag", default="", help='Free label, e.g. "commit=$(git rev-parse --short HEAD)".')
+@click.option("--seed", type=int, default=None,
+              help="The randomisation seed this run used. Mandatory (§13.6).")
+@click.option("--simulator", default=None, help="Which simulator ran it.")
+@click.option("--simulator-version", default=None, help="And which version.")
+@click.option("--command", default="", help="The exact command, so `reproduce` can repeat it.")
+def record(trace, rtl, top, db_path, tag, seed, simulator, simulator_version, command):
+    """Write this run into the regression database (§13.6).
+
+    \b
+      veritrace record sim.fst --rtl rtl/ --seed 3910182 \\
+          --simulator icarus --simulator-version 12.0 \\
+          --tag "commit=$(git rev-parse --short HEAD)"
+
+    The seed, the simulator with its version, and a hash of the RTL are
+    mandatory: without them a nightly failure is not reproducible and the row is
+    an anecdote. The command refuses rather than recording one.
+    """
+    from veritrace import regress
+
+    ctx = _load(trace, rtl, top)
+    files, *_ = _resolve_rtl(rtl, top)
+    if seed is None:
+        raise click.ClickException(
+            "--seed is mandatory (§13.6): a recorded run without its seed cannot be "
+            "reproduced, and a regression nobody can reproduce is a story."
+        )
+    if not simulator or not simulator_version:
+        raise click.ClickException(
+            "--simulator and --simulator-version are mandatory (§13.6): the same RTL "
+            "and the same seed can fail on one simulator and pass on another."
+        )
+
+    root = getattr(ctx.config, "root", None) or Path.cwd()
+    run = regress.Run(
+        seed=seed,
+        simulator=simulator,
+        simulator_version=simulator_version,
+        rtl_sha256=regress.sha256_of(files) if files else "no-rtl",
+        tag=tag,
+        commit_sha=regress.git_commit(root),
+        command=command,
+        work_dir=str(Path.cwd()),
+        trace_path=str(ctx.trace_path),
+        top=top or "",
+    )
+    _collect(ctx, run)
+
+    con = regress.connect(db_path or (Path(root) / regress.DEFAULT_DB))
+    run_id = regress.record(con, run)
+    con.close()
+    click.echo(
+        f"run {run_id} recorded: seed {seed}, {simulator} {simulator_version}, "
+        f"RTL {run.rtl_sha256[:12]}"
+    )
+    click.echo(f"  {len(run.txn)} interface(s), {len(run.findings)} finding group(s)")
+    click.echo(f"  veritrace reproduce --run-id {run_id}")
+
+
+def _collect(ctx: "Context", run) -> None:
+    """Everything §13.6 lists, from the analyses that already ran."""
+    protocol = ctx.transactions()
+    for e in getattr(protocol, "extractions", []) or []:
+        done = sorted(t.duration() for t in e.transactions if t.closed and t.duration())
+        pick = lambda q: (done[min(len(done) - 1, int(len(done) * q))] if done else None)  # noqa: E731
+        run.txn.append({
+            "iface": e.interface.name, "pack": e.interface.pack.name,
+            "n": len(e.transactions), "p50": pick(0.50), "p95": pick(0.95),
+            "p99": pick(0.99), "max": done[-1] if done else None,
+            "throughput": (len(e.transactions) / (e.sampled_cycles or 1)) if e.sampled_cycles else None,
+            "outstanding": max((t.outstanding for t in e.transactions), default=0),
+            "violations": len(e.violations),
+        })
+
+    report = ctx.check_report()
+    for group in getattr(report, "groups", []) or []:
+        by: dict[str, int] = {}
+        for f in getattr(group, "findings", []) or []:
+            by[str(getattr(f, "severity", "info"))] = by.get(str(getattr(f, "severity", "info")), 0) + 1
+        for severity, n in by.items():
+            run.findings.append((str(getattr(group, "name", group)), severity, n))
+
+    cov = ctx.coverage_report() if hasattr(ctx, "coverage_report") else None
+    code = getattr(cov, "code", None)
+    if code is not None and code.total:
+        run.coverage.append(("line", None, code.covered, code.total, code.score))
+    for f in getattr(cov, "functional", []) or []:
+        pts = [p for p in f.points if p.cells]
+        if pts:
+            covered, total = sum(p.covered for p in pts), sum(p.total for p in pts)
+            run.coverage.append(("functional", f.iface, covered, total, covered / max(1, total)))
+
+
+@main.command()
+@click.argument("sql", required=False)
+@click.option("--db", "db_path", type=click.Path(exists=True, path_type=Path), default=None,
+              help="The DuckDB file (default: regressions.duckdb).")
+@click.option("--limit", default=40, type=int, help="Rows, when no SQL is given.")
+def history(sql, db_path, limit):
+    """Query the regression database (§13.6).
+
+    \b
+      veritrace history
+      veritrace history "SELECT commit_sha, p99_latency FROM txn_metrics
+                         JOIN runs USING (run_id) WHERE iface='dma0'
+                         ORDER BY ts DESC LIMIT 40"
+    """
+    from veritrace import regress
+
+    path = db_path or Path(regress.DEFAULT_DB)
+    if not Path(path).exists():
+        raise click.ClickException(f"{path} does not exist yet — `veritrace record` writes it.")
+    con = regress.connect(path)
+    query = sql or (
+        "SELECT run_id, ts, tag, commit_sha, seed, simulator, simulator_version "
+        f"FROM runs ORDER BY run_id DESC LIMIT {limit}"
+    )
+    try:
+        cols, rows = regress.query(con, query)
+    except Exception as e:  # noqa: BLE001 - a user's SQL, reported as theirs
+        raise click.ClickException(f"query failed: {e}") from e
+    finally:
+        con.close()
+
+    if not rows:
+        click.echo("no rows")
+        return
+    widths = [max(len(str(c)), *(len(str(r[i])) for r in rows)) for i, c in enumerate(cols)]
+    click.echo("  ".join(str(c).ljust(w) for c, w in zip(cols, widths)))
+    click.echo("  ".join("-" * w for w in widths))
+    for r in rows:
+        click.echo("  ".join(str(v).ljust(w) for v, w in zip(r, widths)))
+
+
+@main.command()
+@click.option("--run-id", type=int, default=None, help="Which run (default: the latest).")
+@click.option("--db", "db_path", type=click.Path(exists=True, path_type=Path), default=None,
+              help="The DuckDB file (default: regressions.duckdb).")
+@rtl_options
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def reproduce(run_id, db_path, rtl, top, as_json):
+    """Rebuild the exact command a recorded run used (§13.6).
+
+    \b
+      veritrace reproduce --run-id 4821 --rtl rtl/
+
+    If the RTL has changed since, this says so rather than pretending the
+    reproduction is identical — the same honesty §5.7 applies to a stale trace.
+    """
+    from veritrace import regress
+
+    path = db_path or Path(regress.DEFAULT_DB)
+    if not Path(path).exists():
+        raise click.ClickException(f"{path} does not exist yet — `veritrace record` writes it.")
+    con = regress.connect(path)
+    if run_id is None:
+        row = regress.latest(con)
+        if row is None:
+            raise click.ClickException("the database has no runs in it")
+        run_id = row["run_id"]
+
+    files, *_ = _resolve_rtl(rtl, top)
+    try:
+        out = regress.plan(con, run_id, files or None)
+    except KeyError as e:
+        raise click.ClickException(str(e)) from e
+    finally:
+        con.close()
+
+    if as_json:
+        click.echo(json.dumps(out.to_dict(), indent=2))
+        return
+    click.echo(f"run {out.run_id}: {out.simulator} {out.simulator_version}, seed {out.seed}")
+    if out.work_dir:
+        click.echo(f"  cd {out.work_dir}")
+    click.echo(f"  {out.command or '(no command was recorded)'}")
+    if out.identical:
+        click.echo(f"\nRTL hash: {out.rtl_then[:12]}… — identical to the original run.")
+    else:
+        click.echo(f"\n{out.caveat}")
+        if out.rtl_now:
+            click.echo(f"  then {out.rtl_then[:12]}…  now {out.rtl_now[:12]}…")
+
+
+@main.command()
+@click.argument("trace", type=click.Path(path_type=Path), required=False, default=None)
+@rtl_options
+@click.option("--plan", "plan_path", type=click.Path(exists=True, path_type=Path), default=None,
+              help="A testplan.toml, cross-referenced against what this run produced (§8.37).")
+@click.option("--mutation", type=click.Path(exists=True, path_type=Path), default=None,
+              help="`veritrace mutate --json` output.")
+@click.option("--formal", "formal_json", type=click.Path(exists=True, path_type=Path), default=None,
+              help="`veritrace formal --json` output.")
+@click.option("--synth", "synth_json", type=click.Path(exists=True, path_type=Path), default=None,
+              help="`veritrace synth-diff --json` output.")
+@click.option("--fail-under", type=float, default=None,
+              help="Exit non-zero if any category with a target misses it.")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def scorecard(trace, rtl, top, plan_path, mutation, formal_json, synth_json, fail_under, as_json):
+    """Every metric in one report (§8.36).
+
+    \b
+      veritrace scorecard dump.vcd --rtl rtl/
+      veritrace scorecard --plan testplan.toml
+
+    Pure aggregation — nothing here is computed that was not computed already.
+    No row says "verified" without a qualifier, and the report never emits a
+    binary verdict about the design, because that is not a claim a tool can make.
+    """
+    from veritrace import plan as plan_mod
+    from veritrace.report import scorecard as card_mod
+
+    ctx = _load(trace, rtl, top)
+    coverage = ctx.coverage_report() if hasattr(ctx, "coverage_report") else None
+    targets = {"line": 90.0, "functional": 80.0, "mutation": 70.0}
+    if fail_under is not None:
+        targets = {k: fail_under for k in targets}
+
+    # §8.36 aggregates what other commands produced; they already emit JSON, so
+    # a scorecard can be assembled in CI from four separate jobs.
+    load = lambda p: card_mod.Loaded(json.loads(Path(p).read_text(encoding="utf-8"))) if p else None  # noqa: E731
+    formal_reports = None
+    if formal_json:
+        raw = json.loads(Path(formal_json).read_text(encoding="utf-8"))
+        formal_reports = [card_mod.Loaded(r) for r in (raw if isinstance(raw, list) else [raw])]
+
+    card = card_mod.build(
+        checks=ctx.check_report(),
+        coverage=coverage,
+        protocol=ctx.transactions(),
+        mutation=load(mutation),
+        formal=formal_reports,
+        synth=load(synth_json),
+        design=top or getattr(ctx.config, "top", "") or "",
+        commit=__import__("veritrace.regress", fromlist=["git_commit"]).git_commit(
+            getattr(ctx.config, "root", None) or Path.cwd()
+        ),
+        targets=targets,
+    )
+
+    plan_obj = None
+    if plan_path:
+        plan_obj = plan_mod.link(
+            plan_mod.load(plan_path), coverage=coverage,
+            formal=formal_reports, checks=ctx.check_report(),
+        )
+
+    if as_json:
+        payload = card.to_dict()
+        if plan_obj:
+            payload["plan"] = plan_obj.to_dict()
+        click.echo(json.dumps(payload, indent=2))
+    else:
+        click.echo(_format_scorecard(card, plan_obj))
+
+    if fail_under is not None and card.failing:
+        raise SystemExit(1)
+
+
+MARK = {"ok": "OK ", "warn": " ! ", "bad": "XX ", "absent": " - "}
+
+
+def _format_scorecard(card, plan_obj) -> str:
+    head = f"VERITRACE SCORECARD — {card.design or 'this design'}"
+    if card.commit:
+        head += f" @ {card.commit}"
+    out = [head, ""]
+    for row in card.rows:
+        target = f"target {row.target}" if row.target else ""
+        out.append(f"  {MARK[row.status]} {row.category:22} {row.value:>14}   {target}")
+        out.append(f"        {row.detail}")
+    out.append("")
+    out.append(
+        f"{len(card.covered)} of {len(card.rows)} categories measured in this run. "
+        "No line here says a design is verified — that is not a claim this tool makes."
+    )
+    if plan_obj is not None:
+        out += ["", _format_plan(plan_obj)]
+    return "\n".join(out)
+
+
+def _format_plan(plan_obj) -> str:
+    score = plan_obj.score
+    out = [
+        f"VERIFICATION PLAN — {plan_obj.path.name if plan_obj.path else ''}"
+        + (f"   {score:.0f}% of items covered" if score is not None else ""),
+        "",
+    ]
+    for item in plan_obj.items:
+        out.append(f"  {item.evidence:9} {item.id:10} {item.desc}")
+        for l in item.links:
+            out.append(f"              {l.state:8} {l.text}   {l.detail}")
+        if item.status == "covered" and item.evidence != "covered":
+            # A plan is a document and documents drift. Where the file claims
+            # more than the run shows, the run wins and the gap is named.
+            out.append("              the plan says covered; this run does not show it")
+    for err in plan_obj.errors:
+        out.append(f"  ! {err}")
+    return "\n".join(out)
+
+
+#: Where `run` leaves the command it used, and `export` looks for it.
+COMMAND_FILE = "sim.command"
+
+
+def _remember_command(dump: Path, command: str) -> None:
+    if not command:
+        return
+    try:
+        (Path(dump).parent / COMMAND_FILE).write_text(command + "\n", encoding="utf-8")
+    except OSError:
+        pass  # a read-only work directory must not fail the run
+
+
+def _recall_command(trace: Path | None) -> str:
+    """The simulation command, if this waveform came from `veritrace run`.
+
+    Absent is normal — a dump from ModelSim or a colleague's machine has no
+    such record — and the report says "(not recorded)" rather than inventing
+    a plausible command line.
+    """
+    if trace is None:
+        return ""
+    for base in {Path(trace).parent, Path(str(trace).removesuffix(".vtx")).parent}:
+        try:
+            return (base / COMMAND_FILE).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+    return ""
+
+
+def _project_root(trace: Path | None) -> Path:
+    """The directory a team feature works relative to (§13.8).
+
+    The project you are standing in, or the trace's own directory when the dump
+    is kept outside one — the same rule `_load` follows, so `share` and `serve`
+    never disagree about where `notes/` is.
+    """
+    from veritrace import config as cfg
+
+    conf = cfg.load()
+    if conf is not None:
+        return Path(conf.root)
+    return (trace.parent if trace else Path.cwd())
+
+
+@main.command()
+@click.argument("trace", type=click.Path(path_type=Path), required=False, default=None)
+@click.option("-o", "--output", type=click.Path(path_type=Path), default=None,
+              help="Where to write it (default: <trace>.vtsession).")
+@click.option("--query", default="", help="The question this session is about, e.g. 'why(top.x @ c120)'.")
+def share(trace, output, query):
+    """Bundle this screen into a `.vtsession` for a colleague (§13.8).
+
+    \b
+      veritrace share dump.vcd -o notes/dma_deadlock.vtsession
+      veritrace restore notes/dma_deadlock.vtsession        # on their machine
+
+    Layout, bookmarks, annotations and the current query travel; the dump does
+    not — it is referenced by hash, because they already have it and what they
+    lack is the certainty that it is the same one. No server is involved: this
+    is a file you commit, review and grep like any other.
+    """
+    from veritrace import __version__, share as share_mod, store as store_mod
+    from veritrace.api.sessions import LayoutFile
+
+    trace = store_mod.ensure(_default_trace(trace, flag="a trace path"))
+    root = _project_root(trace)
+    bundle = share_mod.build(
+        trace,
+        LayoutFile.for_trace(trace).load(),
+        root,
+        query=query,
+        version=__version__,
+    )
+    out = Path(output) if output else trace.with_name(trace.name + share_mod.SUFFIX)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    share_mod.write(out, bundle)
+
+    rows = len(bundle["layout"].get("signals") or [])
+    click.echo(f"{out}")
+    click.echo(f"  trace     {bundle['trace']['name']}  sha256 {bundle['trace']['sha256'][:12]}…")
+    click.echo(f"  layout    {rows} row(s), {len(bundle['layout'].get('cursors') or [])} cursor(s)")
+    click.echo(f"  notes     {len(bundle['notes'])} file(s)")
+    if bundle["query"]:
+        click.echo(f"  query     {bundle['query']}")
+
+
+@main.command()
+@click.argument("bundle", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument("trace", type=click.Path(path_type=Path), required=False, default=None)
+@click.option("--force", is_flag=True, help="Overwrite annotation files that differ locally.")
+def restore(bundle, trace, force):
+    """Open a colleague's `.vtsession` against your copy of the dump (§13.8).
+
+    \b
+      veritrace restore dma_deadlock.vtsession dump.vcd
+      veritrace serve dump.vcd --rtl rtl/     # and there is their screen
+
+    A dump whose hash does not match is still applied — the signal selection is
+    the useful half either way — but it is called out, because bookmarks taken
+    in another run point at times that do not exist in yours.
+    """
+    from veritrace import share as share_mod, store as store_mod
+
+    data = share_mod.read(Path(bundle))
+    trace = store_mod.ensure(_default_trace(trace, flag="a trace path"))
+    applied = share_mod.apply(data, trace, _project_root(trace), force=force)
+
+    click.echo(f"layout    -> {applied.layout_path}")
+    for p in applied.notes:
+        click.echo(f"notes     -> {p}")
+    if applied.query:
+        click.echo(f"query        {applied.query}")
+    for w in applied.warnings:
+        click.echo(f"  ! {w}", err=True)
+    click.echo(f"\nveritrace serve {trace}")
+
+
+@main.command("import-capture")
+@click.argument("capture", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--format", "fmt", type=click.Choice(list(_CAPTURE_FORMATS)), default="vivado-ila",
+              help="Which tool exported it.")
+@click.option("--scope", default="", help="Prefix every probe with this scope, e.g. `top.dut`.")
+@click.option("--timescale", default="1ns", help="Time unit to give one sample.")
+@click.option("-o", "--output", type=click.Path(path_type=Path), default=None,
+              help="Where to write the .vcd (default: beside the capture).")
+def import_capture(capture, fmt, scope, timescale, output):
+    """An ILA or SignalTap capture, as a trace (§8.11b).
+
+    \b
+      veritrace import-capture ila.csv --scope top.dut -o ila.vcd
+      veritrace serve ila.vcd --rtl rtl/
+
+    A capture is a *window*: shallow, narrow and triggered. Everything that
+    reads a trace works on it, and a causal chain that reaches the first sample
+    stops at `capture_boundary` with what to trigger on next time, rather than
+    calling a value constant because the evidence ran out.
+    """
+    from veritrace.ingest import capture as cap_mod
+
+    got = cap_mod.read(capture, fmt=fmt, scope=scope)
+    out = Path(output) if output else Path(capture).with_suffix(".vcd")
+    out.write_text(cap_mod.to_vcd(got, timescale), encoding="utf-8")
+
+    click.echo(f"{out}")
+    click.echo(f"  {len(got.names)} probe(s), {got.n_samples} sample(s), one per {timescale} tick")
+    if got.trigger is not None:
+        click.echo(f"  trigger at sample {got.trigger}")
+    click.echo(
+        "  a capture is a window: the chain stops at its first sample rather "
+        "than claiming a cause it cannot see (§8.11b)"
+    )
+
+
+@main.command()
+@click.argument("text")
+@click.option("--signal", default=None, help="The signal this is about.")
+@click.option("--at", "when", default=None, help="`c1247` or a raw timestamp. Needs --signal.")
+@click.option("--loc", default=None, help="`rtl/dma.sv:42` — a source anchor instead of a signal.")
+@click.option("-f", "--file", "path", type=click.Path(path_type=Path), default=None,
+              help="Which .vtnotes to append to (default: notes/<top>.vtnotes).")
+@click.option("--trace", type=click.Path(path_type=Path), default=None,
+              help="Only needed to turn a `cN` cycle into a time.")
+def note(text, signal, when, loc, path, trace):
+    """Append an annotation to a versionable text file (§13.8).
+
+    \b
+      veritrace note "grant drops a cycle early" --signal top.u_dma.state --at c120
+      veritrace note "this if() should test busy too" --loc rtl/dma.sv:42
+
+    One note per line, in `notes/*.vtnotes`, so it is reviewable in the same
+    pull request as the fix and findable with `grep`. No database, no cloud.
+    """
+    from veritrace import config as cfg
+    from veritrace import notes as notes_mod
+
+    at: int | None = None
+    if when is not None:
+        if not signal:
+            raise click.ClickException("--at anchors a signal; pass --signal too.")
+        # A cycle number only means something against a clock, so the trace is
+        # loaded for that case and only that case.
+        at = _at(_load(trace), when) if when.lower().startswith("c") else int(when)
+
+    file_, line = "", None
+    if loc:
+        head, _, tail = loc.rpartition(":")
+        if not tail.isdigit():
+            raise click.ClickException(f"--loc wants file:line, got {loc!r}")
+        file_, line = head, int(tail)
+
+    conf = cfg.load()
+    root = Path(conf.root) if conf is not None else Path.cwd()
+    dest = Path(path) if path else root / "notes" / f"{(conf.top if conf else '') or 'veritrace'}.vtnotes"
+    entry = notes_mod.Note(text=text, signal=signal or "", time=at, file=file_, line=line)
+    notes_mod.append(dest, entry)
+    click.echo(f"{dest}: {entry}")
 
 
 def _write(text: str, output: Path | None, what: str) -> None:

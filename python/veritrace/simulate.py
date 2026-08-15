@@ -63,6 +63,11 @@ class Result:
     #: without a second pass over the file.
     output: str = ""
     warnings: list[str] = field(default_factory=list)
+    #: The exact commands that produced this waveform, one per line. §12 wants
+    #: the simulation command in the bug report's header, and §13.6 wants it in
+    #: the regression database — neither could have it while only this function
+    #: knew what it ran.
+    command: str = ""
 
 
 def find_iverilog() -> tuple[str, str] | None:
@@ -192,7 +197,8 @@ def icarus(
         raise SimulationError(_compile_error(got.stderr or got.stdout))
     warnings = [ln for ln in (got.stderr or "").splitlines() if "warning" in ln.lower()]
 
-    ran = _run([vvp, str(vvp_path)], here, timeout)
+    run_cmd = [vvp, str(vvp_path)]
+    ran = _run(run_cmd, here, timeout)
     seconds = time.perf_counter() - started
     output = (ran.stdout or "") + (ran.stderr or "")
     log = work / "sim.log"
@@ -215,6 +221,7 @@ def icarus(
         seconds=seconds,
         output=output,
         warnings=warnings,
+        command=_shell(build) + "\n" + _shell(run_cmd),
     )
 
 
@@ -291,6 +298,11 @@ def include_path(here: Path, sources: list[Path], extra: list[str]) -> list[Path
 #: Icarus says `Include file foo.vh not found`. Turning that into the flag that
 #: fixes it is the difference between a wall of output and one thing to do.
 _MISSING_INCLUDE = re.compile(r"Include file (\S+) not found")
+
+
+def _shell(cmd: list[str]) -> str:
+    """A command line someone can paste back into a terminal."""
+    return " ".join(f'"{c}"' if " " in c else c for c in cmd)
 
 
 def _compile_error(text: str) -> str:

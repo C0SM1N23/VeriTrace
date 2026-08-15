@@ -19,6 +19,7 @@ from typing import Any, Callable, Iterator
 
 from veritrace.analysis import (
     fsmchecks,
+    handshake,
     integrity,
     lint,
     liveness,
@@ -135,6 +136,14 @@ def run_all(
         Group.PROTOCOL.value,
         None if analysis is not None else "protocol extraction was not run",
         lambda: protocol.scan(analysis, clock, config),
+    )
+    # §8.9's one structural row: a `ready` computed from `valid` in the same
+    # cycle. It needs the graph and not the trace — a run where the two never
+    # deadlocked leaves the combinational path exactly where it was.
+    run(
+        f"{Group.PROTOCOL.value}.handshake",
+        no_rtl or (None if analysis is not None else "protocol extraction was not run"),
+        lambda: handshake.scan(analysis, graph, config),
     )
     # §8.18, on the same terms: a design with no interfaces has no agents, which
     # is a result and not a skip. Only a caller that never ran the scan is told

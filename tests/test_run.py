@@ -15,6 +15,7 @@ a first-time user hits before anything else works.
 from __future__ import annotations
 
 import shutil
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -292,3 +293,57 @@ def test_a_missing_include_names_the_flag_that_fixes_it(tmp_path):
     assert got.exit_code != 0
     assert "elsewhere.vh" in got.output
     assert "--incdir" in got.output
+
+
+@needs_icarus
+def test_the_config_lands_where_the_next_command_will_look_for_it(tmp_path, monkeypatch):
+    """`veritrace run rtl/` — the shape of every real project.
+
+    `config.find` searches upward, so a file written beside the sources is
+    invisible from the directory the command was run in. That made the very
+    promise printed on the line above it false: the next command answered "No
+    trace given", and so did the one after that.
+    """
+    project = tmp_path / "project"
+    (project / "rtl").mkdir(parents=True)
+    for f in (DESIGNS / "fifo_buggy").glob("*.sv"):
+        shutil.copy(f, project / "rtl")
+
+    monkeypatch.chdir(project)
+    CliRunner().invoke(main, ["run", "rtl"], catch_exceptions=False)
+
+    conf = project / ".veritrace.toml"
+    assert conf.is_file(), "the config went somewhere the next command cannot see"
+    assert not (project / "rtl" / ".veritrace.toml").exists()
+
+    body = tomllib.loads(conf.read_text(encoding="utf-8"))
+    # Every path is resolved against the config's own directory, so that is what
+    # they have to be written relative to. `rtl/rtl/dump.vcd` was the bug.
+    assert (project / body["trace"]["default"]).is_file(), body["trace"]["default"]
+    for pattern in body["design"]["rtl"]:
+        assert list(project.glob(pattern)) or pattern.endswith(".v"), pattern
+
+    # And the promise itself: no arguments, from the project root.
+    out = CliRunner().invoke(main, ["check"], catch_exceptions=False)
+    assert out.exit_code == 0, out.output
+    assert "No trace given" not in out.output
+
+
+@needs_icarus
+def test_a_folder_run_from_elsewhere_configures_itself(tmp_path, monkeypatch):
+    """The other shape: `veritrace run /somewhere/else`. There is no project
+    around the caller, so the sources' own directory is the only sensible home
+    for the config — and it must not be written into whatever directory the
+    user happened to be standing in."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    for f in (DESIGNS / "fifo_buggy").glob("*.sv"):
+        shutil.copy(f, elsewhere)
+    caller = tmp_path / "caller"
+    caller.mkdir()
+
+    monkeypatch.chdir(caller)
+    CliRunner().invoke(main, ["run", str(elsewhere)], catch_exceptions=False)
+
+    assert (elsewhere / ".veritrace.toml").is_file()
+    assert not (caller / ".veritrace.toml").exists(), "configured the wrong directory"

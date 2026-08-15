@@ -1,0 +1,19 @@
+# §14.1 — the injected bug and the root cause `why()` must reach.
+design = "fifo_buggy"
+top = "tb_fifo_buggy"
+bug = """rd_rst_n is tied to 0, so the read side never leaves reset and the \
+FIFO fills and never drains"""
+correlation_min = 99
+
+[[why]]
+question = "why(tb_fifo_buggy.dut.full @ 455000)"
+# The root cause, and the line that holds it. §14.3: getting this wrong is the
+# highest-severity failure this project has.
+root_cause = "tb_fifo_buggy.dut.rd_rst_n"
+reason = "constant"
+file = "fifo_buggy.sv"
+line = 30
+
+[checks]
+# The tied-low reset freezes the read pointer, and §8.4 has to say so.
+required_signals = ["tb_fifo_buggy.dut.rd_ptr"]

@@ -17,7 +17,7 @@ VTX      = $(DESIGN)/dump.vtx
 .PHONY: help run sim-icarus sim-verilator sim-modelsim sim-xsim \
         convert serve serve-rtl correlate check stuck triage export probes \
         txn txn-why perf deadlock memory sdram track coverage dma \
-        web web-build test test-web test-all bench designs clean
+        web web-build test test-web test-all bench bench-stress designs clean
 
 help:
 	@echo "Start:     run          (folder of .sv -> findings, one command)"
@@ -213,9 +213,14 @@ test-web:
 
 test-all: test test-web
 
-## The tier-A performance budget of §4.2.
+## The tier-A performance budget of §4.2, at the size the spec names.
 bench:
-	cargo run --release -p vt-trace --example bench -- 50
+	cargo run --release -p vt-trace --example bench -- 100 5000
+
+## Tier B, "stress": 1 GB over 50k signals. Validation, not a daily gate — it
+## needs ~2 GB of scratch space and about a minute.
+bench-stress:
+	cargo run --release -p vt-trace --example bench -- 1000 50000
 
 ## Re-simulate every reference design and rebuild its store.
 designs:

@@ -15,9 +15,9 @@ use crate::model::{Time, Timescale};
 use crate::{Error, Result};
 
 pub const MAGIC: &[u8; 4] = b"VTX1";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const HEADER_LEN: usize = 64;
-pub const ENTRY_LEN: usize = 40;
+pub const ENTRY_LEN: usize = 48;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkEntry {
@@ -31,6 +31,11 @@ pub struct ChunkEntry {
     pub row_offset: u64,
     pub t_first: Time,
     pub t_last: Time,
+    /// Second *distinct* timestamp in this chunk, or `Time::MAX` when every row
+    /// shares one. It is what lets `is_constant` — and so the stuck detector of
+    /// §8.4 — answer from the index instead of decoding the time column of
+    /// every signal in the trace.
+    pub t_second: Time,
 }
 
 impl ChunkEntry {
@@ -42,6 +47,7 @@ impl ChunkEntry {
         out.extend_from_slice(&self.row_offset.to_le_bytes());
         out.extend_from_slice(&self.t_first.to_le_bytes());
         out.extend_from_slice(&self.t_last.to_le_bytes());
+        out.extend_from_slice(&self.t_second.to_le_bytes());
     }
 
     fn read_from(b: &[u8]) -> ChunkEntry {
@@ -56,6 +62,7 @@ impl ChunkEntry {
             row_offset: u64_at(16),
             t_first: i64_at(24),
             t_last: i64_at(32),
+            t_second: i64_at(40),
         }
     }
 }
@@ -188,7 +195,16 @@ mod tests {
     use super::*;
 
     fn entry(stream_id: u32, t_first: Time, t_last: Time, row_offset: u64) -> ChunkEntry {
-        ChunkEntry { stream_id, part_id: 0, row_group: 0, n_rows: 4, row_offset, t_first, t_last }
+        ChunkEntry {
+            stream_id,
+            part_id: 0,
+            row_group: 0,
+            n_rows: 4,
+            row_offset,
+            t_first,
+            t_last,
+            t_second: t_first + 1,
+        }
     }
 
     fn sample() -> (tempfile::TempDir, Index) {

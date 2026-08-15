@@ -1,0 +1,26 @@
+# §14.1 — the multi-driver case. Two continuous assignments on one net, and the
+# X they produce appears *after* reset, clears, and comes back.
+design = "multidriver"
+top = "tb_multidriver"
+bug = """two continuous assignments drive `y`; the net resolves to X whenever \
+they disagree, and no wait makes it settle"""
+correlation_min = 99
+
+[[why]]
+question = "why(tb_multidriver.dut.y @ 100000)"
+# §8.1: more than one active driver is its own terminal, and it is a root cause
+# — the tool can state this one with certainty.
+root_cause = "tb_multidriver.dut.y"
+reason = "conflict"
+file = "multidriver.sv"
+
+[[why]]
+# The tie-off next to it still terminates as a constant.
+question = "why(tb_multidriver.dut.tied_off @ 100000)"
+root_cause = "tb_multidriver.dut.tied_off"
+reason = "constant"
+
+[checks]
+# §8.5 must report it. Anchoring the scan on a single post-reset sample missed
+# this entirely: at that instant the two drivers happened to agree.
+required_signals = ["tb_multidriver.dut.y"]

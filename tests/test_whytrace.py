@@ -17,7 +17,7 @@ from veritrace.analysis import vtq
 from veritrace.analysis.whytrace import NodeKind, Reason, WhyTracer
 from veritrace.api import create_app
 from veritrace.correlate.resolver import correlate
-from veritrace.graph.elaborate import elaborate
+from veritrace.graph.elaborate import discover, elaborate
 
 DESIGNS = Path(__file__).resolve().parents[1] / "designs"
 BUGGY = DESIGNS / "fifo_buggy"
@@ -328,3 +328,185 @@ def test_rtl_change_is_detected_and_warned_not_blocked(tmp_path):
         assert c.post(
             f"/session/{s}/query", json={"vtq": "why(tb_fifo_buggy.dut.full @ 455000)"}
         ).status_code == 200
+
+
+# --- §5.5 problem 2, at the level that actually matters ---------------------
+
+
+def test_a_register_is_explained_by_the_value_going_into_the_edge(buggy):
+    """The NBA rule of §5.5, asserted on *values* and not only on times.
+
+    `test_sequential_signals_are_explained_at_the_clock_edge` checks that the
+    causes sit on the right edge. That passes even if the tracer reads them
+    with `value_at` instead of `value_before` — and reading them at the edge is
+    exactly the mistake §5.5 calls the number-one source of wrong answers, so
+    the distinction needs a test of its own.
+    """
+    graph, store, _ = buggy
+    clk = store.handle("tb_fifo_buggy.dut.clk")
+    _, t_end = store.time_range
+    edges = [t for t, v in store.transitions(clk, 0, t_end + 1) if v.to_int() == 1]
+
+    # A signal that changes *at* an edge: its pre-edge and post-edge values
+    # differ, so which one the walk used is observable.
+    ptr = store.handle("tb_fifo_buggy.dut.wr_ptr")
+    edge = next(
+        (
+            t
+            for t in edges
+            if store.value_before(ptr, t) is not None
+            and store.value_at(ptr, t).bits != store.value_before(ptr, t).bits
+        ),
+        None,
+    )
+    assert edge is not None, "no register in this trace changes on an edge"
+
+    node = WhyTracer(graph, store).why("tb_fifo_buggy.dut.wr_ptr", edge).root
+    before = store.value_before(ptr, edge)
+    after = store.value_at(ptr, edge)
+    assert before.to_int() != after.to_int()  # the fixture does what the test needs
+    # The question is about the settled value at `edge`...
+    assert int(node.value, 2) == after.to_int()
+
+    # ...and every cause evaluated at that edge must carry the value it had
+    # going *into* it. Reading them at the edge is the §5.5 mistake, and it is
+    # visible on any cause that also moved at this instant.
+    checked = 0
+    for child in node.children:
+        h = store.handle(child.signal.path())
+        if h is None or child.time != edge:
+            continue
+        pre, post = store.value_before(h, edge), store.value_at(h, edge)
+        if pre is None or post is None or pre.to_int() == post.to_int():
+            continue
+        assert int(child.value, 2) == pre.to_int(), (
+            f"{child.signal.path()} was read at the edge, not before it — §5.5"
+        )
+        checked += 1
+    assert checked or node.children, "the register had no causes to check"
+
+
+# --- §5.6 --------------------------------------------------------------------
+
+
+def test_a_memory_read_names_the_element_and_the_write(tmp_path_factory):
+    """§5.6, end to end: evaluate the index, name `mem[i]`, jump to the write.
+
+    Before this, the walk descended into the array as a whole, found it
+    unreadable, and blamed whichever guard term happened to be false — a
+    confident answer about the wrong signal.
+    """
+    graph, store, _ = build(tmp_path_factory.mktemp("mem"), GOOD_RTL, GOOD / "dump.vcd", "good")
+    result = WhyTracer(graph, store).why("tb_fifo_sync.dut.rd_data", store.time_range[1])
+    nodes = list(result.root.walk())
+
+    elem = next((n for n in nodes if "mem[" in n.signal.path()), None)
+    assert elem is not None, "the chain never named a memory element"
+    assert elem.time < result.root.time, "no jump back to the write"
+    # And the write's own cause is in the tree: `wr_data`, not the read's guards.
+    assert any("wr_data" in n.signal.path() for n in nodes)
+
+
+def test_an_index_is_a_cause_of_the_value_it_selects(tmp_path_factory):
+    graph, store, _ = build(tmp_path_factory.mktemp("idx"), GOOD_RTL, GOOD / "dump.vcd", "good")
+    result = WhyTracer(graph, store).why("tb_fifo_sync.dut.rd_data", store.time_range[1])
+    paths = {n.signal.path() for n in result.root.walk()}
+    assert any("rd_ptr" in p for p in paths), "the index never appeared in the chain"
+
+
+def test_an_index_within_the_declared_depth_is_not_out_of_range(tmp_path_factory):
+    """The bound on an element index is the declared depth — §5.6.
+
+    `lanes` holds 64 words of 8 bits. Deriving the bound from the element width
+    made every index above 7 "outside the declared bounds", which stopped the
+    chain at one node and named a cause that does not exist.
+    """
+    lanes = DESIGNS / "lanes"
+    graph, store, _ = build(
+        tmp_path_factory.mktemp("lanes"), discover(lanes), lanes / "dump.vcd", "lanes"
+    )
+    mem = graph.get("tb_lanes.dut.g_lane[2].u_fifo.mem")
+    assert mem.depth == 64 and mem.width == 8, "fixture no longer has depth != width"
+
+    result = WhyTracer(graph, store).why("tb_lanes.dut.g_lane[2].u_fifo.dout", 200000)
+    reasons = {n.reason for n in result.root.walk()}
+    assert Reason.OUT_OF_RANGE not in reasons
+
+
+def test_a_memory_that_was_not_dumped_says_so(tmp_path_factory):
+    """§5.6's own instruction: say it plainly instead of answering around it."""
+    lanes = DESIGNS / "lanes"
+    graph, store, _ = build(
+        tmp_path_factory.mktemp("lanes2"), discover(lanes), lanes / "dump.vcd", "lanes"
+    )
+    result = WhyTracer(graph, store).why("tb_lanes.dut.g_lane[2].u_fifo.dout", 200000)
+    node = next(n for n in result.root.walk() if "mem[" in n.signal.path())
+    assert node.reason is Reason.NOT_TRACED
+    assert "not in the trace" in node.detail
+    assert "--trace-max-array" in node.detail
+
+
+# --- §7.3 --------------------------------------------------------------------
+
+
+def test_a_reconstructed_value_is_marked_as_derived(tmp_path_factory):
+    """P2: inference must never be presented as observation."""
+    lanes = DESIGNS / "lanes"
+    graph, store, _ = build(
+        tmp_path_factory.mktemp("lanes3"), discover(lanes), lanes / "dump.vcd", "lanes"
+    )
+    derivable = [
+        s.path for s in graph if s.trace_handle is None and s.drivers
+    ]
+    assert derivable, "fixture no longer has a signal that is not in the dump"
+    result = WhyTracer(graph, store).why(derivable[0], 200000)
+    assert result.root.derived is True
+    assert result.root.to_dict()["derived"] is True
+
+
+# --- §8.1's expected value ---------------------------------------------------
+
+
+def test_a_question_about_a_value_the_trace_disagrees_with_is_called_out():
+    q = vtq.parse("why(top.a == 0 @ c1)")
+    assert vtq.expectation(q, "1") is not None
+    assert vtq.expectation(q, "0") is None
+    # Widths and radices line up rather than comparing text to text.
+    assert vtq.expectation(vtq.parse("why(top.a == 0xff @ c1)"), "11111111") is None
+    assert vtq.expectation(vtq.parse("why(top.a == 8'hff @ c1)"), "00000001") is not None
+    # No stated value, nothing to disagree with.
+    assert vtq.expectation(vtq.parse("why(top.a @ c1)"), "1") is None
+
+
+def test_the_bare_form_from_the_spec_is_accepted():
+    q = vtq.parse("top.ctrl.ready == 0 @ c1247")
+    assert (q.signal, q.value, q.time, q.is_cycle) == ("top.ctrl.ready", "0", 1247, True)
+    # ...without swallowing a typo that is not a question at all.
+    for bad in ["why", "cone(top.a)", ""]:
+        with pytest.raises(vtq.QueryError):
+            vtq.parse(bad)
+
+
+def test_json_carries_the_flat_chain_the_cli_documents(buggy):
+    """§13's own example is `--json | jq '.chain[0].loc'`.
+
+    The tree under `root` is the complete answer; `chain` is the primary path
+    through it, flat, so a shell script does not have to walk a DAG. They must
+    describe the same walk — the first entry is the question and the last is
+    what `root_cause` concluded.
+    """
+    from veritrace.analysis.whytrace import root_cause
+
+    graph, store, _ = buggy
+    result = WhyTracer(graph, store).why("tb_fifo_buggy.dut.full", 455000)
+    payload = result.to_dict()
+
+    chain = payload["chain"]
+    assert chain, "no chain in the JSON"
+    assert chain[0]["signal"] == result.root.signal.path()
+    assert chain[0]["loc"]["file"] and chain[0]["loc"]["line"]
+    cause = root_cause(result.root)
+    assert chain[-1]["signal"] == cause.signal.path()
+    assert chain[-1]["reason"] == cause.reason.value
+    # And it is a path, not the whole tree: no node appears twice.
+    assert len({n["signal"] for n in chain}) == len(chain)

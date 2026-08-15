@@ -50,6 +50,18 @@ jobs:
       - name: pytest
         run: uv run pytest
 
+  # §4.2's stress tier. Heavy (1 GB of scratch, about a minute), so it does not
+  # gate every push — but nothing would catch a regression there without it.
+  bench-stress:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tier B — 1 GB over 50k signals
+        run: cargo run --release -p vt-trace --example bench -- 1000 50000
+
   # §13.9: the tool gating itself. A failing build should carry the cause, not
   # a dump nobody will open — so this runs the same commands a user would, on
   # the designs with the deliberate flaws, and asserts what they must find.
@@ -63,6 +75,12 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync
+
+      - name: The golden suite — every reference design reaches its own root cause
+        run: uv run pytest tests/test_golden.py -q
+
+      - name: Time to root cause (§15, column B)
+        run: uv run python bench/ttrc.py
 
       - name: Correlation must not regress
         run: |

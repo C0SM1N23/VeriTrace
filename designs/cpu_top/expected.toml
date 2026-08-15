@@ -1,0 +1,33 @@
+# §14.1's realistic design. Built with BUG_STORE_INDEX; README.md lists the
+# other two and how to build them.
+design = "cpu_top"
+top = "tb_cpu_top"
+bug = """the store uses mem_addr[4:0] as a word index, so `sw x3, 0(x4)` writes \
+word 0 instead of word 16 and the `lw` that follows reads a word nothing ever \
+wrote"""
+# imem and dmem are only partly dumped, and the tb's locals are not design
+# signals, so the bar is not 99.
+correlation_min = 85
+
+[[why]]
+# §5.6 on a processor: the load reads `dmem[mem_addr[6:2]]`, and the answer has
+# to name word 16 rather than the array.
+question = "why(tb_cpu_top.dut.load_data @ 65000)"
+reaches = "tb_cpu_top.dut.dmem[16]"
+not_reason = "out_of_range"
+
+[[why]]
+# And the register file, which is §5.6's own example: `regfile[rs1]` with the
+# index resolved and the chain continuing from the cycle that wrote the word.
+question = "why(tb_cpu_top.dut.rs1_data @ 65000)"
+reaches = "tb_cpu_top.dut.regfile[4]"
+jumps_back = true
+
+[checks]
+# The register file is reset asynchronously and its release is not registered
+# (§8.11) — a real property of this design, and a stable thing to hold the
+# check layer to.
+required_signals = ["tb_cpu_top.dut.regfile"]
+# Every register is reset and both memories are initialised, so nothing here is
+# X once reset is released. An X source on this design means §8.5 regressed.
+forbidden_groups = ["x_sources"]

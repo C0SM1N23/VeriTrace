@@ -324,6 +324,14 @@ fn write_part(
                 row_offset: start as u64,
                 t_first: s.times[start],
                 t_last: s.times[end - 1],
+                // The first timestamp that is not the chunk's first. Written
+                // here because the writer already has the times in hand; the
+                // reader would have to decode the whole column to learn it.
+                t_second: s.times[start..end]
+                    .iter()
+                    .copied()
+                    .find(|&t| t != s.times[start])
+                    .unwrap_or(crate::model::Time::MAX),
             });
             row_group += 1;
             start = end;

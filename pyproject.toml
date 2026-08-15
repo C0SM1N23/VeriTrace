@@ -7,6 +7,12 @@ name = "veritrace"
 version = "0.1.0"
 description = "RTL verification hub built on free tooling: causal why-trace and transaction-level analysis over Icarus/Verilator/ModelSim/xsim waveforms."
 readme = "README.md"
+# §1.8: permissive on purpose. VeriTrace reads RTL as data and links into
+# nothing, so nothing it touches can be "contaminated" — and a tool that needs
+# legal review before a first run does not get one. LICENSE-GENERATED covers
+# the separate question of what `gen-sva` and `stimgen` output carry.
+license = "MIT"
+license-files = ["LICENSE", "LICENSE-GENERATED"]
 # The upper bound is not cosmetic: PyO3 refuses to compile against a CPython
 # newer than the version it knows about, and without a ceiling here pip picks
 # such an interpreter, starts a source build and fails with a wall of Rust
@@ -30,6 +36,10 @@ dependencies = [
     # the page and silently break every report that quotes a non-blocking
     # assignment.
     "jinja2>=3.1",
+    # §13.6's regression database. A file, not a server — which is the whole
+    # reason the spec names DuckDB: `record` and `history` have to work in a
+    # repository checkout with nothing running.
+    "duckdb>=1.0",
     # SystemVerilog front end. Needed for the *elaborated* AST — generate blocks
     # expanded and parameters resolved — which is what makes correlation
     # tractable (§4.1).
@@ -70,4 +80,7 @@ include = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "httpx>=0.27"]
+# §14.2 makes property-based testing part of the plan, not an extra: the
+# expression layer is 4-state and the cases nobody thinks of are exactly the
+# ones that produce a confidently wrong causal chain.
+dev = ["pytest>=8.0", "httpx>=0.27", "hypothesis>=6.0"]

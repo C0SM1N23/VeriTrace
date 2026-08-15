@@ -260,6 +260,11 @@ impl TraceStore {
         self.inner.first_x(handle).map_err(map_err)
     }
 
+    /// First X at or after `t` — §8.5's post-reset scan.
+    fn first_x_from(&self, handle: u32, t: i64) -> PyResult<Option<i64>> {
+        self.inner.first_x_from(handle, t).map_err(map_err)
+    }
+
     // ---- §5.5 time model ------------------------------------------------
 
     /// Settled value strictly before `t`. This is what NBA evaluation at a
