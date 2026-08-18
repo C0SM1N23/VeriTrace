@@ -269,3 +269,48 @@ def test_fst_support_is_reported(tmp_path):
         result = runner.invoke(main, ["convert", str(src)])
         assert result.exit_code != 0
         assert "fst" in result.output.lower()
+
+
+def test_a_store_pointed_at_directly_is_still_checked_against_its_dump(tmp_path):
+    """The hole the first fix left, found the first time it met a real project.
+
+    `trace.default` in `.veritrace.toml` resolves to the `.vtx` when one is
+    already there, so `veritrace serve` hands `ensure` a *directory*. That
+    branch only ever asked whether the store was readable — so re-running the
+    simulation and then serving produced a session built from yesterday's dump,
+    with the RTL-changed banner on it because the sources had moved on and the
+    trace, silently, had not.
+    """
+    from veritrace import TraceStore
+    from veritrace import store as store_mod
+
+    vcd = "$timescale 1ns $end\n$scope module tb $end\n$var reg 8 ! d [7:0] $end\n" \
+          "$upscope $end\n$enddefinitions $end\n#0\nb0 !\n#10\nb{v} !\n"
+    src = tmp_path / "dump.vcd"
+    src.write_text(vcd.format(v="1010"))
+    store = store_mod.ensure(src)
+    assert str(TraceStore(str(store)).value_at(0, 10)) == "1010"
+
+    # Re-run the simulation, then ask for the store by name rather than by dump.
+    src.write_text(vcd.format(v="11110000"))
+    again = store_mod.ensure(store)
+    assert again == store
+    assert str(TraceStore(str(again)).value_at(0, 10)) == "11110000"
+
+
+def test_a_store_with_no_dump_beside_it_is_served_as_it_is(tmp_path):
+    """§13.8 ships `.vtx` stores without their dumps — a colleague's bundle, or
+    a store committed on its own. Nothing to compare against is not a reason to
+    refuse to open one."""
+    import shutil
+
+    from veritrace import store as store_mod
+
+    src = tmp_path / "dump.vcd"
+    src.write_text(SAMPLE_VCD)
+    store = store_mod.ensure(src)
+    alone = tmp_path / "elsewhere" / "dump.vcd.vtx"
+    alone.parent.mkdir()
+    shutil.copytree(store, alone)
+
+    assert store_mod.ensure(alone) == alone

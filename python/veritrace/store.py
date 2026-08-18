@@ -76,6 +76,17 @@ def _matches_source(store: Path, source: Path) -> bool:
     return recorded is None or recorded == source.stat().st_size
 
 
+def _is_current(store: Path, source: Path) -> bool:
+    """Whether `store` is still the answer for what is in `source` today.
+
+    Both halves are needed and neither is enough. A newer dump is the ordinary
+    re-simulation; a dump of a different size with the *same* timestamp is a
+    `git checkout`, a `cp -p` or an extracted archive, and reading the store
+    then means every answer is about the previous run.
+    """
+    return store.stat().st_mtime >= source.stat().st_mtime and _matches_source(store, source)
+
+
 def ensure(path: Path, announce: Callable[[str], None] | None = None) -> Path:
     """`path` as a store, converting a raw dump if that is what it is.
 
@@ -85,23 +96,34 @@ def ensure(path: Path, announce: Callable[[str], None] | None = None) -> Path:
     """
     path = Path(path)
     if path.is_dir() or path.suffix.lower() not in RAW:
-        # A store handed over directly. If this build cannot read it — an index
-        # written by an older version — rebuild it from the dump beside it. The
-        # alternative is a stack trace about a version number, on a machine that
-        # has everything it needs to fix the problem itself.
-        if path.is_dir() and not _readable(path):
+        # A store handed over directly — by the caller, or by `trace.default`
+        # in `.veritrace.toml` resolving to a `.vtx` that is already there.
+        # Either way the dump it came from may still be beside it, and may have
+        # moved on since: re-running the simulation is the whole reason this
+        # check exists, and pointing at the store rather than at the dump must
+        # not be a way around it.
+        if path.is_dir():
             src = _source_of(path)
-            if src is None:
-                raise ValueError(
-                    f"{path} was written by a different version of VeriTrace and the "
-                    "dump it came from is not beside it. Convert the dump again: "
-                    "`veritrace convert <dump.vcd>`."
-                )
-            if announce:
-                announce(f"{path} is an older store format; rebuilding from {src.name}")
-            from veritrace import _native
+            why = None
+            if not _readable(path):
+                # An index written by an older version. The alternative to
+                # rebuilding is a stack trace about a version number, on a
+                # machine that has everything it needs to fix the problem.
+                why = "is an older store format"
+            elif src is not None and not _is_current(path, src):
+                why = f"is older than {src.name}"
+            if why is not None:
+                if src is None:
+                    raise ValueError(
+                        f"{path} was written by a different version of VeriTrace and the "
+                        "dump it came from is not beside it. Convert the dump again: "
+                        "`veritrace convert <dump.vcd>`."
+                    )
+                if announce:
+                    announce(f"{path} {why}; rebuilding from {src.name}")
+                from veritrace import _native
 
-            _native.convert(str(src), str(path))
+                _native.convert(str(src), str(path))
         return path
 
     from veritrace import _native
@@ -110,9 +132,8 @@ def ensure(path: Path, announce: Callable[[str], None] | None = None) -> Path:
     fresh = (
         out.is_dir()
         and (out / "index.bin").exists()
-        and out.stat().st_mtime >= path.stat().st_mtime
         and _readable(out)
-        and _matches_source(out, path)
+        and _is_current(out, path)
     )
     if not fresh:
         if announce:
