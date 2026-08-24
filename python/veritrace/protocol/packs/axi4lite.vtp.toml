@@ -59,13 +59,16 @@ start = "AR"
 end   = { channel = "R", count = "1" }
 key   = "addr = AR.araddr"
 
-# In cycles, not in raw time units: §8.13's own example reads "latency: 22
-# cycles (addr->resp)", and a column of picoseconds is one nobody can read
-# without knowing the timescale — including §8.17's latency histogram, whose
-# axis would otherwise be meaningless.
+# Every duration in cycles, not in raw time units: §8.13's own example reads
+# "latency: 22 cycles (addr->resp)", and a column of picoseconds is one nobody
+# can read without knowing the timescale — including §8.17's latency histogram,
+# whose axis would otherwise be meaningless. All of them, because these land in
+# one row of the Transactions table where the unit is the only thing telling
+# them apart: with `addr_latency` alone left in ticks the table read
+# "latency 9, addr_latency 80000" for a wait of eight cycles.
 [metrics]
 latency      = "end.cycle - start.cycle"
-addr_latency = "AW.accept_time - AW.assert_time"
+addr_latency = "AW.accept_cycle - AW.assert_cycle"
 stall_cycles = "sum(stall)"
 
 # §8.17. W and R are where the bus does work; AW, AR and B are the overhead a

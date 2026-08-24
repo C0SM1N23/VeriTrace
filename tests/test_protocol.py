@@ -113,8 +113,15 @@ def test_latency_is_measured_from_issue_as_section_8_13_prints_it(axi_lite):
     # In cycles, which is what §8.13 prints and what §8.17's histogram plots.
     assert t.metrics["latency"] == clock.cycle_of(t.end_time) - clock.cycle_of(t.start_time)
     assert t.metrics["latency"] == (t.end_time - t.start_time) // clock.period
-    # Two wait states in the slave, so acceptance is two cycles after issue.
-    assert t.metrics["addr_latency"] == 2 * clock.period
+    # Two wait states in the slave, so acceptance is two cycles after issue —
+    # and in cycles, like the latency beside it. These two sit in the same row
+    # of the Transactions table, so a reader has nothing but the unit to go on;
+    # while this one was in raw ticks the table read "latency 9, addr_latency
+    # 80000" for a wait of eight cycles.
+    assert t.metrics["addr_latency"] == 2
+    assert t.metrics["addr_latency"] == (
+        clock.cycle_of(t.beats("AW")[0].time) - clock.cycle_of(t.beats("AW")[0].assert_time)
+    )
     assert t.start_time == t.beats("AW")[0].assert_time
     assert t.beats("AW")[0].time > t.start_time
 

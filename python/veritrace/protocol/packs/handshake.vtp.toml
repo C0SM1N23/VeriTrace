@@ -35,7 +35,7 @@ start = "X"
 # the engine counts the waiting cycles during the scan and exposes them per beat
 # as `stall`. Same number, and it is decidable.
 stall_cycles = "sum(stall)"
-wait         = "X.accept_time - X.assert_time"
+wait         = "X.accept_cycle - X.assert_cycle"
 
 # §8.17. One channel, so `valid` and `ready` in the cascade below are literally
 # these wires — the generic aggregate and the signal are the same thing here,

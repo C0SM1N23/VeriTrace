@@ -71,7 +71,7 @@ key   = "addr = AR.araddr"
 [metrics]
 # In cycles, not raw time units — vezi axi4lite.vtp.toml.
 latency      = "end.cycle - start.cycle"
-addr_latency = "AW.accept_time - AW.assert_time"
+addr_latency = "AW.accept_cycle - AW.assert_cycle"
 data_beats   = "count(W)"
 stall_cycles = "sum(stall)"
 

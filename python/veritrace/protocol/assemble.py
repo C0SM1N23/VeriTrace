@@ -122,8 +122,15 @@ class TxnEnv:
                 return ev.time
             case "assert_time":
                 return ev.assert_time
-            case "cycle":
+            # Both instants also in cycles, so a duration written from them can
+            # be in the same unit as `end.cycle - start.cycle`. Without an
+            # `assert_cycle`, §8.14's own `addr_latency` had no way to be
+            # anything but raw ticks, and sat in the Transactions table beside a
+            # latency in cycles with nothing to tell them apart.
+            case "cycle" | "accept_cycle":
                 return self._cycle(ev.time)
+            case "assert_cycle":
+                return self._cycle(ev.assert_time)
             case "stall":
                 return ev.stall
         return ev.fields.get(field_name)
@@ -179,6 +186,10 @@ class _EventEnv:
                 return self.ev.time
             case "assert_time":
                 return self.ev.assert_time
+            case "cycle" | "accept_cycle":
+                return self.parent._cycle(self.ev.time)
+            case "assert_cycle":
+                return self.parent._cycle(self.ev.assert_time)
             case "channel":
                 return self.ev.channel
         if name in self.ev.fields:
