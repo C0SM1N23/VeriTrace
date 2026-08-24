@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 from veritrace import __version__
 from veritrace._native import MAX_PX
 from veritrace.analysis import cone, params, vtq
-from veritrace.api.search import hierarchy_level, search_signals, signal_json
+from veritrace.api.search import hierarchy_level, search_signals, signal_json, subtree_signals
 from veritrace.api.sessions import Session, SessionRegistry
 from veritrace.config import WORK_DIR
 
@@ -324,7 +324,23 @@ def create_app(
 
     @api.get("/session/{session_id}/hierarchy")
     def hierarchy(session_id: str, path: str | None = None) -> dict[str, Any]:
+        """§11.3's left column: the design tree, one level at a time."""
         return hierarchy_level(require(session_id).store, path)
+
+    @api.get("/session/{session_id}/hierarchy/signals")
+    def hierarchy_signals(
+        session_id: str,
+        path: str | None = None,
+        limit: int = Query(default=5000, ge=1, le=50_000),
+    ) -> dict[str, Any]:
+        """Every signal at or below one scope — ModelSim's `add wave -r`.
+
+        The tree is lazy per level (§10.1), so the client cannot assemble this
+        itself without one request per scope; and a viewer where a design is
+        put on screen one signal at a time is not a viewer anybody uses.
+        """
+        rows = subtree_signals(require(session_id).store, path, limit)
+        return {"path": path or "", "count": len(rows), "signals": rows}
 
     @api.get("/session/{session_id}/signals")
     def signals(

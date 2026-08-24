@@ -836,3 +836,21 @@ export interface CoverageReport {
   errors: string[];
   ms: number;
 }
+
+/** One node of §11.3's design tree. */
+export interface HierarchyScope {
+  name: string;
+  kind: string;
+  path: string;
+  /** Sub-scopes directly under this one. */
+  n_children: number;
+  /** Signals in the whole subtree — what "add everything here" would add. */
+  n_signals: number;
+}
+
+/** One level of the tree: `GET /session/{id}/hierarchy?path=`. */
+export interface HierarchyLevel {
+  path: string;
+  scopes: HierarchyScope[];
+  signals: SignalMeta[];
+}

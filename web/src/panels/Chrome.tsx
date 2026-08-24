@@ -208,6 +208,8 @@ export function StatusBar() {
   const rowH = useWave((s) => s.rowH);
   const setRowH = useWave((s) => s.setRowH);
   const zoomAll = useWave((s) => s.zoomAll);
+  const treeOpen = useWave((s) => s.treeOpen);
+  const toggleTree = useWave((s) => s.toggleTree);
 
   useEffect(() => {
     const write = () => {
@@ -241,6 +243,14 @@ export function StatusBar() {
         data-testid="ruler-toggle"
       >
         {rulerMode === "time" ? "time" : "cycles"}
+      </button>
+      <button
+        className="chip"
+        onClick={toggleTree}
+        title="Show or hide the design tree (⌘\)"
+        data-testid="tree-toggle"
+      >
+        {treeOpen ? "tree" : "no tree"}
       </button>
       <button
         className="chip"

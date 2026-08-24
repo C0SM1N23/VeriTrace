@@ -12,6 +12,7 @@ import type { PluginTable } from "./lib/types";
 
 /** Shared, so the selector below returns a stable reference — see Chrome.tsx. */
 const NO_TABLES: PluginTable[] = [];
+import { HierarchyPanel } from "./panels/HierarchyPanel";
 import { SignalPanel } from "./panels/SignalPanel";
 import { SourceTab } from "./panels/SourceTab";
 import { MemoryTab } from "./panels/MemoryTab";
@@ -27,6 +28,7 @@ export default function App() {
   const load = useWave((s) => s.load);
   const tab = useWave((s) => s.activeTab);
   const replay = useWave((s) => s.replay);
+  const tree = useWave((s) => s.treeOpen);
   const fsmOpen = useWave((s) => s.fsmOpen);
   const rtlChanged = useWave((s) => s.status?.rtl_changed ?? false);
   const pluginTables = useWave((s) => s.checks?.plugin_tables ?? NO_TABLES);
@@ -75,7 +77,12 @@ export default function App() {
       )}
       <QueryBar />
       <TabStrip />
-      <div className="main">
+      {/* §11.3's three columns: the design tree, the wave list, the panes.
+          The tree is collapsible like the others — *"Toate cele trei coloane
+          sunt colapsabile"* — because on a narrow screen the waveform is what
+          matters and the tree has done its job once the signals are on it. */}
+      <div className={tree ? "main" : "main no-tree"}>
+        {tree && <HierarchyPanel />}
         <SignalPanel />
         {/* The wave canvas stays mounted across tabs: re-creating the worker
             and refetching on every tab switch would make the app feel cheap. */}
@@ -166,6 +173,13 @@ function useKeyboard() {
       if (mod && e.key.toLowerCase() === "k") {
         e.preventDefault();
         window.dispatchEvent(new Event("vt:focus-query"));
+        return;
+      }
+      if (mod && e.key === "\\") {
+        // The chord the help overlay has always advertised (§11.3: every column
+        // is collapsible). It was in the list and did nothing.
+        e.preventDefault();
+        s.toggleTree();
         return;
       }
       if (e.key === "Escape") {

@@ -13,6 +13,7 @@ import type {
   CorrelationReport,
   CoverageReport,
   DiffReport,
+  HierarchyLevel,
   Layout,
   Machine,
   MemoryReport,
@@ -112,6 +113,30 @@ export async function fetchStatus(session: string): Promise<SessionStatus> {
 export async function fetchSignals(session: string, q = "", limit = 5000): Promise<SignalMeta[]> {
   const body = await getJson<{ signals: SignalMeta[] }>(
     `${API}/session/${session}/signals?q=${encodeURIComponent(q)}&limit=${limit}`,
+  );
+  return body.signals;
+}
+
+/**
+ * One level of §11.3's design tree.
+ *
+ * Lazy per level, as §10.1 specifies: a 50k-signal design must not serialise
+ * its whole hierarchy to show the top of it.
+ */
+export async function fetchHierarchy(session: string, path = ""): Promise<HierarchyLevel> {
+  return getJson<HierarchyLevel>(
+    `${API}/session/${session}/hierarchy?path=${encodeURIComponent(path)}`,
+  );
+}
+
+/** Every signal at or below one scope — ModelSim's `add wave -r`. */
+export async function fetchSubtreeSignals(
+  session: string,
+  path = "",
+  limit = 5000,
+): Promise<SignalMeta[]> {
+  const body = await getJson<{ signals: SignalMeta[] }>(
+    `${API}/session/${session}/hierarchy/signals?path=${encodeURIComponent(path)}&limit=${limit}`,
   );
   return body.signals;
 }

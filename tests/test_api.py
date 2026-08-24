@@ -568,6 +568,56 @@ def test_a_vtq_command_that_needs_rtl_says_which_half_is_missing(client, session
     assert ok.status_code == 200 and ok.json()["signals"]
 
 
+def test_the_hierarchy_is_a_tree_that_can_be_walked_one_level_at_a_time(checks_client):
+    """§11.3's left column, and §10.1's lazy-per-level rule behind it.
+
+    The endpoint existed from the start and no frontend code called it, so the
+    only way to put a signal on screen was one at a time — which is what makes
+    a viewer unusable next to `add wave -r`.
+    """
+    client, sid = checks_client
+    root = client.get(f"/session/{sid}/hierarchy").json()
+    assert [s["name"] for s in root["scopes"]] == ["tb_checks"]
+    top = root["scopes"][0]
+    # A collapsed node says what it is hiding, so "add everything here" can be
+    # a decision rather than a surprise.
+    assert top["n_signals"] > top["n_children"] > 0
+
+    level = client.get(f"/session/{sid}/hierarchy", params={"path": "tb_checks"}).json()
+    assert level["path"] == "tb_checks"
+    assert level["scopes"], "tb_checks has sub-scopes"
+    # Lazy: this level carries its own signals, not the subtree's.
+    assert len(level["signals"]) < top["n_signals"]
+    assert all(s["scope"] == "tb_checks" for s in level["signals"])
+
+
+def test_add_wave_recursive_returns_the_whole_subtree(checks_client):
+    """The one action that separates a usable viewer from a signal-at-a-time one."""
+    client, sid = checks_client
+    top = client.get(f"/session/{sid}/hierarchy").json()["scopes"][0]
+
+    everything = client.get(f"/session/{sid}/hierarchy/signals").json()
+    assert everything["count"] == top["n_signals"], "the count on the node is what you get"
+
+    part = client.get(
+        f"/session/{sid}/hierarchy/signals", params={"path": "tb_checks.dut"}
+    ).json()
+    assert 0 < part["count"] < everything["count"]
+    assert all(
+        s["path"].startswith("tb_checks.dut.") or s["scope"] == "tb_checks.dut"
+        for s in part["signals"]
+    )
+    # Hierarchy order, not alphabetical: the wave should read like the design.
+    scopes = [s["scope"] for s in part["signals"]]
+    assert scopes == sorted(scopes)
+
+    # A limit is honoured — a 50k-signal design must not be able to ask for one
+    # response with everything in it by accident.
+    assert client.get(
+        f"/session/{sid}/hierarchy/signals", params={"limit": 5}
+    ).json()["count"] == 5
+
+
 def test_correlation_route_carries_the_names_behind_the_rate(checks_client):
     """§7.2's rate is only actionable next to the list it summarises."""
     client, sid = checks_client

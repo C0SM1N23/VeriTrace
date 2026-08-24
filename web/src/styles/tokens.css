@@ -51,6 +51,8 @@
    * read the ±8-cycle window the step auto-scrolls to, not enough to browse. */
   --replay-wave-h: 220px;
 
+  /* §11.3's left column, the design tree. */
+  --tree-w: 240px;
   --hierarchy-w: 240px;
   --inspector-w: 300px;
 }

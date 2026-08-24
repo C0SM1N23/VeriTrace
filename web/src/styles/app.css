@@ -170,7 +170,9 @@ select:focus-visible {
 
 .main {
   display: grid;
-  grid-template-columns: var(--hierarchy-w) 1fr;
+  /* §11.3: HIERARCHY | main | INSPECTOR. The tree is the first column and the
+     wave's signal list the second; `.no-tree` below drops back to two. */
+  grid-template-columns: var(--tree-w) var(--hierarchy-w) 1fr;
   gap: var(--panel-gap);
   background: var(--line);
   min-height: 0;
@@ -2870,4 +2872,104 @@ select:focus-visible {
   margin-left: auto;
   font-family: var(--font-data);
   color: var(--text-bright);
+}
+
+/* --- §11.3's design tree ------------------------------------------------- */
+
+.main.no-tree {
+  grid-template-columns: var(--hierarchy-w) 1fr;
+}
+
+.tree {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg-panel);
+  font-family: var(--font-chrome);
+  font-size: 11px;
+}
+
+.tree-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--line);
+  letter-spacing: 0.06em;
+  /* The note ("+47 signals from dut") is transient and can be long; it must
+     never push the header wider than the column. */
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.tree-body {
+  flex: 1;
+  overflow: auto;
+  padding: 2px 0;
+}
+
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 19px;
+  padding-right: 6px;
+}
+
+.tree-row:hover {
+  background: var(--bg-raised);
+}
+
+/* The `+ all` button appears on hover: it is on every row, and showing all of
+   them at once turns the tree into a wall of buttons. */
+.tree-add {
+  opacity: 0;
+  padding: 0 4px;
+  font-size: 10px;
+}
+
+.tree-row:hover .tree-add,
+.tree-add:focus-visible {
+  opacity: 1;
+}
+
+.tree-twisty,
+.tree-sig {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  background: none;
+  border: none;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.tree-twisty {
+  color: var(--text-bright);
+}
+
+.tree-sig.on {
+  color: var(--text-dim);
+}
+
+.tree-sig.on::after {
+  content: "•";
+  color: var(--text-bright);
+}
+
+.tree-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tree-count {
+  flex: none;
+  font-size: 10px;
 }

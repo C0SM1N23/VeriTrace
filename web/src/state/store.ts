@@ -201,6 +201,8 @@ export interface WaveState {
   filter: string;
   paletteOpen: boolean;
   helpOpen: boolean;
+  /** §11.3's design tree column. ⌘\ collapses it. */
+  treeOpen: boolean;
   activeTab: number;
   ready: boolean;
   error: string | null;
@@ -219,6 +221,8 @@ export interface WaveState {
   moveRow: (from: number, to: number) => void;
   removeRow: (index: number) => void;
   addSignal: (handle: number) => void;
+  /** Add many signals at once, optionally under a group header (§11.3). */
+  addSignals: (handles: number[], group?: string) => number;
   addGroup: (name: string) => void;
   toggleGroup: (id: string) => void;
   renameGroup: (id: string, name: string) => void;
@@ -228,6 +232,7 @@ export interface WaveState {
   setFilter: (q: string) => void;
   setPalette: (open: boolean) => void;
   setHelp: (open: boolean) => void;
+  toggleTree: () => void;
   setTab: (n: number) => void;
   stepEdge: (dir: 1 | -1) => Promise<void>;
   runWhy: (signalPath: string, t: number) => Promise<void>;
@@ -440,6 +445,7 @@ export const useWave = create<WaveState>((set, get) => ({
   filter: "",
   paletteOpen: false,
   helpOpen: false,
+  treeOpen: true,
   activeTab: 1,
   ready: false,
   error: null,
@@ -571,6 +577,36 @@ export const useWave = create<WaveState>((set, get) => ({
     set({ rows: [...get().rows, { kind: "signal", handle, path: sig.path }] });
     schedulePersist(get);
   },
+  /**
+   * The bulk half of §11.3's tree, and the reason it exists.
+   *
+   * A viewer where a design is assembled one signal at a time is not one
+   * anybody uses next to `add wave -r /*`. Already-shown signals are skipped
+   * rather than duplicated — clicking a scope twice should be idempotent, not
+   * a way to get two of everything — and the count of what was actually added
+   * is returned so the caller can say so.
+   */
+  addSignals: (handles, group) => {
+    const state = get();
+    const shown = new Set(
+      state.rows.flatMap((r) => (r.kind === "signal" ? [r.handle] : [])),
+    );
+    const fresh: Row[] = [];
+    for (const handle of handles) {
+      if (shown.has(handle)) continue;
+      const sig = state.signalsByHandle.get(handle);
+      if (!sig) continue;
+      shown.add(handle);
+      fresh.push({ kind: "signal", handle, path: sig.path });
+    }
+    if (fresh.length === 0) return 0;
+    const header: Row[] = group
+      ? [{ kind: "group", id: `g${Date.now().toString(36)}`, name: group, collapsed: false }]
+      : [];
+    set({ rows: [...state.rows, ...header, ...fresh] });
+    schedulePersist(get);
+    return fresh.length;
+  },
   addGroup: (name) => {
     const id = `g${Date.now().toString(36)}`;
     set({ rows: [...get().rows, { kind: "group", id, name, collapsed: false }] });
@@ -603,6 +639,8 @@ export const useWave = create<WaveState>((set, get) => ({
   setFilter: (q) => set({ filter: q }),
   setPalette: (open) => set({ paletteOpen: open }),
   setHelp: (open) => set({ helpOpen: open }),
+  toggleTree: () => set({ treeOpen: !get().treeOpen }),
+
   setTab: (n) => set({ activeTab: n }),
 
   stepEdge: async (dir) => {
