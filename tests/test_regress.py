@@ -258,3 +258,42 @@ def test_a_waived_item_is_not_scored(tmp_path):
     p = plan_mod.link(plan_mod.load(f))
     assert p.items[0].evidence == "waived"
     assert p.score == 0.0, "one scored item, not covered"
+
+
+def test_record_and_history_resolve_the_same_database(tmp_path, monkeypatch):
+    """§13.6's two commands have to agree about where the file is.
+
+    `record` anchored the default to the project root and the readers anchored
+    it to the working directory, so recording beside a simulation and querying
+    from the repository root — the sequence §13.6 documents — reported that the
+    database `record` had just written did not exist.
+    """
+    from veritrace.cli import _regress_db
+
+    (tmp_path / ".veritrace.toml").write_text(
+        '[design]\ntop = "dut"\nrtl = ["rtl/*.sv"]\n', encoding="utf-8"
+    )
+    sub = tmp_path / "sim" / "deep"
+    sub.mkdir(parents=True)
+
+    monkeypatch.chdir(tmp_path)
+    at_root = _regress_db(None)
+    monkeypatch.chdir(sub)
+    from_below = _regress_db(None)
+
+    assert at_root == from_below == tmp_path / "regressions.duckdb"
+
+
+def test_without_a_project_the_working_directory_is_the_anchor(tmp_path, monkeypatch):
+    """No config means no project, and then there is nothing else to anchor to."""
+    from veritrace.cli import _regress_db
+
+    monkeypatch.chdir(tmp_path)
+    assert _regress_db(None) == tmp_path / "regressions.duckdb"
+
+
+def test_an_explicit_db_wins(tmp_path, monkeypatch):
+    from veritrace.cli import _regress_db
+
+    monkeypatch.chdir(tmp_path)
+    assert _regress_db(tmp_path / "elsewhere.duckdb") == tmp_path / "elsewhere.duckdb"

@@ -140,10 +140,35 @@ def build_config(
     }
 
 
+def _speak_utf8() -> None:
+    """Write UTF-8 whatever the console's code page is.
+
+    Python picks the ANSI code page for stdout on Windows, so every `§` and `—`
+    the reports are written with left as cp1252 bytes: fine on a native console,
+    mojibake in Git Bash, in a CI log, and in any file the output is redirected
+    to. Section references are how findings point back at the spec, so they are
+    worth keeping legible.
+
+    Only the encoding changes, and only when it is not already UTF-8 — a stream
+    a test or a pipe has replaced with something else is left alone.
+    """
+    import sys
+
+    for stream in (sys.stdout, sys.stderr):
+        enc = (getattr(stream, "encoding", "") or "").lower().replace("-", "")
+        if enc in ("utf8", "") or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass  # an unusual stream is not a reason to fail the command (P7)
+
+
 @click.group()
 @click.version_option(version=__version__, prog_name="veritrace")
 def main() -> None:
     """VeriTrace command-line interface."""
+    _speak_utf8()
 
 
 def _resolve_rtl(rtl: tuple[Path, ...], top: str | None) -> tuple[list[Path], list[str], list[str], str | None]:
@@ -3808,11 +3833,39 @@ def _remember_ingest(ctx, cocotb_log: Path | None, uvm_db: Path | None) -> None:
 # --- §13.6 regression database, §8.36 scorecard, §8.37 test plan -----------
 
 
+def _regress_db(db_path: Path | None) -> Path:
+    """Where §13.6's database lives, resolved the same way for every command.
+
+    It has to be one rule. `record` anchored the default to the project root and
+    the two readers anchored it to the working directory, so the documented
+    sequence contradicted itself the moment they were run from different places
+    — which is the normal case, since you record beside a simulation and query
+    from the repository root:
+
+        $ cd designs/axi_lite && veritrace record …
+        run 1 recorded
+        $ veritrace history
+        Error: regressions.duckdb does not exist yet
+
+    The project root is the right anchor: the database is the project's memory,
+    not one directory's. With no config there is no project, and the working
+    directory is all there is.
+    """
+    if db_path is not None:
+        return db_path
+    from veritrace import config as cfg
+    from veritrace.regress.db import DEFAULT_DB
+
+    conf = cfg.load()
+    root = getattr(conf, "root", None) if conf is not None else None
+    return Path(root or Path.cwd()) / DEFAULT_DB
+
+
 @main.command()
 @click.argument("trace", type=click.Path(path_type=Path), required=False, default=None)
 @rtl_options
 @click.option("--db", "db_path", type=click.Path(path_type=Path), default=None,
-              help="The DuckDB file (default: regressions.duckdb next to the config).")
+              help="The DuckDB file (default: regressions.duckdb at the project root).")
 @click.option("--tag", default="", help='Free label, e.g. "commit=$(git rev-parse --short HEAD)".')
 @click.option("--seed", type=int, default=None,
               help="The randomisation seed this run used. Mandatory (§13.6).")
@@ -3861,7 +3914,7 @@ def record(trace, rtl, top, db_path, tag, seed, simulator, simulator_version, co
     )
     _collect(ctx, run)
 
-    con = regress.connect(db_path or (Path(root) / regress.DEFAULT_DB))
+    con = regress.connect(_regress_db(db_path))
     run_id = regress.record(con, run)
     con.close()
     click.echo(
@@ -3920,8 +3973,8 @@ def _jsonable(v):
 
 @main.command()
 @click.argument("sql", required=False)
-@click.option("--db", "db_path", type=click.Path(exists=True, path_type=Path), default=None,
-              help="The DuckDB file (default: regressions.duckdb).")
+@click.option("--db", "db_path", type=click.Path(path_type=Path), default=None,
+              help="The DuckDB file (default: regressions.duckdb at the project root).")
 @click.option("--limit", default=40, type=int, help="Rows, when no SQL is given.")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 def history(sql, db_path, limit, as_json):
@@ -3935,7 +3988,7 @@ def history(sql, db_path, limit, as_json):
     """
     from veritrace import regress
 
-    path = db_path or Path(regress.DEFAULT_DB)
+    path = _regress_db(db_path)
     if not Path(path).exists():
         raise click.ClickException(f"{path} does not exist yet — `veritrace record` writes it.")
     con = regress.connect(path)
@@ -3972,8 +4025,8 @@ def history(sql, db_path, limit, as_json):
 
 @main.command()
 @click.option("--run-id", type=int, default=None, help="Which run (default: the latest).")
-@click.option("--db", "db_path", type=click.Path(exists=True, path_type=Path), default=None,
-              help="The DuckDB file (default: regressions.duckdb).")
+@click.option("--db", "db_path", type=click.Path(path_type=Path), default=None,
+              help="The DuckDB file (default: regressions.duckdb at the project root).")
 @rtl_options
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 def reproduce(run_id, db_path, rtl, top, as_json):
@@ -3987,7 +4040,7 @@ def reproduce(run_id, db_path, rtl, top, as_json):
     """
     from veritrace import regress
 
-    path = db_path or Path(regress.DEFAULT_DB)
+    path = _regress_db(db_path)
     if not Path(path).exists():
         raise click.ClickException(f"{path} does not exist yet — `veritrace record` writes it.")
     con = regress.connect(path)
