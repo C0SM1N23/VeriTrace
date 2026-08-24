@@ -21,6 +21,8 @@ import subprocess
 from pathlib import Path
 
 import pytest
+
+from conftest import design_store
 from click.testing import CliRunner
 
 from veritrace import simulate
@@ -101,10 +103,9 @@ def test_the_new_packs_do_not_steal_the_existing_designs():
     from veritrace.protocol import engine
 
     design = DESIGNS / "axi_lite"
-    store = TraceStore(str(design / "dump.vcd.vtx"))
-    analysis = engine.extract(
-        store, design / "dump.vcd.vtx", clocks.resolve(store), None, project_root=design
-    )
+    vtx = design_store("axi_lite")
+    store = TraceStore(str(vtx))
+    analysis = engine.extract(store, vtx, clocks.resolve(store), None, project_root=design)
     packs = {e.interface.pack.name for e in analysis.extractions}
     assert packs == {"AXI4-Lite"}, packs
 
@@ -195,7 +196,7 @@ def test_the_portable_checker_compiles_and_runs_in_icarus(tmp_path):
         main,
         [
             "gen-sva",
-            str(DESIGNS / "axi_lite" / "dump.vcd.vtx"),
+            str(design_store("axi_lite")),
             "--rtl",
             str(DESIGNS / "axi_lite"),
             "--target",

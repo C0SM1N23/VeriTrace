@@ -253,20 +253,35 @@ def test_every_reporting_command_can_be_scripted():
     assert NOT_A_REPORT <= set(cli.list_commands(ctx))
 
 
+def _json_out(result):
+    """The JSON a `--json` command printed, past anything on stderr.
+
+    CliRunner folds stderr into `output`, and a command that has to convert a
+    dump first announces it there — so a payload that parses on a machine with
+    the store already built fails on a clean checkout. Taking the document from
+    its first brace is what makes the assertion about the JSON rather than
+    about what else happened to be on the terminal.
+    """
+    text = result.output
+    start = min((i for i in (text.find("{"), text.find("[")) if i >= 0), default=-1)
+    assert start >= 0, f"no JSON in output: {text!r}"
+    return json.loads(text[start:])
+
+
 def test_packs_and_plugins_are_machine_readable():
-    packs = json.loads(run(["packs", "--root", str(DESIGNS / "axi_lite"), "--json"]).output)
+    packs = _json_out(run(["packs", "--root", str(DESIGNS / "axi_lite"), "--json"]))
     assert packs["errors"] == []
     assert "AXI4-Lite" in [p["name"] for p in packs["packs"]]
 
-    matched = json.loads(
+    matched = _json_out(
         run([
             "packs", "--root", str(DESIGNS / "axi_lite"),
             "--trace", str(DESIGNS / "axi_lite" / "dump.vcd"), "--json",
-        ]).output
+        ])
     )
     assert [m["pack"] for m in matched["matched"]] == ["AXI4-Lite"]
 
-    plugins = json.loads(run(["plugins", "--root", str(DESIGNS / "fsm"), "--json"]).output)
+    plugins = _json_out(run(["plugins", "--root", str(DESIGNS / "fsm"), "--json"]))
     assert plugins["errors"] == {}
     assert "state_dwell" in [p["name"] for p in plugins["plugins"]]
 

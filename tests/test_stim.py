@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import design_store
+
 from veritrace.formal import harness
 from veritrace.graph.elaborate import discover, elaborate
 from veritrace.protocol import pack as pack_mod
@@ -43,7 +45,7 @@ def holes(tmp_path_factory):
     from veritrace.coverage import report as cov
     from veritrace.protocol import engine
 
-    store = TraceStore(str(AXI / "dump.vtx"))
+    store = TraceStore(str(design_store("axi_lite")))
     clock = clocks.resolve(store, None, None)
     protocol = engine.extract(store, AXI / "dump.vtx", clock, None, project_root=AXI)
     report = cov.build(protocol, store, clock, project_root=AXI)

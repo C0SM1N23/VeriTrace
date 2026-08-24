@@ -31,6 +31,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
+from conftest import design_store
 from click.testing import CliRunner
 
 from veritrace import TraceStore, clocks, convert
@@ -381,7 +383,7 @@ def test_the_fsm_route_serves_machines_and_a_diagram():
 
     from veritrace.api import create_app
 
-    client = TestClient(create_app(str(FSM_DIR / "dump.vcd.vtx"), [str(FSM_DIR)]))
+    client = TestClient(create_app(str(design_store("fsm")), [str(FSM_DIR)]))
     sid = client.get("/", headers={"Accept": "application/json"}).json()["default_session"]
 
     got = client.get(f"/session/{sid}/fsm")

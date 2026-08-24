@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import design_store
+
 from veritrace import TraceStore, clocks, timing
 from veritrace.export import saif, wavedrom
 
@@ -22,7 +24,7 @@ AXI = DESIGNS / "axi_lite"
 
 @pytest.fixture(scope="module")
 def store():
-    return TraceStore(str(AXI / "dump.vtx"))
+    return TraceStore(str(design_store("axi_lite")))
 
 
 # --- §8.31 SAIF -------------------------------------------------------------

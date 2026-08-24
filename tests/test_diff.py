@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import design_store
+
 from veritrace import TraceStore, clocks, convert
 from veritrace import diff as diff_mod
 from veritrace.correlate.resolver import correlate
@@ -311,8 +313,8 @@ def test_diff_command_reports_the_first_divergence():
         main,
         [
             "diff",
-            str(DEADLOCK / "dump_ok.vcd.vtx"),
-            str(DEADLOCK / "dump.vcd.vtx"),
+            str(design_store("deadlock", "dump_ok.vcd")),
+            str(design_store("deadlock")),
             "--rtl",
             str(DEADLOCK),
         ],
@@ -328,11 +330,11 @@ def test_diff_route_opens_the_second_trace_as_its_own_session():
 
     from veritrace.api import create_app
 
-    client = TestClient(create_app(str(DEADLOCK / "dump_ok.vcd.vtx"), [str(DEADLOCK)]))
+    client = TestClient(create_app(str(design_store("deadlock", "dump_ok.vcd")), [str(DEADLOCK)]))
     sid = client.get("/", headers={"Accept": "application/json"}).json()["default_session"]
 
     got = client.post(
-        f"/session/{sid}/diff", json={"trace": str(DEADLOCK / "dump.vcd.vtx")}
+        f"/session/{sid}/diff", json={"trace": str(design_store("deadlock"))}
     )
     assert got.status_code == 200, got.text
     body = got.json()
@@ -350,10 +352,10 @@ def test_diffing_a_trace_against_itself_is_refused():
 
     from veritrace.api import create_app
 
-    client = TestClient(create_app(str(DEADLOCK / "dump_ok.vcd.vtx"), [str(DEADLOCK)]))
+    client = TestClient(create_app(str(design_store("deadlock", "dump_ok.vcd")), [str(DEADLOCK)]))
     sid = client.get("/", headers={"Accept": "application/json"}).json()["default_session"]
     got = client.post(
-        f"/session/{sid}/diff", json={"trace": str(DEADLOCK / "dump_ok.vcd.vtx")}
+        f"/session/{sid}/diff", json={"trace": str(design_store("deadlock", "dump_ok.vcd"))}
     )
     assert got.status_code == 400
     assert "same trace" in got.json()["detail"]

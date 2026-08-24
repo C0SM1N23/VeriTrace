@@ -52,3 +52,22 @@ def make_vtx(tmp_path: Path, text: str = SMALL_VCD, name: str = "dump") -> Path:
     out = tmp_path / f"{name}.vtx"
     convert(str(src), str(out))
     return out
+
+
+#: The reference designs ship their `.vcd` dumps; a `.vtx` store is a build
+#: product and is not committed.
+DESIGNS = Path(__file__).resolve().parents[1] / "designs"
+
+
+def design_store(design: str, dump: str = "dump.vcd") -> Path:
+    """The `.vtx` for a reference dump, converting it if it is not there yet.
+
+    Tests used to name `designs/<x>/dump.vcd.vtx` directly. That passes on a
+    machine where some earlier run happened to leave one behind and fails on a
+    clean checkout — which is exactly what CI is, on all three platforms. The
+    conversion is cached on disk, so asking for it costs nothing after the
+    first test that does.
+    """
+    from veritrace import store as store_mod
+
+    return store_mod.ensure(DESIGNS / design / dump)

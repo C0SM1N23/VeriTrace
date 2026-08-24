@@ -17,6 +17,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
+from conftest import design_store
 from click.testing import CliRunner
 
 from veritrace import TraceStore, clocks, convert, simulate
@@ -414,7 +416,7 @@ def client():
 
     # A `.vtx`, not the raw dump: conversion is the CLI's job (`_default_trace`),
     # and a session is handed a store it can open.
-    return TestClient(create_app(str(BUGGY / "dump.vcd.vtx"), [str(BUGGY)]))
+    return TestClient(create_app(str(design_store("fifo_buggy")), [str(BUGGY)]))
 
 
 def _session(client) -> str:
