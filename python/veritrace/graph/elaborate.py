@@ -697,6 +697,19 @@ def elaborate(
     el = _Elaborator(sm)
     root = comp.getRoot()
     tops = list(root.topInstances)
+    if top and not tops:
+        # Asking for a top module that is not in these sources gives slang no
+        # top instance, and every later step reads that as "a design with no
+        # signals" rather than as a question that cannot be answered. Refusing
+        # here is what turns a confident wrong answer — `fsm` finding no state
+        # machines, `why` rejecting a signal it then suggests — into a sentence
+        # naming the mistake.
+        names = sorted({d.name for d in comp.getDefinitions() if getattr(d, "name", "")})
+        near = ", ".join(names[:8]) or "none"
+        raise ValueError(
+            f"top module {top!r} is not in these sources; found: {near}"
+            + (" …" if len(names) > 8 else "")
+        )
     el.graph.top = tops[0].name if tops else ""
     for inst in tops:
         el.instances[inst.name] = _definition_name(inst)

@@ -81,8 +81,20 @@ probe_tmp.sv
 # run. Generated, and rebuilt every time.
 .veritrace/
 # ...and the config it writes for a reference design, which the Makefile does
-# not need. A real project commits its own `.veritrace.toml` on purpose.
+# not need. A real project commits its own `.veritrace.toml` on purpose. The
+# root pattern matters as much as the per-design one: `run` writes the config
+# beside the working directory, so running it from here leaves one that every
+# later `--rtl` command finds by searching upward.
+/.veritrace.toml
 designs/*/.veritrace.toml
+
+# The simulation command `run` records for `export` to quote (§13.4b). Absolute
+# paths from one machine; regenerated on every run.
+designs/*/sim.command
+
+# §13.6's regression database. A real project commits its own on purpose; the
+# one written while testing the reference designs is not history worth keeping.
+/regressions.duckdb
 
 # TypeScript's incremental build state.
 web/tsconfig.tsbuildinfo

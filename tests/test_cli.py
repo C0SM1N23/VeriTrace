@@ -809,3 +809,64 @@ def test_the_rest_api_accepts_a_raw_dump(tmp_path):
         r = c.post("/session", json={"trace_path": str(raw)})
         assert r.status_code == 200, r.text
         assert r.json()["n_signals"] > 0
+
+
+# --- §4.3 config precedence -------------------------------------------------
+#
+# `config.load()` searches upward, so a `.veritrace.toml` in a repository root
+# is found by a command run anywhere below it — including one pointed at a
+# different design with `--rtl`. Taking `design.top` from that config elaborated
+# the given sources under a top module they do not contain, which produced an
+# empty graph and answers that were confidently wrong rather than refused.
+
+
+def _stray_config(root, top="tb_somewhere_else"):
+    (root / ".veritrace.toml").write_text(
+        f'[design]\ntop = "{top}"\nrtl = ["other/*.sv"]\n', encoding="utf-8"
+    )
+
+
+def test_a_config_for_another_design_does_not_capture_an_explicit_rtl(tmp_path, monkeypatch):
+    from veritrace.cli import _resolve_rtl
+
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "other.sv").write_text("module other_mod; endmodule\n")
+    mine = tmp_path / "mine"
+    mine.mkdir()
+    (mine / "fifo_sync.sv").write_text(SAMPLE_FIFO)
+    _stray_config(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    files, _incdirs, _defines, top = _resolve_rtl((mine,), None)
+    assert [f.name for f in files] == ["fifo_sync.sv"]
+    assert top is None, "an unrelated config supplied its top to an explicit --rtl"
+
+
+def test_a_config_for_this_design_still_fills_in_what_it_knows(tmp_path, monkeypatch):
+    """The fix must not cost a real project its own defaults."""
+    from veritrace.cli import _resolve_rtl
+
+    (tmp_path / "rtl").mkdir()
+    (tmp_path / "rtl" / "fifo_sync.sv").write_text(SAMPLE_FIFO)
+    (tmp_path / ".veritrace.toml").write_text(
+        '[design]\ntop = "fifo_sync"\nrtl = ["rtl/*.sv"]\n', encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    _files, _incdirs, _defines, top = _resolve_rtl((tmp_path / "rtl",), None)
+    assert top == "fifo_sync"
+
+
+def test_a_top_that_is_not_in_the_sources_is_refused(tmp_path):
+    """The second half: elaborating under an absent top gave an empty graph."""
+    import pytest
+
+    from veritrace.graph.elaborate import elaborate
+
+    src = tmp_path / "fifo_sync.sv"
+    src.write_text(SAMPLE_FIFO)
+    with pytest.raises(ValueError, match="not in these sources"):
+        elaborate([src], (), (), "tb_somewhere_else")
+    # And the name it does contain is offered.
+    with pytest.raises(ValueError, match="fifo_sync"):
+        elaborate([src], (), (), "tb_somewhere_else")

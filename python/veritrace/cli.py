@@ -147,7 +147,17 @@ def main() -> None:
 
 
 def _resolve_rtl(rtl: tuple[Path, ...], top: str | None) -> tuple[list[Path], list[str], list[str], str | None]:
-    """RTL sources from the command line, falling back to `.veritrace.toml`."""
+    """RTL sources from the command line, falling back to `.veritrace.toml`.
+
+    A config is only allowed to fill in `top`, `incdirs` and `defines` when it
+    is talking about the *same* design. `config.load()` searches upward, so a
+    `.veritrace.toml` left in a repository root — which `veritrace run` writes
+    there (§13.4b) — otherwise supplied its `design.top` to a command that had
+    been pointed somewhere else with `--rtl`. Elaborating a folder under a top
+    module that is not in it yields an empty graph, and every answer built on
+    that graph is wrong: `fsm` reported no state machines on a design with six,
+    and `why` rejected a signal while suggesting the same name back.
+    """
     from veritrace import config as cfg
     from veritrace.graph.elaborate import discover
 
@@ -158,13 +168,27 @@ def _resolve_rtl(rtl: tuple[Path, ...], top: str | None) -> tuple[list[Path], li
     defines: list[str] = []
 
     conf = cfg.load()
-    if conf is not None:
+    if conf is not None and (not files or _config_covers(conf, files)):
         if not files:
             files = conf.rtl_files()
         incdirs = [str(conf.root / d) for d in conf.incdirs]
         defines = conf.defines
         top = top or conf.top
     return files, incdirs, defines, top
+
+
+def _config_covers(conf: object, files: list[Path]) -> bool:
+    """Is this config describing the sources the command was given?
+
+    True when the config names any of them in `design.rtl`. Nothing stricter:
+    a project config that lists `rtl/**/*.sv` and a command narrowed to one of
+    those files is still the same design, and should keep its defines.
+    """
+    try:
+        known = {p.resolve() for p in conf.rtl_files()}  # type: ignore[attr-defined]
+    except OSError:
+        return False
+    return any(f.resolve() in known for f in files)
 
 
 # --- shared plumbing for the analysis commands -----------------------------
