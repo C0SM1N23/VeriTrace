@@ -692,7 +692,23 @@ impl TraceStore {
     pub fn last_change_all(&self, t: Time) -> Vec<Option<Time>> {
         (0..self.signals.len() as Handle)
             .into_par_iter()
-            .map(|h| self.last_change_before(h, t).unwrap_or(None))
+            .map(|h| {
+                // §8.4 asks this about the end of the trace, and there the
+                // answer is already in the index: the last chunk's `t_last`.
+                // `last_change_before` would decode the whole time column of
+                // every signal in the design to rediscover it, which was most
+                // of what put the stuck detector over §4.2's budget.
+                if let Ok(sig) = self.signal(h) {
+                    let (lo, hi) = self.index.chunks_of(sig.stream_id);
+                    if hi > lo {
+                        let last = self.index.entry(hi - 1);
+                        if t > last.t_last {
+                            return Some(last.t_last);
+                        }
+                    }
+                }
+                self.last_change_before(h, t).unwrap_or(None)
+            })
             .collect()
     }
 
@@ -726,7 +742,7 @@ impl TraceStore {
         // Stream → the one chunk that can contain `t`, from the index. Several
         // handles can share a stream (§7.1 aliases), so the work is per stream
         // and the answer is fanned back out per handle at the end.
-        let mut by_part: HashMap<u32, Vec<(u32, usize)>> = HashMap::new();
+        let mut by_part: HashMap<u32, Vec<(u32, usize, bool)>> = HashMap::new();
         let mut cached: HashMap<u32, Option<Value>> = HashMap::new();
         let mut seen: HashSet<u32> = HashSet::new();
         for &h in handles {
@@ -744,7 +760,25 @@ impl TraceStore {
             match self.index.chunk_for_time(stream, t) {
                 Some(ci) => {
                     let e = self.index.entry(ci);
-                    by_part.entry(e.part_id).or_default().push((stream, e.row_group as usize));
+                    // Past the end of this chunk the answer is simply its last
+                    // row — and §8.4, the caller this exists for, always asks
+                    // about the end of the trace. The index carries that value
+                    // (format 3), so the whole scan answers from a binary
+                    // search and touches no Parquet at all. A store written
+                    // before format 3 has no summary and falls back below.
+                    let past_end = t >= e.t_last;
+                    if past_end && ci + 1 == self.index.chunks_of(stream).1 {
+                        if let Some(v) =
+                            self.index.last_value(stream).and_then(|b| self.decode_for(stream, b))
+                        {
+                            cached.insert(stream, Some(v));
+                            continue;
+                        }
+                    }
+                    by_part
+                        .entry(e.part_id)
+                        .or_default()
+                        .push((stream, e.row_group as usize, past_end));
                 }
                 None => {
                     cached.insert(stream, None);
@@ -782,17 +816,22 @@ impl TraceStore {
     fn values_from_part(
         &self,
         part: u32,
-        wanted: &[(u32, usize)],
+        wanted: &[(u32, usize, bool)],
         t: Time,
     ) -> Result<HashMap<u32, Option<Value>>> {
-        let mut groups: Vec<usize> = wanted.iter().map(|(_, g)| *g).collect();
+        let mut groups: Vec<usize> = wanted.iter().map(|(_, g, _)| *g).collect();
         groups.sort_unstable();
         groups.dedup();
-        // Columns 0, 1 and 3 — `delta` is never read here, and skipping it is
-        // the same column pruning §6.3 counts as a reason to be in Parquet at
-        // all. `load_times` does the same for its one column.
+        // When `t` is past the end of every chunk wanted here — which is what
+        // §8.4 asks, once per session, about the end of the trace — the answer
+        // is each stream's last row and the time column has nothing left to
+        // decide. Dropping it is a third of the bytes this read touches.
+        let past_end = wanted.iter().all(|(_, _, p)| *p);
+        // `delta` is never read either way, and skipping it is the same column
+        // pruning §6.3 counts as a reason to be in Parquet at all.
         let builder = self.part_reader(part)?;
-        let mask = ProjectionMask::roots(builder.parquet_schema(), [0, 1, 3]);
+        let cols: &[usize] = if past_end { &[0, 3] } else { &[0, 1, 3] };
+        let mask = ProjectionMask::roots(builder.parquet_schema(), cols.iter().copied());
         let reader = builder.with_row_groups(groups).with_projection(mask).build()?;
 
         // Last row at or before `t` wins: rows inside a chunk are in time order
@@ -802,19 +841,25 @@ impl TraceStore {
         let mut last_row: HashMap<u32, usize> = HashMap::new();
         for batch in reader {
             let batch = batch?;
-            // Index 2, not 3: the projection above dropped `delta`, so the
-            // batch has three columns and `value` moved up one.
+            // The projection decides the layout: `signal_id` is always first,
+            // and `value` is second or third depending on whether `time` came.
             let ids = col::<UInt32Array>(&batch, 0, "signal_id")?;
-            let ts = col::<Int64Array>(&batch, 1, "time")?;
-            let vs = col::<BinaryArray>(&batch, 2, "value")?;
+            let vs = col::<BinaryArray>(&batch, if past_end { 1 } else { 2 }, "value")?;
             // Two passes over the batch, deliberately. Copying the value of
             // every candidate row and overwriting it with the next is one heap
             // allocation per event for an answer that keeps one per stream; the
             // row indices are integers and cost nothing to overwrite.
             last_row.clear();
-            for r in 0..batch.num_rows() {
-                if ts.value(r) <= t {
+            if past_end {
+                for r in 0..batch.num_rows() {
                     last_row.insert(ids.value(r), r);
+                }
+            } else {
+                let ts = col::<Int64Array>(&batch, 1, "time")?;
+                for r in 0..batch.num_rows() {
+                    if ts.value(r) <= t {
+                        last_row.insert(ids.value(r), r);
+                    }
                 }
             }
             for (&stream, &r) in &last_row {
@@ -823,19 +868,25 @@ impl TraceStore {
         }
 
         let mut out = HashMap::with_capacity(wanted.len());
-        for &(stream, _) in wanted {
+        for &(stream, _, _) in wanted {
             // Width and encoding belong to the stream, so any handle on it will
             // do; `by_stream` is built once at open rather than searched here.
-            let value = match (best.get(&stream), self.by_stream.get(&stream)) {
-                (Some(bytes), Some(&h)) => {
-                    let s = &self.signals[h as usize];
-                    Some(decode_one(bytes, s.width, s.encoding, words_for(s.width).max(1)))
-                }
-                _ => None,
-            };
+            let value = best.get(&stream).and_then(|bytes| self.decode_for(stream, bytes));
             out.insert(stream, value);
         }
         Ok(out)
+    }
+
+    /// Decode one encoded row using the width and encoding of `stream`.
+    ///
+    /// Both of those belong to the stream rather than to a handle, so any
+    /// handle on it will do; `by_stream` is built once at open rather than
+    /// searched here. Shared by the Parquet path and the index summary so the
+    /// two can never disagree about how a value is read back.
+    fn decode_for(&self, stream: u32, bytes: &[u8]) -> Option<Value> {
+        let &h = self.by_stream.get(&stream)?;
+        let s = &self.signals[h as usize];
+        Some(decode_one(bytes, s.width, s.encoding, words_for(s.width).max(1)))
     }
 
     // ---- cycle-aligned sampling (§5.5, §8.14) ----------------------------

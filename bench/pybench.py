@@ -11,7 +11,9 @@ of §4.2 are not Rust and were measured by nothing:
 | `why()` with 200 nodes            | 150 ms | 300 ms |
 
 A budget nothing measures is a budget nothing keeps, which is how the stuck
-detector came to sit three times over its number without anyone noticing.
+detector came to sit three times over its number without anyone noticing. It
+exits non-zero when a row is over, so the build fails the way §4.2 says it
+should — and so a budget cannot quietly drift again.
 
     python bench/pybench.py                 # tier A: 5000 signals
     python bench/pybench.py --tier b        # tier B: 50000 signals
@@ -334,12 +336,14 @@ def main() -> int:
 
     over = [r.name for r in report.rows if r.over]
     if over:
-        # Reported, not fatal — the same call `bench.rs` makes for its scan: a
-        # regression is worth seeing without failing a build on a slower runner.
-        # The stuck detector is over its budget today for a reason recorded in
-        # docs/COMMANDS.md, and a red CI nobody can fix teaches people to ignore
-        # CI.
+        # Fatal, which is what §4.2 asks for: *"praguri verificate in CI la
+        # fiecare commit, cu build care pica daca sunt depasite"*. This returned
+        # 0 while printing the warning, on the reasoning that a red CI nobody
+        # can fix teaches people to ignore CI — but the thing nobody could fix
+        # has been fixed, and a gate that never closes is not a gate. `bench.rs`
+        # has always exited 1 here; now both halves of §4.2 agree.
         print(f"OVER BUDGET: {', '.join(over)}", file=sys.stderr)
+        return 1
     return 0
 
 

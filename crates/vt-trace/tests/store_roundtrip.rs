@@ -524,3 +524,83 @@ fn sample_before_has_no_value_before_the_first_event() {
     assert_eq!(rows[0][1], None);
     assert_eq!(rows[0][2].as_ref().unwrap().as_u64(), Some(0));
 }
+
+/// Widths that exercise every encoding branch, plus a signal that never moves.
+const RAGGED: &str = "$timescale 1ns $end
+$scope module top $end
+$var wire 1 ! a $end
+$var wire 8 \" b $end
+$var wire 33 # wide $end
+$var wire 1 $ quiet $end
+$upscope $end
+$enddefinitions $end
+#0
+0!
+b00000001 \"
+b000000000000000000000000000000001 #
+0$
+#10
+1!
+b10101010 \"
+#20
+0!
+b11111111 \"
+b111111111111111111111111111111111 #
+#30
+1!
+bxxxxxxxx \"
+#40
+b00001111 \"
+";
+
+/// The index summary and the Parquet rows must never disagree.
+///
+/// Past the end of the trace `value_at_all` answers from the last-value summary
+/// in `index.bin` and touches no Parquet at all — which is what takes §8.4 from
+/// four times over its tier-B budget to well inside it. Two routes to one answer
+/// is exactly where a fast path goes quietly wrong, so this pins them together
+/// across every encoding: one bit, a byte, a value wider than a word, an X, and
+/// a signal that never moved.
+#[test]
+fn the_summary_agrees_with_the_rows_it_summarises() {
+    let (_d, s, _) = convert(RAGGED);
+    let handles: Vec<u32> = (0..s.n_signals() as u32).collect();
+    let (_t0, t1) = s.time_range();
+
+    for t in [t1, t1 + 1, t1 + 1000] {
+        let bulk = s.value_at_all(&handles, t);
+        let one: Vec<_> = handles.iter().map(|&h| s.value_at(h, t).unwrap()).collect();
+        assert_eq!(bulk, one, "past the end at t={t}");
+    }
+    // And the values themselves are the last ones written, not a neighbour's.
+    assert_eq!(u64_at(&s, "top.b", t1 + 1), Some(0b0000_1111));
+    assert_eq!(u64_at(&s, "top.a", t1 + 1), Some(1));
+    assert_eq!(u64_at(&s, "top.quiet", t1 + 1), Some(0));
+
+    // Inside the trace the row-group path still runs, and still agrees.
+    for t in [0, 5, 10, 20, 25, 30, 40] {
+        let bulk = s.value_at_all(&handles, t);
+        let one: Vec<_> = handles.iter().map(|&h| s.value_at(h, t).unwrap()).collect();
+        assert_eq!(bulk, one, "inside the trace at t={t}");
+    }
+}
+
+/// §8.4 asks this of every signal at once, so it carries the same obligation.
+///
+/// The whole-trace case now answers from the chunk table rather than decoding
+/// every signal's time column, which was most of what the scan cost.
+#[test]
+fn last_change_all_agrees_with_last_change_before() {
+    let (_d, s, _) = convert(RAGGED);
+    let (_t0, t1) = s.time_range();
+    for t in [0, 15, 25, t1, t1 + 1, t1 + 1000] {
+        let bulk = s.last_change_all(t);
+        for h in 0..s.n_signals() as u32 {
+            assert_eq!(
+                bulk[h as usize],
+                s.last_change_before(h, t).unwrap(),
+                "signal {h} disagrees at t={t}"
+            );
+        }
+    }
+}

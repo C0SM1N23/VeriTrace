@@ -15,9 +15,12 @@ use crate::model::{Time, Timescale};
 use crate::{Error, Result};
 
 pub const MAGIC: &[u8; 4] = b"VTX1";
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const HEADER_LEN: usize = 64;
 pub const ENTRY_LEN: usize = 48;
+/// One `(stream_id, blob_off, blob_len)` row of the last-value summary, padded
+/// to a power of two so the table can be indexed without a multiply.
+pub const SUMMARY_LEN: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkEntry {
@@ -75,12 +78,34 @@ pub struct Header {
     pub t_min: Time,
     pub t_max: Time,
     pub n_chunks: u32,
+    /// Streams carrying a settled-value summary (§8.4). Zero is legal and means
+    /// the answer has to come from Parquet, as it did before format 3.
+    pub n_summaries: u32,
+    pub blob_len: u32,
 }
 
-/// Serialise header + entries. Entries must already be sorted by
-/// `(stream_id, t_first)`.
-pub fn write(path: impl AsRef<Path>, h: &Header, entries: &[ChunkEntry]) -> Result<()> {
-    let mut buf = Vec::with_capacity(HEADER_LEN + entries.len() * ENTRY_LEN);
+/// Serialise header + entries + the last-value summary.
+///
+/// Entries must already be sorted by `(stream_id, t_first)`; `summaries` by
+/// `stream_id`, one row per stream, holding that stream's final encoded value.
+///
+/// **Why the summary is here.** §8.4 runs over every signal when a session
+/// opens and asks each one what it is stuck at — always at the end of the
+/// trace. Answering from Parquet costs one row-group decode per frozen signal,
+/// which at tier B is thirty thousand of them and four times §4.2's budget. The
+/// value is a few bytes the writer already holds, so keeping it beside the
+/// chunk table turns that whole scan into a binary search per signal. This is
+/// the same trade `t_second` made for `is_constant`.
+pub fn write(
+    path: impl AsRef<Path>,
+    h: &Header,
+    entries: &[ChunkEntry],
+    summaries: &[(u32, Vec<u8>)],
+) -> Result<()> {
+    let blob_len: usize = summaries.iter().map(|(_, v)| v.len()).sum();
+    let mut buf = Vec::with_capacity(
+        HEADER_LEN + entries.len() * ENTRY_LEN + summaries.len() * SUMMARY_LEN + blob_len,
+    );
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&VERSION.to_le_bytes());
     buf.extend_from_slice(&h.timescale.num.to_le_bytes());
@@ -91,9 +116,22 @@ pub fn write(path: impl AsRef<Path>, h: &Header, entries: &[ChunkEntry]) -> Resu
     buf.extend_from_slice(&h.t_max.to_le_bytes());
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     buf.extend_from_slice(&0u32.to_le_bytes()); // flags
+    buf.extend_from_slice(&(summaries.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(blob_len as u32).to_le_bytes());
     buf.resize(HEADER_LEN, 0);
     for e in entries {
         e.write_to(&mut buf);
+    }
+    let mut off = 0u32;
+    for (stream, v) in summaries {
+        buf.extend_from_slice(&stream.to_le_bytes());
+        buf.extend_from_slice(&off.to_le_bytes());
+        buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // pad
+        off += v.len() as u32;
+    }
+    for (_, v) in summaries {
+        buf.extend_from_slice(v);
     }
     let mut f = File::create(path)?;
     f.write_all(&buf)?;
@@ -130,12 +168,57 @@ impl Index {
             t_min: i64_at(24),
             t_max: i64_at(32),
             n_chunks: u32_at(40),
+            n_summaries: u32_at(48),
+            blob_len: u32_at(52),
         };
-        let need = HEADER_LEN + header.n_chunks as usize * ENTRY_LEN;
+        let need = HEADER_LEN
+            + header.n_chunks as usize * ENTRY_LEN
+            + header.n_summaries as usize * SUMMARY_LEN
+            + header.blob_len as usize;
         if map.len() < need {
             return Err(Error::Store(format!("index.bin: truncated ({} < {need})", map.len())));
         }
         Ok(Index { map, header })
+    }
+
+    /// Byte offset of the summary table, i.e. just past the chunk entries.
+    fn summary_base(&self) -> usize {
+        HEADER_LEN + self.header.n_chunks as usize * ENTRY_LEN
+    }
+
+    /// The settled value of `stream` at the end of the trace, still encoded.
+    ///
+    /// `None` when this store carries no summary for it, which is what a caller
+    /// falls back to Parquet for.
+    pub fn last_value(&self, stream: u32) -> Option<&[u8]> {
+        let n = self.header.n_summaries as usize;
+        if n == 0 {
+            return None;
+        }
+        let base = self.summary_base();
+        let id_at = |i: usize| {
+            let o = base + i * SUMMARY_LEN;
+            u32::from_le_bytes(self.map[o..o + 4].try_into().unwrap())
+        };
+        // Written one row per stream in ascending order, so this is a binary
+        // search over a borrowed slice with nothing decoded up front — the same
+        // property the chunk table is built for.
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match id_at(mid).cmp(&stream) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    let o = base + mid * SUMMARY_LEN;
+                    let off = u32::from_le_bytes(self.map[o + 4..o + 8].try_into().unwrap());
+                    let len = u32::from_le_bytes(self.map[o + 8..o + 12].try_into().unwrap());
+                    let blob = base + n * SUMMARY_LEN + off as usize;
+                    return Some(&self.map[blob..blob + len as usize]);
+                }
+            }
+        }
+        None
     }
 
     pub fn len(&self) -> usize {
@@ -216,6 +299,9 @@ mod tests {
             entry(2, 10, 90, 0),
             entry(5, 5, 5, 0),
         ];
+        // Deliberately ragged: two streams with values of different lengths and
+        // one with none, which is what the blob offsets have to survive.
+        let summaries = vec![(0u32, vec![1u8, 2, 3]), (2u32, vec![9u8]), (5u32, vec![7u8, 7])];
         let h = Header {
             timescale: Timescale { num: 1, unit_exp: -12 },
             n_signals: 7,
@@ -223,10 +309,44 @@ mod tests {
             t_min: 0,
             t_max: 90,
             n_chunks: entries.len() as u32,
+            n_summaries: summaries.len() as u32,
+            blob_len: summaries.iter().map(|(_, v)| v.len() as u32).sum(),
         };
-        write(&path, &h, &entries).unwrap();
+        write(&path, &h, &entries, &summaries).unwrap();
         let idx = Index::open(&path).unwrap();
         (dir, idx)
+    }
+
+    #[test]
+    fn the_summary_gives_each_stream_its_own_last_value() {
+        let (_d, idx) = sample();
+        assert_eq!(idx.last_value(0), Some(&[1u8, 2, 3][..]));
+        assert_eq!(idx.last_value(2), Some(&[9u8][..]));
+        assert_eq!(idx.last_value(5), Some(&[7u8, 7][..]));
+        // A stream with no summary is a miss, not a neighbour's value.
+        assert_eq!(idx.last_value(1), None);
+        assert_eq!(idx.last_value(99), None);
+    }
+
+    #[test]
+    fn an_index_with_no_summary_is_still_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.bin");
+        let entries = vec![entry(0, 0, 30, 0)];
+        let h = Header {
+            timescale: Timescale { num: 1, unit_exp: -12 },
+            n_signals: 1,
+            n_streams: 1,
+            t_min: 0,
+            t_max: 30,
+            n_chunks: 1,
+            n_summaries: 0,
+            blob_len: 0,
+        };
+        write(&path, &h, &entries, &[]).unwrap();
+        let idx = Index::open(&path).unwrap();
+        assert_eq!(idx.len(), 1);
+        assert_eq!(idx.last_value(0), None);
     }
 
     #[test]

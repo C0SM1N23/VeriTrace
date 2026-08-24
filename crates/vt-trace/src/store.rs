@@ -229,17 +229,22 @@ pub fn write_vtx(trace: &Trace, out_dir: impl AsRef<Path>, source: Option<&Path>
 
     // Each part is an independent file, so encoding and writing run fully in
     // parallel across signal groups.
-    let per_part: Vec<Result<Vec<ChunkEntry>>> = parts
+    let per_part: Vec<Result<(Vec<ChunkEntry>, Vec<(u32, Vec<u8>)>)>> = parts
         .par_iter()
         .enumerate()
         .map(|(part_id, streams)| write_part(trace, &encodings, out_dir, part_id as u32, streams))
         .collect();
 
     let mut entries: Vec<ChunkEntry> = Vec::new();
+    let mut summaries: Vec<(u32, Vec<u8>)> = Vec::new();
     for r in per_part {
-        entries.extend(r?);
+        let (e, s) = r?;
+        entries.extend(e);
+        summaries.extend(s);
     }
     entries.sort_by_key(|e| (e.stream_id, e.t_first));
+    // Both tables are binary-searched by stream, so both are written sorted.
+    summaries.sort_by_key(|(sid, _)| *sid);
 
     index::write(
         out_dir.join("index.bin"),
@@ -250,8 +255,11 @@ pub fn write_vtx(trace: &Trace, out_dir: impl AsRef<Path>, source: Option<&Path>
             t_min: trace.t_min,
             t_max: trace.t_max,
             n_chunks: entries.len() as u32,
+            n_summaries: summaries.len() as u32,
+            blob_len: summaries.iter().map(|(_, v)| v.len() as u32).sum(),
         },
         &entries,
+        &summaries,
     )?;
 
     write_signals(trace, &encodings, out_dir)?;
@@ -284,13 +292,17 @@ fn write_part(
     out_dir: &Path,
     part_id: u32,
     streams: &[u32],
-) -> Result<Vec<ChunkEntry>> {
+) -> Result<(Vec<ChunkEntry>, Vec<(u32, Vec<u8>)>)> {
     let path = out_dir.join("events").join(format!("part-{part_id:03}.parquet"));
     let schema = events_schema();
     let file = fs::File::create(&path)?;
     let mut w = ArrowWriter::try_new(file, schema.clone(), Some(writer_props()))?;
 
     let mut entries = Vec::new();
+    // §8.4's settled value per stream, encoded exactly as the Parquet row is.
+    // Collected here because the writer already holds the final row; the reader
+    // would have to decode a row group per signal to recover it.
+    let mut summaries: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut row_group = 0u32;
     let mut scratch = Vec::with_capacity(32);
 
@@ -346,9 +358,12 @@ fn write_part(
             row_group += 1;
             start = end;
         }
+        // The stream's settled value: the last row, encoded the same way.
+        encode_row(&s.values, s.len() - 1, enc, &mut scratch);
+        summaries.push((sid, scratch.clone()));
     }
     w.close()?;
-    Ok(entries)
+    Ok((entries, summaries))
 }
 
 fn write_signals(trace: &Trace, encodings: &[Encoding], out_dir: &Path) -> Result<()> {
