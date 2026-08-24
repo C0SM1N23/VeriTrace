@@ -486,14 +486,34 @@ def _initial_value(graph: DesignGraph, store: Any, clock: Clock | None) -> Itera
     if clock is None or not clock.edges:
         return
     first_edge = clock.edges[0]
+    # `$dumpvars` writes every signal once at the start of the trace, and that
+    # first write *is* the declared initialiser being observed — not a driver
+    # overwriting it. Counting it as a write made the condition below true for
+    # every signal in every dump, so this check could never fire at all; the
+    # `cfg` case that designs/checks injects for it went unreported.
+    t_start = store.time_range[0]
     for sig in graph:
         if not sig.has_initializer or sig.trace_handle is None:
             continue
+        # §8.11 names the case exactly: a *register* read before its first
+        # write, because the flop the hardware brings up does not carry the
+        # declared value. That means a clocked register and nothing else — the
+        # neighbours share the declaration shape without sharing the hazard:
+        #   - a localparam is a constant, which synthesis honours exactly;
+        #   - a testbench net nothing ever writes, or a clock generator driven
+        #     by delays, is stimulus rather than a flop.
+        if sig.kind is not Kind.REG or sig.stimulus_only:
+            continue
+        if not any(d.is_sequential for d in sig.drivers):
+            continue
         if not graph.fanout(sig.path):
             continue  # nothing reads it; the initial value cannot matter
-        if store.last_change_before(sig.trace_handle, first_edge + 1) is not None:
-            continue  # written before anything could sample it
+        wrote = store.last_change_before(sig.trace_handle, first_edge + 1)
+        if wrote is not None and wrote > t_start:
+            continue  # a driver reached it before anything could sample it
         value = store.value_at(sig.trace_handle, first_edge)
+        if value is None:
+            continue  # not in the trace at that instant; nothing to claim
         yield Finding(
             group=Group.LINT,
             severity=Severity.WARN,

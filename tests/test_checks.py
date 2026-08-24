@@ -70,6 +70,7 @@ INJECTED = {
     "async_reset_no_sync",
     "x_source",
     "x_optimism",
+    "initial_value_dependency",
     "parameter_default",
 }
 
@@ -566,3 +567,31 @@ def test_a_registered_ready_is_not_reported(tmp_path):
     fixed = elaborate(discover(design), defines=["FIX_HANDSHAKE"])
     correlate(fixed.graph, {s.path: s.handle for s in store.signals()}, fixed.aliases)
     assert not list(handshake.scan(analysis, fixed.graph))
+
+
+# --- §8.11: the initial-value check, and the three shapes next to it --------
+
+
+def test_the_initial_value_check_names_the_register_that_carries_one(session):
+    """`cfg` is a clocked register read while it still holds its declaration
+    value. It is the thirteenth problem designs/checks injects, and the check
+    could not fire at all while `$dumpvars`' write at t=0 counted as a driver
+    reaching it."""
+    _store, _el, _clock, report = session
+    found = [f for f in report if f.check == "initial_value_dependency"]
+    assert [f.signal for f in found] == ["tb_checks.dut.u_dut.cfg"], (
+        f"expected only cfg, got {[f.signal for f in found]}"
+    )
+    assert found[0].loc.file == "checks_dut.sv"
+
+
+def test_the_initial_value_check_leaves_alone_what_is_not_a_flop(session):
+    """The neighbours that share the declaration shape without the hazard: a
+    localparam is a constant, a clock generator and an unwritten testbench net
+    are stimulus. Reporting them buried the one row that is real."""
+    _store, _el, _clock, report = session
+    signals = {f.signal for f in report if f.check == "initial_value_dependency"}
+    assert "tb_checks.slow_clk" not in signals, "a clock generator is not a flop"
+    assert not {s for s in signals if s.endswith((".WIDTH", ".DEPTH"))}, (
+        "a localparam is a constant, which synthesis honours exactly"
+    )
