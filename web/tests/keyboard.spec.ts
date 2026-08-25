@@ -189,3 +189,24 @@ test("subtrace() and repro() are verbs, not only buttons", async ({ page }) => {
   await bar.press("Enter");
   await expect(page.locator('[data-testid="repro-code"]')).toBeVisible({ timeout: 30_000 });
 });
+
+test("a chord still works while a field has focus", async ({ page }) => {
+  // ⌘M and ⌘B sat below the "is the user typing?" guard, so any focused input
+  // swallowed them. A modifier says the keystroke is for the application, and
+  // there is now an input in the design tree that is always on screen — which
+  // is how this surfaced.
+  await open(page);
+  await page.locator('[data-testid="tree-search"]').click();
+  await page.locator('[data-testid="tree-search"]').fill("wr");
+
+  await page.locator('[data-testid="tab-3"]').click();
+  await page.locator('[data-testid="tree-search"]').click();
+  await page.keyboard.press("ControlOrMeta+m");
+  await expect(page.locator('[data-testid="fsm-mode"]')).toBeVisible();
+
+  // And the bare letters still yield to the field, so typing "c" in a filter
+  // does not run a cone.
+  await page.locator('[data-testid="tree-search"]').click();
+  await page.keyboard.press("c");
+  await expect(page.locator('[data-testid="query-bar"]')).toHaveValue("");
+});

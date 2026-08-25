@@ -187,11 +187,27 @@ function useKeyboard() {
         s.toggleTree();
         return;
       }
+      if (mod && e.key.toLowerCase() === "m") {
+        // A mode of the Source tab, entered and left with the same chord.
+        e.preventDefault();
+        s.setFsmOpen(!s.fsmOpen);
+        return;
+      }
+      if (mod && e.key.toLowerCase() === "b") {
+        // Bookmark the current (signal, time); the note is typed in the list.
+        e.preventDefault();
+        s.addBookmark();
+        return;
+      }
       if (e.key === "Escape") {
         s.setPalette(false);
         s.setHelp(false);
         return;
       }
+      // Below this line are the bare-letter shortcuts, which have to yield to
+      // whoever is typing. Every chord above it does not: a modifier says the
+      // keystroke is for the application, and an app whose chords stop working
+      // because a field has focus is an app whose chords cannot be relied on.
       if (typing) return;
 
       if (e.key >= "1" && e.key <= "9" && !mod) {
@@ -205,13 +221,6 @@ function useKeyboard() {
       }
       if (e.key === "?") {
         s.setHelp(!s.helpOpen);
-        return;
-      }
-      if (mod && e.key.toLowerCase() === "m") {
-        // §11.4: FSM is a mode of the Source tab, entered and left with the
-        // same chord.
-        e.preventDefault();
-        s.setFsmOpen(!s.fsmOpen);
         return;
       }
       if (e.key === "s" && !mod) {
@@ -254,12 +263,6 @@ function useKeyboard() {
       }
       if (e.key === "z" && !mod) {
         s.zoomAll();
-        return;
-      }
-      if (mod && e.key.toLowerCase() === "b") {
-        // §11.4: a bookmark is (signal, time) with a note, and §P5 keeps it.
-        e.preventDefault();
-        s.addBookmark();
         return;
       }
     };
