@@ -96,6 +96,10 @@ designs/*/sim.command
 # one written while testing the reference designs is not history worth keeping.
 /regressions.duckdb
 
+# §8.14's cached transaction tables. Written beside a store the first time an
+# interface is extracted, and rebuilt from the trace whenever they are missing.
+designs/*/*.vtx.txn/
+
 # TypeScript's incremental build state.
 web/tsconfig.tsbuildinfo
 

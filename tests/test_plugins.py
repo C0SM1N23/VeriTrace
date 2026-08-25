@@ -357,7 +357,7 @@ def test_a_plugin_written_from_the_documentation_alone_works(tmp_path):
     assert [c.name for c in found] == ["reset_polarity"]
     assert found[0].needs == ["trace"]
 
-    store = TraceStore(str(DESIGNS / "fifo_buggy" / "dump.vtx"))
+    store = TraceStore(str(design_store("fifo_buggy")))
     got = plugin_mod.run_all(found, store=store, clock=clocks.resolve(store))
 
     assert got.skipped == {}, got.skipped
@@ -496,7 +496,7 @@ def test_plugins_reach_the_checks_report(tmp_path):
     (project / "plugins" / "reset_polarity.py").write_text(_FROM_THE_DOCS, encoding="utf-8")
     (project / ".veritrace.toml").write_text('[design]\ntop = "tb"\n', encoding="utf-8")
 
-    store = TraceStore(str(DESIGNS / "fifo_buggy" / "dump.vtx"))
+    store = TraceStore(str(design_store("fifo_buggy")))
     conf = config.load_or_empty(project)
     report = checks_mod.run_all(store, clock=clocks.resolve(store), config=conf)
 
