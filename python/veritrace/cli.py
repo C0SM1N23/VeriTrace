@@ -164,7 +164,25 @@ def _speak_utf8() -> None:
             pass  # an unusual stream is not a reason to fail the command (P7)
 
 
-@click.group()
+class _Group(click.Group):
+    """The command group, with one shared translation of elaboration failures.
+
+    Pointing a command at the wrong design is the commonest mistake there is,
+    and the answer to it is a sentence naming the modules that *are* there.
+    Every command elaborates, so catching it here rather than in each of them
+    keeps eight `try` blocks from having to stay in step.
+    """
+
+    def invoke(self, ctx: click.Context):  # noqa: ANN201 - click's own signature
+        from veritrace.graph.elaborate import TopNotFound
+
+        try:
+            return super().invoke(ctx)
+        except TopNotFound as e:
+            raise click.ClickException(str(e)) from e
+
+
+@click.group(cls=_Group)
 @click.version_option(version=__version__, prog_name="veritrace")
 def main() -> None:
     """VeriTrace command-line interface."""

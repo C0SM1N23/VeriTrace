@@ -617,6 +617,15 @@ def is_protected(path: Path) -> bool:
         return False
 
 
+class TopNotFound(ValueError):
+    """The requested top module is not among the given sources.
+
+    Its own type so the CLI can turn it into a one-line message rather than a
+    traceback: it is the commonest way to point a command at the wrong design,
+    and the answer is a sentence, not a stack.
+    """
+
+
 def elaborate(
     files: Sequence[str | Path],
     incdirs: Sequence[str | Path] = (),
@@ -706,7 +715,7 @@ def elaborate(
         # naming the mistake.
         names = sorted({d.name for d in comp.getDefinitions() if getattr(d, "name", "")})
         near = ", ".join(names[:8]) or "none"
-        raise ValueError(
+        raise TopNotFound(
             f"top module {top!r} is not in these sources; found: {near}"
             + (" …" if len(names) > 8 else "")
         )
