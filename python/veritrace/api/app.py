@@ -565,6 +565,8 @@ def create_app(
                 root = session.config.root if session.config is not None else session.trace_path.parent
                 got = mem_query.run(session.memory, pipeline, session.store, session.clock, root)
                 return {"query": body.vtq, **got}
+            if pipeline.name == "protocol":
+                return {"query": body.vtq, **txn_query.protocol(session.protocol, pipeline)}
             result = txn_query.run(session.protocol, pipeline)
         except vtq.QueryError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e

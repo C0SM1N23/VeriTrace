@@ -93,6 +93,49 @@ def _stage(txns: list[Transaction], call: Call) -> list[Transaction]:
     raise QueryError(f"unknown stage `{call.name}()`; try {', '.join(STAGES)}")
 
 
+def protocol(analysis: Any, pipeline: Pipeline) -> dict[str, Any]:
+    """§10.1's `protocol(iface)` — the pack rules this run broke.
+
+    The violations were always computed, and reached the Checks tab and the
+    `/transactions` payload; they had no name in the query language, so the one
+    table in §10.1 that asks "what did this interface do wrong" could not be
+    asked. Reads the same extraction the rest of this module does.
+    """
+    src = pipeline.source
+    if pipeline.stages:
+        raise QueryError("`protocol()` does not take a `| stage`")
+    name = str(src.args[0]) if src.args else None
+    if name is None:
+        chosen = list(analysis.extractions)
+    else:
+        ex = analysis.get(name)
+        if ex is None:
+            known = ", ".join(e.interface.name for e in analysis.extractions) or "none"
+            raise QueryError(f"no interface named `{name}`; detected: {known}")
+        chosen = [ex]
+
+    rows = []
+    for ex in chosen:
+        for v in ex.violations:
+            row = v.to_dict() if hasattr(v, "to_dict") else dict(v)
+            row.setdefault("iface", ex.interface.name)
+            rows.append(row)
+    return {
+        "kind": "protocol",
+        "iface": name,
+        "interfaces": [e.interface.name for e in chosen],
+        # Rules that were checked, so "no violations" is distinguishable from
+        # "this pack declares no rules" (P7, and §8.14's honesty rule).
+        "rules": sorted(
+            {r.id for e in chosen for r in getattr(e.interface_pack, "rules", []) or []}
+        )
+        if any(hasattr(e, "interface_pack") for e in chosen)
+        else [],
+        "violations": rows,
+        "n": len(rows),
+    }
+
+
 def run(analysis: Any, pipeline: Pipeline) -> TxnResult:
     """Execute a parsed `txn(...)` pipeline."""
     src = pipeline.source

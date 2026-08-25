@@ -1042,3 +1042,118 @@ def test_a_bad_track_query_is_a_400_with_the_reason(dma_api):
     r = client.post(f"/session/{sid}/transactions/query", json={"vtq": "scoreboard(nope)"})
     assert r.status_code == 400
     assert "mem" in r.json()["detail"]
+
+
+def test_the_query_bar_completes_the_signal_level_table(checks_client):
+    """The three §10.1 commands the dispatch table still had no line for.
+
+    Each already had an implementation somewhere — `changed` in the store's edge
+    counts, `handshake` in the extraction, `uncovered` in §8.12's holes — so the
+    gap was the name, not the analysis.
+    """
+    client, sid = checks_client
+
+    def run(vtq: str):
+        r = client.post(f"/session/{sid}/query", json={"vtq": vtq})
+        return r.status_code, r.json()
+
+    code, body = run("changed(tb_checks.dut, c0:c40)")
+    assert code == 200, body
+    assert body["kind"] == "changed"
+    assert body["signals"] and all(s["n_edges"] > 0 for s in body["signals"])
+    # Busiest first, so the answer to "what moved" starts with what moved most.
+    counts = [s["n_edges"] for s in body["signals"]]
+    assert counts == sorted(counts, reverse=True)
+
+    # The window is the point: a narrow one has to say less than a wide one,
+    # which is what a range silently parsed as `None` could never do.
+    narrow = run("changed(tb_checks.dut, c0:c2)")[1]["signals"]
+    wide = run("changed(tb_checks.dut, c0:c300)")[1]["signals"]
+    assert sum(s["n_edges"] for s in narrow) < sum(s["n_edges"] for s in wide)
+    # And a scope is a scope: nothing outside it is reported.
+    assert all(s["path"].startswith("tb_checks.dut") for s in wide)
+
+    # This design has no bus, and saying so beats an empty list (P7).
+    code, body = run("handshake()")
+    assert code == 400 and "no protocol interface" in body["detail"]
+
+    code, body = run("uncovered(checks_dut.sv)")
+    assert code == 200, body
+    assert body["kind"] == "uncovered"
+
+
+def test_a_pipeline_narrows_each_stage_to_the_one_before_it(checks_client):
+    """§9.3, with the spec's own two examples.
+
+    Every stage used to be refused outright, so the piping half of the language
+    did not exist. What matters is not that a pipeline parses but that it
+    *narrows*: a stage that quietly ignored its input would read the same and
+    answer about the whole design.
+    """
+    client, sid = checks_client
+
+    def run(vtq: str):
+        r = client.post(f"/session/{sid}/query", json={"vtq": vtq})
+        return r.status_code, r.json()
+
+    everything = run("stuck(min_duration=c50)")[1]["findings"]
+    code, body = run("find(*lock_r*) | stuck(min_duration=c50)")
+    assert code == 200, body
+    assert body["kind"] == "stuck"
+    piped = body["findings"]
+    assert piped, "the pipeline filtered everything away"
+    assert len(piped) < len(everything), "the stage ignored its input"
+    assert all("lock_r" in f["signal"] for f in piped)
+
+    # §9.3's other example: a cone, narrowed to what actually moved (§8.6).
+    code, body = run("cone(u_dut.lock_r, 3) | changed(c0:c400)")
+    assert code == 200, body
+    assert body["kind"] == "changed"
+    cone = {n["path"] for n in run("cone(u_dut.lock_r, 3)")[1]["nodes"]}
+    assert {s["path"] for s in body["signals"]} <= cone
+
+    # A command that needs a signal of its own cannot be a stage, and says so.
+    code, body = run("find(lock) | cone(x)")
+    assert code == 400 and "cannot follow a `|`" in body["detail"]
+
+
+def test_a_glob_in_find_is_a_glob(checks_client):
+    """§9.1 makes a path segment a glob and §9.3's example is `find(*fifo*.full)`.
+
+    The fuzzy ranking treated the star as a character to look for, so the one
+    syntax the spec writes its examples in matched nothing, silently.
+    """
+    client, sid = checks_client
+
+    def run(vtq: str):
+        return client.post(f"/session/{sid}/query", json={"vtq": vtq}).json()
+
+    starred = {s["path"] for s in run("find(*lock_r*)")["signals"]}
+    assert starred, "a glob matched nothing"
+    assert all("lock_r" in p for p in starred)
+    # An anchored glob is anchored: this one has a prefix that cannot match.
+    assert run("find(nosuchscope.*)")["signals"] == []
+
+
+def test_a_cycle_range_parses_as_a_range():
+    """§9.1's `time := INT | '@' INT | 't' INT | 'c' INT`, in a `lo:hi`.
+
+    `c1200` is hex as far as a character class is concerned, so the range
+    pattern matched it and then `int("c1200", 0)` raised and was turned into
+    `None`. Every cycle range in the language therefore meant "the whole trace",
+    silently — `edges(sig, c0:c400)` included.
+    """
+    from veritrace.analysis import vtq
+
+    def args(q: str):
+        return vtq.parse_pipeline(q).source.args
+
+    assert args("edges(a.b, c0:c400)") == ("a.b", ("c0", "c400"))
+    assert args("edges(a.b, t10:t99)") == ("a.b", ("t10", "t99"))
+    assert args("edges(a.b, @10:@99)") == ("a.b", ("@10", "@99"))
+    # Plain and hex endpoints still arrive as numbers, which is what an address
+    # range like §10.1's `addr=0x4000:0x5000` depends on.
+    assert args("edges(a.b, 10:400)") == ("a.b", (10, 400))
+    assert vtq.parse_pipeline("txn(m0, addr=0x4000:0x5000)").source.kwargs == {
+        "addr": (0x4000, 0x5000)
+    }

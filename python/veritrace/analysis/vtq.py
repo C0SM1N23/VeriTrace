@@ -229,8 +229,11 @@ class Pipeline:
 
 
 _CALL = re.compile(r"^\s*(?P<name>[A-Za-z_]\w*)\s*\((?P<body>.*)\)\s*$", re.S)
-#: `0x4000:0x5000` — an inclusive range, the form §10.1 uses for addresses.
-_RANGE = re.compile(r"^(?P<lo>-?(?:0[xXbB])?[0-9a-fA-F_]+)\s*:\s*(?P<hi>-?(?:0[xXbB])?[0-9a-fA-F_]+)$")
+#: One endpoint of a range: an address like `0x4000`, or one of §9.1's time
+#: forms — `c1247` for a clock cycle, `t1247`/`@1247` for a raw timestamp.
+_ENDPOINT = r"[@ct]?-?(?:0[xXbB])?[0-9a-fA-F_]+"
+#: `0x4000:0x5000` and `c1200:c1250` — inclusive, the form §10.1 uses for both.
+_RANGE = re.compile(rf"^(?P<lo>{_ENDPOINT})\s*:\s*(?P<hi>{_ENDPOINT})$")
 
 
 def _value(text: str) -> Any:
@@ -240,7 +243,20 @@ def _value(text: str) -> Any:
         return s[1:-1]
     m = _RANGE.match(s)
     if m:
-        return (_number(m.group("lo")), _number(m.group("hi")))
+        return (_endpoint(m.group("lo")), _endpoint(m.group("hi")))
+    n = _number(s)
+    return s if n is None else n
+
+
+def _endpoint(s: str) -> Any:
+    """A range endpoint, as a number when it is one and as text when it is not.
+
+    `c1200` is hex as far as a character class is concerned, so the old pattern
+    matched it and then `int("c1200", 0)` failed and produced `None` — silently,
+    which made `edges(sig, c0:c400)` and every other cycle range mean "the whole
+    trace". Cycle and `t`/`@` forms are handed on as text for the executor's
+    `_at` to resolve against the primary clock (§5.5, problem 3).
+    """
     n = _number(s)
     return s if n is None else n
 
