@@ -172,6 +172,104 @@ def resolve(store: Any, graph: Any = None, config: Any = None) -> Clock | None:
     return None
 
 
+def domains(
+    store: Any,
+    graph: Any = None,
+    config: Any = None,
+    primary: Clock | None = None,
+    aliases: Any = None,
+) -> list[dict[str, Any]]:
+    """Every clock domain in the design, and which scopes each one drives.
+
+    §5.5, problem 3: *"nu exista 'ciclul' in general — exista fronturi pe un
+    anumit clock"*, and a signal in a second domain has to be shown with its own
+    cycle number, named — `axi: c891 (aclk)`. The Inspector is where the spec
+    puts that, so it needs to know which clock counts a given signal rather than
+    guessing from the name.
+
+    Membership is per *signal*, not per scope, because two clocks routinely
+    drive registers in one module — `designs/checks` has exactly that, and a
+    scope prefix cannot tell them apart. Each non-primary domain therefore
+    carries the signals it actually clocks, read off the graph; everything else
+    belongs to the primary clock. With no graph there is only the primary,
+    which is the honest answer: nothing in a bare dump says which net clocks
+    which flop.
+    """
+    if primary is None:
+        primary = resolve(store, graph, config)
+    if primary is None:
+        return []
+
+    wanted: list[str] = [primary.path]
+    for path in list(getattr(config, "other_clocks", []) or []) + (
+        _from_graph(graph) if graph is not None else []
+    ):
+        if path not in wanted:
+            wanted.append(path)
+
+    # Signals each clock drives, from the drivers that name it.
+    driven: dict[str, set[str]] = {}
+    if graph is not None:
+        for sig in graph:
+            for d in sig.drivers:
+                if d.clock is not None:
+                    driven.setdefault(d.clock.path(), set()).add(sig.path)
+
+    # One wire wears several names (§7.1): a register inside a module is also a
+    # port net one level up, and the dump carries all of them. A domain that
+    # listed only the inner name would fail to recognise the row a user clicked,
+    # so each member brings its whole equivalence class with it.
+    same = _alias_classes(aliases)
+    for paths in driven.values():
+        for path in list(paths):
+            paths |= same.get(path, set())
+
+    out: list[dict[str, Any]] = []
+    for path in wanted:
+        clock = primary if path == primary.path else clock_at(store, path, "graph")
+        if clock is None or clock.period is None:
+            continue
+        out.append(
+            {
+                "path": path,
+                "name": path.rsplit(".", 1)[-1],
+                "primary": path == primary.path,
+                "period": clock.period,
+                "origin": clock.edges[0] if clock.edges else 0,
+                "n_cycles": clock.n_cycles,
+                # Only for the secondary domains: the primary is the default for
+                # every signal, and listing a whole design here would put the
+                # hierarchy in a status payload for nothing.
+                "signals": [] if path == primary.path else sorted(driven.get(path, ())),
+            }
+        )
+    return out
+
+
+def _alias_classes(aliases: Any) -> dict[str, set[str]]:
+    """Path -> every other path naming the same wire, from port connections."""
+    if not aliases:
+        return {}
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b in aliases:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    out: dict[str, set[str]] = {}
+    for path in parent:
+        out.setdefault(find(path), set()).add(path)
+    return {p: out[find(p)] for p in parent}
+
+
 def format_time(t: int, clock: Clock | None) -> str:
     """`c1247` when a clock is known, the raw timestamp otherwise.
 

@@ -225,6 +225,8 @@ export interface WaveState {
   helpOpen: boolean;
   /** §11.3's design tree column. ⌘\ collapses it. */
   treeOpen: boolean;
+  /** §11.3's third column: details of whatever is selected. Collapsible too. */
+  inspectorOpen: boolean;
   activeTab: number;
   ready: boolean;
   error: string | null;
@@ -255,6 +257,7 @@ export interface WaveState {
   setPalette: (open: boolean) => void;
   setHelp: (open: boolean) => void;
   toggleTree: () => void;
+  toggleInspector: () => void;
   setTab: (n: number) => void;
   stepEdge: (dir: 1 | -1) => Promise<void>;
   runWhy: (signalPath: string, t: number) => Promise<void>;
@@ -489,6 +492,7 @@ export const useWave = create<WaveState>((set, get) => ({
   paletteOpen: false,
   helpOpen: false,
   treeOpen: true,
+  inspectorOpen: true,
   activeTab: 1,
   ready: false,
   error: null,
@@ -693,6 +697,7 @@ export const useWave = create<WaveState>((set, get) => ({
   setPalette: (open) => set({ paletteOpen: open }),
   setHelp: (open) => set({ helpOpen: open }),
   toggleTree: () => set({ treeOpen: !get().treeOpen }),
+  toggleInspector: () => set({ inspectorOpen: !get().inspectorOpen }),
 
   setTab: (n) => set({ activeTab: n }),
 

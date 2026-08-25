@@ -7,6 +7,7 @@ import { CoverageTab } from "./panels/CoverageTab";
 import { DiffTab } from "./panels/DiffTab";
 import { FsmMode } from "./panels/FsmMode";
 import { FIXED_TABS, HelpOverlay, QueryBar, StatusBar, TabStrip, TopBar } from "./panels/Chrome";
+import { Inspector } from "./panels/Inspector";
 import { PluginTab } from "./panels/PluginTab";
 import type { PluginTable } from "./lib/types";
 
@@ -29,6 +30,7 @@ export default function App() {
   const tab = useWave((s) => s.activeTab);
   const replay = useWave((s) => s.replay);
   const tree = useWave((s) => s.treeOpen);
+  const inspector = useWave((s) => s.inspectorOpen);
   const fsmOpen = useWave((s) => s.fsmOpen);
   const rtlChanged = useWave((s) => s.status?.rtl_changed ?? false);
   const pluginTables = useWave((s) => s.checks?.plugin_tables ?? NO_TABLES);
@@ -81,7 +83,7 @@ export default function App() {
           The tree is collapsible like the others — *"Toate cele trei coloane
           sunt colapsabile"* — because on a narrow screen the waveform is what
           matters and the tree has done its job once the signals are on it. */}
-      <div className={tree ? "main" : "main no-tree"}>
+      <div className={`main${tree ? "" : " no-tree"}${inspector ? "" : " no-inspector"}`}>
         {tree && <HierarchyPanel />}
         <SignalPanel />
         {/* The wave canvas stays mounted across tabs: re-creating the worker
@@ -144,6 +146,9 @@ export default function App() {
           )}
           <ReplayMode />
         </div>
+        {/* §11.3's third column. Reads the shared selection of §11.6, so it
+            describes whatever any panel last selected without being told. */}
+        <Inspector />
       </div>
       <StatusBar />
       <CommandPalette />

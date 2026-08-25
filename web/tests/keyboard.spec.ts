@@ -39,18 +39,29 @@ async function selectSignal(page: Page, name: string): Promise<void> {
   await row.click();
 }
 
-test("c takes the fan-in cone of the selection and filters Wave to it", async ({ page }) => {
+test("c takes the fan-in cone of the selection and filters Wave to it", async ({ page, request }) => {
   // §8.6 — "din 4000 de semnale ramai cu 8". The endpoint and the analysis were
   // both there; no key and no button reached them.
   await open(page);
-  const before = await page.locator('[data-testid="signal-row"]').count();
   await selectSignal(page, "full");
   await page.keyboard.press("c");
 
   await expect(page.locator('[data-testid="query-bar"]')).toHaveValue(/^cone\(.*full, depth=4\)$/);
-  const after = await page.locator('[data-testid="signal-row"]').count();
-  expect(after).toBeGreaterThan(0);
-  expect(after).toBeLessThan(before);
+
+  // What matters is that Wave is showing the cone, not that it is showing
+  // *fewer* rows: on a design this small the cone reaches everything, and
+  // asserting a reduction would be asserting a property of fifo_buggy.
+  const q = await page.locator('[data-testid="query-bar"]').inputValue();
+  const r = await request.post(`${BACKEND}/session/${sessionId}/query`, { data: { vtq: q } });
+  const expected: string[] = (await r.json()).nodes.map((n: { path: string }) => n.path);
+  expect(expected.length).toBeGreaterThan(0);
+
+  const shown = await page.$$eval('[data-testid="signal-row"]', (rows) =>
+    rows.map((el) => el.getAttribute("data-path") ?? ""),
+  );
+  expect(shown.length).toBe(expected.length);
+  expect(new Set(shown)).toEqual(new Set(expected));
+
   // The move is reversible, like every other click-through (§11.4b).
   await expect(page.locator('[data-testid="signal-focus-back"]')).toBeVisible();
 });

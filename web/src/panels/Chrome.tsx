@@ -211,6 +211,8 @@ export function StatusBar() {
   const treeOpen = useWave((s) => s.treeOpen);
   const toggleTree = useWave((s) => s.toggleTree);
   const note = useWave((s) => s.note);
+  const inspectorOpen = useWave((s) => s.inspectorOpen);
+  const toggleInspector = useWave((s) => s.toggleInspector);
   const nBookmarks = useWave((s) => s.bookmarks.length);
   const [marksOpen, setMarksOpen] = useState(false);
 
@@ -262,6 +264,14 @@ export function StatusBar() {
         data-testid="tree-toggle"
       >
         {treeOpen ? "tree" : "no tree"}
+      </button>
+      <button
+        className="chip"
+        onClick={toggleInspector}
+        title="Show or hide the inspector (§11.3)"
+        data-testid="inspector-toggle"
+      >
+        {inspectorOpen ? "inspector" : "no inspector"}
       </button>
       <button
         className="chip"

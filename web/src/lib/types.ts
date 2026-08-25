@@ -74,6 +74,17 @@ export interface Layout {
   query?: string;
 }
 
+export interface ClockDomain {
+  path: string;
+  name: string;
+  primary: boolean;
+  period: number | null;
+  origin: number;
+  n_cycles: number;
+  /** Signals this clock drives. Empty for the primary domain: it is the default. */
+  signals: string[];
+}
+
 export interface SessionStatus {
   phase: string;
   progress: number;
@@ -92,6 +103,12 @@ export interface SessionStatus {
   rtl_changed: boolean;
   n_rtl_signals: number;
   rtl_error: string;
+  /**
+   * §5.5, problem 3: every clock domain, so a signal outside the primary one
+   * can be shown with its own cycle number and the name of the clock that
+   * counted it. `signals` is populated for the secondary domains only.
+   */
+  clock_domains: ClockDomain[];
   /** §11.4b — which tab to open on, decided by the server from the design. */
   default_tab: string;
   n_findings: number;

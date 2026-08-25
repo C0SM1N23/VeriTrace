@@ -476,6 +476,7 @@ class Session:
             self.layout_file.save(layout)
 
     def status(self) -> dict[str, Any]:
+        from veritrace import clocks
         from veritrace.analysis.checks import default_tab
 
         t0, t1 = self.store.time_range
@@ -505,6 +506,15 @@ class Session:
             "clock": self.clock.path if self.clock else None,
             "clock_method": self.clock.method if self.clock else None,
             "n_cycles": self.clock.n_cycles if self.clock else 0,
+            # §5.5, problem 3: `c1247` is ambiguous with two clocks, so the
+            # Inspector shows a signal's own domain beside the primary count.
+            "clock_domains": clocks.domains(
+                self.store,
+                self.graph,
+                self.config,
+                self.clock,
+                getattr(self.elaboration, "aliases", None),
+            ),
             "phase": "ready",
             "progress": 1.0,
             # Without RTL there is nothing to correlate; reporting null beats a

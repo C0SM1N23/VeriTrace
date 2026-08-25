@@ -19,7 +19,7 @@
  */
 
 import { useEffect, useState } from "react";
-import { fetchHierarchy, fetchSubtreeSignals } from "../api/client";
+import { fetchHierarchy, fetchSignals, fetchSubtreeSignals } from "../api/client";
 import type { HierarchyLevel, HierarchyScope, SignalMeta } from "../lib/types";
 import { useWave } from "../state/store";
 
@@ -31,6 +31,30 @@ export function HierarchyPanel() {
   const [busy, setBusy] = useState<string | null>(null);
   const [note, setNote] = useState("");
   const [error, setError] = useState("");
+  // §11.3 spells this column "arbore + cautare". The tree was built and the
+  // search was not, so finding one signal in a deep design meant opening every
+  // scope on the way down to it.
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<SignalMeta[] | null>(null);
+
+  useEffect(() => {
+    const q = query.trim();
+    if (!session || q.length < 2) {
+      setHits(null);
+      return;
+    }
+    // Debounced: this is a keystroke handler talking to the server.
+    let live = true;
+    const id = window.setTimeout(() => {
+      void fetchSignals(session, q, 200)
+        .then((rows) => live && setHits(rows))
+        .catch(() => live && setHits([]));
+    }, 150);
+    return () => {
+      live = false;
+      window.clearTimeout(id);
+    };
+  }, [session, query]);
 
   const load = async (path: string) => {
     if (!session || levels[path]) return;
@@ -105,6 +129,24 @@ export function HierarchyPanel() {
           {error || note}
         </span>
       </div>
+      <input
+        className="tree-search"
+        placeholder="find a signal…"
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        data-testid="tree-search"
+      />
+      {hits !== null ? (
+        <div className="tree-body" data-testid="tree-hits">
+          {hits.length === 0 ? (
+            <div className="pane-hint">
+              Nothing matches <span className="mono">{query}</span> in this trace.
+            </div>
+          ) : (
+            hits.map((sig) => <SignalRow key={sig.handle} sig={sig} depth={0} />)
+          )}
+        </div>
+      ) : (
       <div className="tree-body">
         {(levels[""]?.scopes ?? []).map((s) => (
           <Node
@@ -122,6 +164,7 @@ export function HierarchyPanel() {
           <SignalRow key={sig.handle} sig={sig} depth={0} />
         ))}
       </div>
+      )}
     </div>
   );
 }
