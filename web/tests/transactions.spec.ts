@@ -41,8 +41,9 @@ async function open(page: Page): Promise<void> {
   await expect(page.locator('[data-testid="transactions-tab"]')).toBeVisible();
   // Zoom to fit. The layout reset above races the previous page's debounced
   // save, so the starting view is normalised here rather than assumed — and
-  // every band is then on screen, whatever ran before.
-  await page.keyboard.press("f");
+  // every band is then on screen, whatever ran before. `z`, not `f`: §11.7
+  // gives `f` to §8.6's fan-out.
+  await page.keyboard.press("z");
   await expect(page.locator('[data-testid^="txn-band-"]').first()).toBeVisible();
 }
 

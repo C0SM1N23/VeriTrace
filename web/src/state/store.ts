@@ -38,6 +38,7 @@ import {
   unsuppressFinding,
 } from "../api/client";
 import type {
+  Bookmark,
   CausalNode,
   ChecksReport,
   CmdEvent,
@@ -167,6 +168,27 @@ export interface WaveState {
   stashedLabel: string;
   /** What the current list is, when a click-through chose it. */
   focusLabel: string;
+  /**
+   * What the query bar shows — §9.4.
+   *
+   * *"Fiecare actiune din UI scrie query-ul echivalent in bara. Asa se invata
+   * limbajul fara tutorial."* Every route that runs a query sets this, so
+   * right-clicking a signal spells out `why(...)` and pressing `c` spells out
+   * `cone(...)`. The bar is the one place the language is visible, and it was
+   * an uncontrolled input that never showed anything anyone had done.
+   */
+  queryText: string;
+  /** Queries this session has run, most recent first — §9.4's history. */
+  queryHistory: string[];
+  /** §11.4's `⌘B` marks, persisted with the layout (P5). */
+  bookmarks: Bookmark[];
+  /**
+   * One line of transient feedback, shown in the status bar.
+   *
+   * §11.8's rule applies: it says what happened and what to do next, never
+   * "something went wrong". Cleared by the next action that succeeds.
+   */
+  note: string;
   // §8.8 — a mode of Source, not a tab.
   machines: Machine[];
   fsmBusy: boolean;
@@ -263,6 +285,23 @@ export interface WaveState {
   setMemFilter: (q: string) => void;
   /** Focus Wave on a set of signals, remembering what it replaced. */
   focusRows: (rows: Row[], label: string) => void;
+  /** What the query bar shows, without running it (§9.4). */
+  setQueryText: (text: string) => void;
+  /** Put a query at the head of the session's history, de-duplicated (§9.4). */
+  rememberQuery: (text: string) => void;
+  /** §11.4: mark the current (signal, time). The note is typed afterwards. */
+  addBookmark: () => void;
+  setBookmarkLabel: (index: number, label: string) => void;
+  removeBookmark: (index: number) => void;
+  /**
+   * §8.6 — the fan-in or fan-out of the current selection, filtered into Wave.
+   *
+   * *"Din 4000 de semnale ramai cu 8."* The analysis and its endpoint existed
+   * from the start; nothing in the UI called them, so the feature §8.6 calls
+   * the best value for effort in the project could only be reached by typing
+   * the query by hand.
+   */
+  runCone: (direction: "fanin" | "fanout") => Promise<void>;
   /** Swap the current list with the one a click-through replaced. */
   swapRows: () => void;
   loadMachines: () => Promise<void>;
@@ -294,7 +333,7 @@ export function layoutFrom(s: WaveState): Layout {
     signals: s.rows,
     groups: [],
     radix: s.radix,
-    bookmarks: [],
+    bookmarks: s.bookmarks,
     cursors: s.cursor === null ? s.markers : [s.cursor, ...s.markers],
     zoom: { t0: Math.round(s.view.t0), t1: Math.round(s.view.t1) },
     // Extra keys: the server stores the layout as an open document, so view
@@ -423,6 +462,10 @@ export const useWave = create<WaveState>((set, get) => ({
   stashedRows: null,
   stashedLabel: "",
   focusLabel: "",
+  queryText: "",
+  queryHistory: [],
+  bookmarks: [],
+  note: "",
   machines: [],
   fsmBusy: false,
   fsmError: null,
@@ -494,6 +537,16 @@ export const useWave = create<WaveState>((set, get) => ({
         markers: layout.cursors?.length ? layout.cursors.slice(1) : [],
         rulerMode: layout.rulerMode === "cycle" ? "cycle" : "time",
         rowH: layout.rowH === 28 ? 28 : 20,
+        // P5: bookmarks come back with everything else. Filtered to the marks
+        // this trace can still place — a shared session (§13.8) may carry marks
+        // for signals that are not in your dump, and a mark on nothing is worse
+        // than no mark.
+        bookmarks: (Array.isArray(layout.bookmarks) ? layout.bookmarks : []).filter(
+          (b): b is Bookmark =>
+            !!b &&
+            typeof b.t === "number" &&
+            (b.signal === null || signals.some((s) => s.path === b.signal)),
+        ),
         clockPeriod,
         clockOrigin,
         // §11.4b: the server decides which tab suits this design. §13.4 wants
@@ -665,10 +718,21 @@ export const useWave = create<WaveState>((set, get) => ({
   runWhy: async (signalPath, t) => {
     const s = get();
     if (!s.session) return;
-    set({ ...askingAgain(), causalBusy: true, activeTab: 2, cursor: Math.round(t) });
+    // §9.4: the bar shows the query this action is equivalent to, which is how
+    // the language is learned without a tutorial.
+    const text = `why(${signalPath} @ ${Math.round(t)})`;
+    set({
+      ...askingAgain(),
+      causalBusy: true,
+      activeTab: 2,
+      cursor: Math.round(t),
+      queryText: text,
+      note: "",
+    });
     try {
-      const res = await runQuery(s.session, `why(${signalPath} @ ${Math.round(t)})`);
+      const res = await runQuery(s.session, text);
       set({ causal: res, causalBusy: false, activeNode: nodeId(res.root) });
+      get().rememberQuery(text);
       schedulePersist(get);
       const loc = res.root.loc;
       if (loc) void get().openSource(loc.file, loc.line);
@@ -722,10 +786,11 @@ export const useWave = create<WaveState>((set, get) => ({
   runQueryText: async (text) => {
     const s = get();
     if (!s.session) return;
-    set({ ...askingAgain(), causalBusy: true, activeTab: 2 });
+    set({ ...askingAgain(), causalBusy: true, activeTab: 2, queryText: text, note: "" });
     try {
       const res = await runQuery(s.session, text);
       set({ causal: res, causalBusy: false, activeNode: nodeId(res.root), cursor: res.time });
+      get().rememberQuery(text);
       schedulePersist(get);
       if (res.root.loc) void get().openSource(res.root.loc.file, res.root.loc.line);
     } catch (e) {
@@ -1000,6 +1065,78 @@ export const useWave = create<WaveState>((set, get) => ({
       stashedLabel: s.focusLabel || "your signal list",
       focusLabel: label,
     });
+  },
+
+  setQueryText: (text) => set({ queryText: text }),
+
+  rememberQuery: (text) => {
+    const q = text.trim();
+    if (!q) return;
+    const s = get();
+    // Most recent first, and asking the same thing twice does not fill the
+    // history with one question. Capped: this is a session's recall, not a log.
+    set({ queryHistory: [q, ...s.queryHistory.filter((x) => x !== q)].slice(0, 50) });
+  },
+
+  addBookmark: () => {
+    const s = get();
+    const t = s.cursor ?? Math.round((s.view.t0 + s.view.t1) / 2);
+    const sig = s.selected !== null ? (s.signalsByHandle.get(s.selected)?.path ?? null) : null;
+    // Marking the same instant twice is a slip, not a second mark.
+    if (s.bookmarks.some((b) => b.t === t && b.signal === sig)) {
+      set({ note: "Already bookmarked here." });
+      return;
+    }
+    const mark: Bookmark = { t, signal: sig, label: "" };
+    set({
+      bookmarks: [...s.bookmarks, mark].sort((a, b) => a.t - b.t),
+      note: `Bookmarked ${sig ?? "this instant"} — add a note in the list.`,
+    });
+    schedulePersist(get);
+  },
+
+  setBookmarkLabel: (index, label) => {
+    const s = get();
+    if (!s.bookmarks[index]) return;
+    set({ bookmarks: s.bookmarks.map((b, i) => (i === index ? { ...b, label } : b)) });
+    schedulePersist(get);
+  },
+
+  removeBookmark: (index) => {
+    const s = get();
+    set({ bookmarks: s.bookmarks.filter((_, i) => i !== index) });
+    schedulePersist(get);
+  },
+
+  runCone: async (direction) => {
+    const s = get();
+    if (!s.session) return;
+    const sig = s.selected !== null ? s.signalsByHandle.get(s.selected) : undefined;
+    if (!sig) {
+      set({ note: "Select a signal first — a cone starts somewhere." });
+      return;
+    }
+    const verb = direction === "fanout" ? "fanout" : "cone";
+    const text = `${verb}(${sig.path}, depth=4)`;
+    set({ queryText: text });
+    try {
+      const res = (await runQuery(s.session, text)) as unknown as {
+        nodes?: { path: string }[];
+      };
+      const paths = new Set((res.nodes ?? []).map((n) => n.path));
+      const rows: Row[] = s.signals
+        .filter((x) => paths.has(x.path))
+        .map((x) => ({ kind: "signal", handle: x.handle, path: x.path }) as Row);
+      if (!rows.length) {
+        set({ note: `${verb}(${sig.name}) reached nothing in this trace` });
+        return;
+      }
+      get().focusRows(rows, `${verb} of ${sig.name}`);
+      get().rememberQuery(text);
+      set({ activeTab: 1, note: "" });
+    } catch (e) {
+      set({ note: e instanceof Error ? e.message : String(e) });
+    }
   },
 
   swapRows: () => {

@@ -1,6 +1,6 @@
 /** Top bar, tab strip, status bar and the shortcut overlay (§11.3, §11.7). */
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { fetchCorrelation } from "../api/client";
 import { formatTime } from "../lib/time";
 import type { CorrelationReport, PluginTable } from "../lib/types";
@@ -210,6 +210,9 @@ export function StatusBar() {
   const zoomAll = useWave((s) => s.zoomAll);
   const treeOpen = useWave((s) => s.treeOpen);
   const toggleTree = useWave((s) => s.toggleTree);
+  const note = useWave((s) => s.note);
+  const nBookmarks = useWave((s) => s.bookmarks.length);
+  const [marksOpen, setMarksOpen] = useState(false);
 
   useEffect(() => {
     const write = () => {
@@ -232,6 +235,14 @@ export function StatusBar() {
       <span ref={rangeRef} className="mono" data-testid="status-range" />
       <Dot />
       <span ref={cursorRef} className="mono" data-testid="status-cursor" />
+      {note && (
+        <>
+          <Dot />
+          <span className="status-note" data-testid="status-note">
+            {note}
+          </span>
+        </>
+      )}
       <span className="spacer" />
       <button className="chip" onClick={zoomAll} title="Zoom to fit">
         fit
@@ -260,7 +271,79 @@ export function StatusBar() {
       >
         {rowH === 20 ? "compact" : "tall"}
       </button>
+      <button
+        className="chip"
+        onClick={() => setMarksOpen(true)}
+        title="Bookmarks on this trace (⌘B to add)"
+        data-testid="bookmarks-toggle"
+      >
+        {nBookmarks ? `${nBookmarks} mark${nBookmarks === 1 ? "" : "s"}` : "marks"}
+      </button>
       <span className="hint">? for shortcuts</span>
+      {marksOpen && <Bookmarks onClose={() => setMarksOpen(false)} />}
+    </div>
+  );
+}
+
+/**
+ * §11.4's bookmarks: a note on a (signal, time), kept in the layout (P5).
+ *
+ * The shortcut was in the help overlay from the start with nothing behind it,
+ * and the layout wrote an empty list over whatever was there. `⌘B` marks the
+ * spot; the note is typed here, because a modal prompt in the middle of a
+ * debugging session is the wrong shape for something you want to be cheap.
+ */
+function Bookmarks({ onClose }: { onClose: () => void }) {
+  const marks = useWave((s) => s.bookmarks);
+  const setLabel = useWave((s) => s.setBookmarkLabel);
+  const remove = useWave((s) => s.removeBookmark);
+  const jumpTo = useWave((s) => s.jumpTo);
+  const timescale = useWave((s) => s.status?.timescale ?? "1ns");
+
+  return (
+    <div className="palette-backdrop" onClick={onClose}>
+      <div className="marks" onClick={(e) => e.stopPropagation()} data-testid="bookmarks-panel">
+        <div className="marks-head">
+          <span className="strong">BOOKMARKS</span>
+          <span className="spacer" />
+          <span className="dim">⌘B marks the cursor</span>
+        </div>
+        {marks.length === 0 ? (
+          <div className="pane-note">
+            No bookmarks yet.
+            <div className="pane-hint">
+              Select a signal, put the cursor where it matters, and press <kbd>⌘B</kbd>.
+            </div>
+          </div>
+        ) : (
+          <ul className="marks-list">
+            {marks.map((b, i) => (
+              <li key={`${b.t}:${b.signal ?? ""}`}>
+                <button
+                  className="chip mono"
+                  onClick={() => {
+                    jumpTo(b.t, b.signal ? [b.signal] : undefined, "bookmark");
+                    onClose();
+                  }}
+                  title="Go to this mark"
+                >
+                  {formatTime(b.t, timescale)}
+                </button>
+                <span className="mono dim marks-sig">{b.signal ?? "—"}</span>
+                <input
+                  value={b.label}
+                  placeholder="what matters here?"
+                  onChange={(e) => setLabel(i, e.target.value)}
+                  data-testid="bookmark-label"
+                />
+                <button className="chip" onClick={() => remove(i)} title="Remove">
+                  ×
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
     </div>
   );
 }
@@ -273,6 +356,10 @@ const SHORTCUTS: [string, string][] = [
   ["r", "replay the chain, step by step"],
   ["⌘M", "state machines, in the Source tab"],
   ["right-click", "why, on the signal under the pointer"],
+  ["c", "fan-in cone of the selection (§8.6)"],
+  ["f", "fan-out of the selection"],
+  ["n / p", "next / previous finding, in Checks and Diff"],
+  ["z", "zoom to fit"],
   ["1–9, 0", "switch tab"],
   ["← →", "previous/next transition"],
   ["⇧← ⇧→", "previous/next clock cycle"],
@@ -303,15 +390,39 @@ export function HelpOverlay() {
   );
 }
 
+/** The §10.1 verbs, for the completion list. `why` first: it is the main road. */
+const VERBS = [
+  "why", "cone", "fanout", "find", "stuck", "edges", "hold",
+  "changed", "xtrace", "fsm", "lint", "handshake", "uncovered",
+];
+
 /**
  * Query bar — always visible, because it is the spine of the tool (§11.3).
  *
- * `why(...)` is the only form that exists so far; anything else is refused by
- * the server with a message saying so, rather than failing quietly.
+ * **It is a controlled input, and that is the feature.** §9.4: *"fiecare
+ * actiune din UI scrie query-ul echivalent in bara… asa se invata limbajul
+ * fara tutorial"*. Right-clicking a signal, pressing `c`, clicking `[why]` on
+ * a finding — each writes what it is equivalent to here, so the language is
+ * read off the tool instead of out of a manual. While this was uncontrolled it
+ * showed nothing anybody had done.
+ *
+ * `↑`/`↓` walk the session's history, and typing offers the verbs and the
+ * signal names that match — the other two halves of §9.4.
  */
 export function QueryBar() {
   const ref = useRef<HTMLInputElement>(null);
   const hasRtl = useWave((s) => s.status?.has_rtl ?? false);
+  const text = useWave((s) => s.queryText);
+  const setQueryText = useWave((s) => s.setQueryText);
+  const history = useWave((s) => s.queryHistory);
+  const signals = useWave((s) => s.signals);
+  // -1 means "not walking history"; 0 is the most recent query.
+  const [histAt, setHistAt] = useState(-1);
+  const [open, setOpen] = useState(false);
+  // -1 means the list is only *offered*. Enter runs the query that was typed
+  // unless the arrow keys moved into the list — completing a query somebody
+  // has finished writing would make the bar fight whoever is using it.
+  const [pick, setPick] = useState(-1);
 
   useEffect(() => {
     const onFocus = () => ref.current?.focus();
@@ -319,30 +430,127 @@ export function QueryBar() {
     return () => window.removeEventListener("vt:focus-query", onFocus);
   }, []);
 
+  // Complete the verb while it is being typed, and the signal name once inside
+  // the parentheses — the two things that are long enough to be worth it.
+  const suggestions = useMemo(() => {
+    if (!open || !text.trim()) return [];
+    const paren = text.indexOf("(");
+    if (paren < 0) {
+      const head = text.trim().toLowerCase();
+      return VERBS.filter((v) => v.startsWith(head) && v !== head).map((v) => `${v}(`);
+    }
+    const inner = text.slice(paren + 1).replace(/[)\s].*$/, "");
+    if (inner.length < 2) return [];
+    const low = inner.toLowerCase();
+    return signals
+      .filter((s) => s.path.toLowerCase().includes(low))
+      .slice(0, 8)
+      .map((s) => `${text.slice(0, paren + 1)}${s.path}`);
+  }, [open, text, signals]);
+
+  const accept = (value: string) => {
+    setQueryText(value);
+    setOpen(false);
+    ref.current?.focus();
+  };
+
+  const submit = (value: string) => {
+    const q = value.trim();
+    if (!q) return;
+    setOpen(false);
+    setHistAt(-1);
+    // Hand the keyboard back to the application. The answer arrives with `s`
+    // and `r` offered on it (§11.4b, §11.5), and with the caret still here
+    // those go into the query instead of running. ⌘K comes back.
+    ref.current?.blur();
+    void useWave.getState().runQueryText(q);
+  };
+
   return (
     <div className="query-bar">
       <span className="prompt">&gt;</span>
       <input
         ref={ref}
+        value={text}
         placeholder={
           hasRtl
             ? "why(top.ctrl.ready == 0 @ c1247)"
             : "why() needs RTL — start the server with --rtl"
         }
         disabled={!hasRtl}
+        onChange={(e) => {
+          setQueryText(e.target.value);
+          setHistAt(-1);
+          setOpen(true);
+          setPick(-1);
+        }}
+        onBlur={() => window.setTimeout(() => setOpen(false), 120)}
         onKeyDown={(e) => {
-          if (e.key !== "Enter") return;
-          const text = (e.target as HTMLInputElement).value.trim();
-          if (!text) return;
-          // Hand the keyboard back to the application. The answer arrives with
-          // `s` and `r` offered on it (§11.4b, §11.5), and with the caret still
-          // here those go into the query instead of running — the shortcut is
-          // printed next to the button that ignores it. ⌘K comes back.
-          (e.target as HTMLInputElement).blur();
-          void useWave.getState().runQueryText(text);
+          if (e.key === "Enter") {
+            if (open && pick >= 0 && suggestions[pick]) {
+              e.preventDefault();
+              accept(suggestions[pick]);
+              return;
+            }
+            submit(text);
+            return;
+          }
+          if (e.key === "Escape") {
+            setOpen(false);
+            return;
+          }
+          if (e.key === "Tab" && suggestions.length) {
+            // Tab is the key that means "complete it", so it takes the first
+            // suggestion when none has been picked.
+            e.preventDefault();
+            accept(suggestions[Math.max(pick, 0)]);
+            return;
+          }
+          if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+            const down = e.key === "ArrowDown";
+            if (open && suggestions.length) {
+              e.preventDefault();
+              // Down from "nothing picked" enters the list at the top; up from
+              // the top leaves it again, back to what was typed.
+              const next = down ? pick + 1 : pick - 1;
+              setPick(next >= suggestions.length ? -1 : next < -1 ? suggestions.length - 1 : next);
+              return;
+            }
+            // §9.4's history. Up walks back; down walks forward and off the
+            // end into an empty bar, which is where a new question is typed.
+            if (!history.length) return;
+            e.preventDefault();
+            const next = Math.min(history.length - 1, Math.max(-1, histAt + (down ? -1 : 1)));
+            setHistAt(next);
+            setQueryText(next < 0 ? "" : history[next]);
+            // Recalled text would otherwise open the completion list, and the
+            // next arrow key would walk that instead of the history.
+            setOpen(false);
+            setPick(-1);
+          }
         }}
         data-testid="query-bar"
       />
+      {suggestions.length > 0 && (
+        <ul className="query-suggest" data-testid="query-suggest">
+          {suggestions.map((sug, i) => (
+            <li key={sug}>
+              <button
+                className={i === pick ? "on" : ""}
+                data-testid="query-suggestion"
+                // `mousedown`, not `click`: blur fires first and would close
+                // the list out from under the pointer.
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  accept(sug);
+                }}
+              >
+                {sug}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

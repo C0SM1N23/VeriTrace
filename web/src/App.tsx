@@ -236,8 +236,26 @@ function useKeyboard() {
         }
         return;
       }
+      // §11.7 gives `c` and `f` to the two directions of §8.6's cone. `f` used
+      // to zoom to fit — a useful thing with no key in the spec, which now has
+      // `z` and the "fit" button in the status bar it always had.
+      if (e.key === "c" && !mod) {
+        void s.runCone("fanin");
+        return;
+      }
       if (e.key === "f" && !mod) {
+        void s.runCone("fanout");
+        return;
+      }
+      if (e.key === "z" && !mod) {
         s.zoomAll();
+        return;
+      }
+      if (mod && e.key.toLowerCase() === "b") {
+        // §11.4: a bookmark is (signal, time) with a note, and §P5 keeps it.
+        e.preventDefault();
+        s.addBookmark();
+        return;
       }
     };
     window.addEventListener("keydown", onKey);

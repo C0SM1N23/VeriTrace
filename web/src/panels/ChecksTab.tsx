@@ -52,6 +52,9 @@ export function ChecksTab() {
   // state: nothing else in the application depends on the window it is asking
   // about, and a reload should go back to what the config says.
   const [stuck, setStuck] = useState<StuckResult | null>(null);
+  // §11.7 gives `n`/`p` to Checks as well as Diff: walking the findings is how
+  // this tab is read when there are thirty of them. Only Diff had it.
+  const [at, setAt] = useState(-1);
 
   useEffect(() => {
     if (!checks && !busy) void load();
@@ -78,6 +81,89 @@ export function ChecksTab() {
     ? Object.fromEntries(Object.entries(checks.skipped).filter(([k]) => k !== "stuck"))
     : checks.skipped;
   const nSkipped = Object.keys(skipped).length;
+  return (
+    <ChecksBody
+      checks={checks}
+      hasRtl={hasRtl}
+      shown={shown}
+      total={total}
+      skipped={skipped}
+      nSkipped={nSkipped}
+      stuck={stuck}
+      setStuck={setStuck}
+      filter={filter}
+      setFilter={setFilter}
+      at={at}
+      setAt={setAt}
+    />
+  );
+}
+
+/**
+ * The list itself, split out so the `n`/`p` walker of §11.7 can live beside it.
+ *
+ * §11.7 gives those keys to Checks as well as Diff — a report of thirty rows is
+ * read by stepping through it — and only Diff had them. Stepping moves the
+ * shared selection (§11.6), so Wave and Source follow the finding the way they
+ * follow everything else.
+ */
+function ChecksBody({
+  checks,
+  hasRtl,
+  shown,
+  total,
+  skipped,
+  nSkipped,
+  stuck,
+  setStuck,
+  filter,
+  setFilter,
+  at,
+  setAt,
+}: {
+  checks: ChecksReport;
+  hasRtl: boolean;
+  shown: Finding[];
+  total: number;
+  skipped: Record<string, string>;
+  nSkipped: number;
+  stuck: StuckResult | null;
+  setStuck: (r: StuckResult | null) => void;
+  filter: string;
+  setFilter: (q: string) => void;
+  at: number;
+  setAt: (i: number) => void;
+}) {
+  // Sections render grouped, so the walk order is the order on screen.
+  const ordered = SECTIONS.flatMap(({ key }) => shown.filter((f) => f.group === key));
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "n" && e.key !== "p") return;
+      const el = e.target as HTMLElement | null;
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) {
+        return;
+      }
+      if (!ordered.length) return;
+      e.preventDefault();
+      const next =
+        e.key === "n"
+          ? (at + 1) % ordered.length
+          : (at - 1 + ordered.length) % ordered.length;
+      setAt(next);
+      const f = ordered[next];
+      const s = useWave.getState();
+      if (f.time !== null) s.setCursor(f.time);
+      const sig = f.signal ? s.signals.find((x) => x.path === f.signal) : undefined;
+      if (sig) s.setSelected(sig.handle);
+      if (f.loc) void s.openSource(f.loc.file, f.loc.line);
+      document
+        .querySelector(`[data-finding-index="${next}"]`)
+        ?.scrollIntoView({ block: "nearest" });
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [ordered, at, setAt]);
 
   return (
     <div className="checks" data-testid="checks-tab">
@@ -121,7 +207,7 @@ export function ChecksTab() {
         return (
           <Section key={key} label={label} count={rows.length}>
             {rows.map((f) => (
-              <Row key={f.id} finding={f} />
+              <Row key={f.id} finding={f} index={ordered.indexOf(f)} current={at} />
             ))}
           </Section>
         );
@@ -236,7 +322,15 @@ function Section({
   );
 }
 
-function Row({ finding }: { finding: Finding }) {
+function Row({
+  finding,
+  index,
+  current,
+}: {
+  finding: Finding;
+  index: number;
+  current: number;
+}) {
   const openFinding = useWave((s) => s.openFinding);
   const suppress = useWave((s) => s.suppress);
   const [asking, setAsking] = useState(false);
@@ -244,9 +338,12 @@ function Row({ finding }: { finding: Finding }) {
 
   return (
     <div
-      className={`check-row${finding.severity === "info" ? "" : ` ${finding.severity}`}`}
+      className={`check-row${finding.severity === "info" ? "" : ` ${finding.severity}`}${
+        index === current ? " walked" : ""
+      }`}
       data-testid="check-row"
       data-check={finding.check}
+      data-finding-index={index}
     >
       <div className="check-main">
         <span className={`sev sev-${finding.severity}`}>{finding.severity}</span>

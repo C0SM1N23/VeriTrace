@@ -45,12 +45,26 @@ export interface WaveChunk {
   done: boolean;
 }
 
+/**
+ * §11.4's `⌘B`: a note on a (signal, time).
+ *
+ * Written into the layout, so it survives a reload (P5) and travels in the
+ * `.vtsession` that `veritrace share` bundles (§13.8). The server has always
+ * stored these; nothing in the UI ever made one.
+ */
+export interface Bookmark {
+  t: number;
+  /** Signal the mark is about, or `null` for a mark on the timeline alone. */
+  signal: string | null;
+  label: string;
+}
+
 export interface Layout {
   version?: number;
   signals: Row[];
   groups: unknown[];
   radix: Record<string, Radix>;
-  bookmarks: unknown[];
+  bookmarks: Bookmark[];
   cursors: number[];
   zoom: { t0: number; t1: number } | null;
   /** View preferences stored alongside the layout. */

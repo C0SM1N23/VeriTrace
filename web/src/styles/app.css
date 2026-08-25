@@ -2973,3 +2973,99 @@ select:focus-visible {
   flex: none;
   font-size: 10px;
 }
+
+/* --- §9.4's completion list ---------------------------------------------- */
+.query-bar {
+  position: relative;
+}
+.query-suggest {
+  position: absolute;
+  top: 100%;
+  left: 28px;
+  right: 12px;
+  z-index: 40;
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-top: none;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.query-suggest button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 3px 10px;
+  background: none;
+  border: 0;
+  color: var(--text);
+  font: inherit;
+  font-family: var(--font-data);
+  cursor: pointer;
+}
+.query-suggest button:hover,
+.query-suggest button.on {
+  background: var(--bg-panel);
+  color: var(--text-bright);
+}
+
+/* --- §11.8's one-line feedback, in the status bar ------------------------- */
+.status-note {
+  color: var(--causal);
+  max-width: 52ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- §11.4's bookmarks --------------------------------------------------- */
+.marks {
+  width: min(760px, 92vw);
+  max-height: 70vh;
+  overflow-y: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  padding: 14px 16px;
+}
+.marks-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+.marks-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.marks-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--bg-raised);
+}
+.marks-sig {
+  flex: 0 1 30ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.marks-list input {
+  flex: 1 1 auto;
+  min-width: 8ch;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font: inherit;
+  padding: 3px 7px;
+}
+
+/* §11.7's `n`/`p` walk through the findings: where you are, without moving. */
+.check-row.walked {
+  box-shadow: inset 2px 0 0 var(--causal);
+  background: var(--bg-raised);
+}
