@@ -402,8 +402,8 @@ export function HelpOverlay() {
 
 /** The §10.1 verbs, for the completion list. `why` first: it is the main road. */
 const VERBS = [
-  "why", "cone", "fanout", "find", "stuck", "edges", "hold",
-  "changed", "xtrace", "fsm", "lint", "handshake", "uncovered",
+  "why", "subtrace", "repro", "cone", "fanout", "find", "stuck", "edges",
+  "hold", "changed", "xtrace", "fsm", "lint", "handshake", "uncovered",
 ];
 
 /**

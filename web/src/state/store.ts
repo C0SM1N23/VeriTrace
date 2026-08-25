@@ -791,6 +791,22 @@ export const useWave = create<WaveState>((set, get) => ({
   runQueryText: async (text) => {
     const s = get();
     if (!s.session) return;
+
+    // §9.2 lists `subtrace(...)` and `repro(...)` beside `why(...)`, and they
+    // are the same question asked one step further: minimise the chain, or
+    // build the testbench from it. Both already have a button and an endpoint,
+    // so the verbs route to them rather than to a second implementation.
+    const step = /^\s*(subtrace|repro)\s*\((.*)\)\s*$/i.exec(text);
+    if (step) {
+      set({ queryText: text, note: "" });
+      await get().runQueryText(`why(${step[2]})`);
+      if (!get().causal) return; // the why failed and already said why
+      get().rememberQuery(text);
+      if (step[1].toLowerCase() === "subtrace") await get().loadSubtrace();
+      else await get().buildRepro({ validate: false });
+      return;
+    }
+
     set({ ...askingAgain(), causalBusy: true, activeTab: 2, queryText: text, note: "" });
     try {
       const res = await runQuery(s.session, text);

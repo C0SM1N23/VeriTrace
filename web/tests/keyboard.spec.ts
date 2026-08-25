@@ -171,3 +171,21 @@ test("n and p walk the findings in Checks, not only in Diff", async ({ page }) =
   await page.keyboard.press("p");
   expect(await page.locator(".check-row.walked").getAttribute("data-finding-index")).toBe(first);
 });
+
+test("subtrace() and repro() are verbs, not only buttons", async ({ page }) => {
+  // §9.2 lists them beside why(). Both were reachable by clicking in Causal and
+  // by neither name in the bar, so the language and the buttons disagreed about
+  // what the tool can do.
+  await open(page);
+  const bar = page.locator('[data-testid="query-bar"]');
+
+  await bar.fill("subtrace(tb_fifo_buggy.dut.full @ 455000)");
+  await bar.press("Enter");
+  await expect(page.locator('[data-testid="subtrace-section"] .subtrace li').first()).toBeVisible({
+    timeout: 20_000,
+  });
+
+  await bar.fill("repro(tb_fifo_buggy.dut.full @ 455000)");
+  await bar.press("Enter");
+  await expect(page.locator('[data-testid="repro-code"]')).toBeVisible({ timeout: 30_000 });
+});
