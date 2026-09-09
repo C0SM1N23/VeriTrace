@@ -26,7 +26,7 @@ from veritrace.analysis.whytrace import (
     WhyTracer,
 )
 from veritrace.clocks import Clock
-from veritrace.graph.model import SignalId, SourceLoc
+from veritrace.graph.model import SourceLoc
 
 CHECK = "x_source"
 

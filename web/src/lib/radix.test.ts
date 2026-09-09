@@ -20,11 +20,14 @@ describe("expand", () => {
 });
 
 describe("format", () => {
-  it("renders the four radices", () => {
+  it("renders every radix, including symbolic state names", () => {
     expect(format("10100000", 8, "bin")).toBe("10100000");
     expect(format("10100000", 8, "hex")).toBe("a0");
     expect(format("10100000", 8, "dec")).toBe("160");
     expect(format("1000001", 8, "ascii")).toBe("A");
+    expect(format("10", 2, "enum", { "0": "IDLE", "2": "DONE" })).toBe("DONE");
+    // A literal not named by the RTL remains a visible, truthful number.
+    expect(format("11", 2, "enum", { "2": "DONE" })).toBe("3");
   });
 
   it("pads hex to the signal width", () => {

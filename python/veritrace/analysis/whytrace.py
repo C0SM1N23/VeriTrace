@@ -22,7 +22,7 @@ from __future__ import annotations
 import time as _time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 from veritrace.graph.conditions import BV, evaluate
 from veritrace.graph.model import (
@@ -58,6 +58,9 @@ class NodeKind(Enum):
     #: §8.16 — the chain crossed from a signal into the transaction that signal
     #: belongs to. The one node in the tree that is not about a signal.
     TXN_LINK = "txn_link"
+    #: §11.4's why-not interaction: this value is wanted, but the conditions
+    #: that would produce it are not currently true.
+    COUNTERFACTUAL = "counterfactual"
 
 
 class Reason(Enum):
@@ -76,6 +79,7 @@ class Reason(Enum):
     CAPTURE_BOUNDARY = "capture_boundary"
     ASSIGNED = "assigned"
     HOLD = "hold"
+    COUNTERFACTUAL = "counterfactual"
 
     # §8.5 — where an X actually came from. `UNKNOWN_X` stays as the answer of
     # last resort: it says "this is X", these say why, which is the difference
@@ -140,6 +144,10 @@ class CausalNode:
     #: the trace (§7.3). P2 applies here too: inference presented as measurement
     #: is the one thing a causal chain must never do.
     derived: bool = False
+    #: Width at this point in the elaborated graph.  The browser cannot infer
+    #: it from ``value`` (an unknown 32-bit bus is rendered simply as ``x``),
+    #: and reconstructed waveform rows need the real width to format values.
+    width: int = 1
 
     def walk(self, seen: set[int] | None = None) -> Iterable["CausalNode"]:
         """Every distinct node, once.
@@ -181,6 +189,7 @@ class CausalNode:
                 "detail": self.detail,
                 "txn": self.txn,
                 "derived": self.derived,
+                "width": self.width,
                 "repeated": True,
                 "children": [],
             }
@@ -200,6 +209,7 @@ class CausalNode:
             "detail": self.detail,
             "txn": self.txn,
             "derived": self.derived,
+            "width": self.width,
             "repeated": False,
             "children": [c.to_dict(seen) for c in self.children],
         }
@@ -295,6 +305,7 @@ class TraceView:
         self.graph = graph
         self.store = store
         self._cache: dict[tuple[str, int, bool], BV | None] = {}
+        self._last_change_cache: dict[tuple[str, int], int | None] = {}
 
     def signal(self, sid: SignalId) -> Signal | None:
         return self.graph.get(sid.path())
@@ -328,8 +339,10 @@ class TraceView:
             fn = self.store.value_before if before else self.store.value_at
             val = fn(sig.trace_handle, t)
             return bv_from_bits(val.bits, sig.width) if val is not None else None
-        # Not dumped, but derivable from the graph (§7.3).
-        if sig.drivers:
+        # Not dumped, but combinationally derivable from the graph (§7.3).
+        # Sequential state and memories cannot be recovered from their current
+        # inputs; doing so invents history that the trace never recorded.
+        if sig.is_reconstructible:
             return self._reconstruct(sig, t, before)
         return None
 
@@ -342,10 +355,50 @@ class TraceView:
         return None
 
     def last_change(self, sid: SignalId, t: int) -> int | None:
+        key = (sid.path(), t)
+        if key in self._last_change_cache:
+            return self._last_change_cache[key]
         sig = self.signal(sid)
         if sig is None or sig.trace_handle is None:
-            return None
-        return self.store.last_change_before(sig.trace_handle, t)
+            result = None
+        else:
+            result = self.store.last_change_before(sig.trace_handle, t)
+        self._last_change_cache[key] = result
+        return result
+
+    def last_changes(self, signals: list[SignalId], t: int) -> dict[str, int | None]:
+        """Last transitions for a cone, crossing Python/Rust only once when wide.
+
+        A normal causal step has two or three inputs and stays on the targeted
+        query.  Generated logic, arbiters and decode trees can have hundreds;
+        making one PyO3/Parquet call per input dominated the entire 200-node
+        budget.  At that width the store's parallel all-signal scan is cheaper
+        and also fills this view's ordinary cache, so later recursion is free.
+        """
+        unique = {signal.path(): signal for signal in signals}
+        missing = [
+            signal
+            for path, signal in unique.items()
+            if (path, t) not in self._last_change_cache
+        ]
+        if len(missing) >= 64:
+            bulk = self.store.last_change_all(t)
+            for signal in missing:
+                sig = self.signal(signal)
+                handle = sig.trace_handle if sig is not None else None
+                value = (
+                    bulk[handle]
+                    if handle is not None and 0 <= handle < len(bulk)
+                    else None
+                )
+                self._last_change_cache[(signal.path(), t)] = value
+        else:
+            for signal in missing:
+                self.last_change(signal, t)
+        return {
+            path: self._last_change_cache.get((path, t))
+            for path in unique
+        }
 
     def first_x(self, sid: SignalId) -> int | None:
         sig = self.signal(sid)
@@ -396,7 +449,7 @@ def relevant_refs(expr: Expr, read: Callable[[SignalId], BV | None]) -> list[Sig
     return [s for s in out if not (s.path() in seen or seen.add(s.path()))]
 
 
-def _relevant(e: Expr, read, out: list[SignalId]) -> None:
+def _relevant(e: Expr, read, out: list[SignalId], known: BV | None = None) -> None:
     match e:
         case Ref(signal=s):
             out.append(s)
@@ -409,14 +462,26 @@ def _relevant(e: Expr, read, out: list[SignalId]) -> None:
             else:
                 _relevant(t if cv.v else o, read, out)
         case Binary(op=op, lhs=l, rhs=r) if op in ("&", "&&", "|", "||"):
-            res = evaluate(e, read).truthy()
-            lv, rv = evaluate(l, read).truthy(), evaluate(r, read).truthy()
+            res = (known if known is not None else evaluate(e, read)).truthy()
             controlling = 0 if op in ("&", "&&") else 1
             if not res.x and res.v == controlling:
                 # Only the operands forcing the result are to blame.
-                for sub, val in ((l, lv), (r, rv)):
+                l_raw, r_raw = evaluate(l, read), evaluate(r, read)
+                for sub, raw in ((l, l_raw), (r, r_raw)):
+                    val = raw.truthy()
                     if val.x or val.v == controlling:
-                        _relevant(sub, read, out)
+                        _relevant(sub, read, out, raw)
+                return
+            if not res.x:
+                # A known non-controlling result proves the truth value of
+                # both operands: 0 from OR means both are zero; 1 from AND
+                # means both are non-zero. Propagating that fact avoids
+                # re-evaluating every left-associated prefix of a wide guard.
+                # The old walk was O(n^2), making the specified 200-node
+                # causal query miss its latency budget despite doing no extra
+                # useful work.
+                _relevant(l, read, out, res)
+                _relevant(r, read, out, res)
                 return
             _relevant(l, read, out)
             _relevant(r, read, out)
@@ -712,6 +777,7 @@ class WhyTracer:
         max_depth: int = MAX_DEPTH,
         txn_index: Any = None,
         capture_start: int | None = None,
+        on_node: Callable[[CausalNode], None] | None = None,
     ) -> None:
         self.graph = graph
         self.store = store
@@ -725,6 +791,11 @@ class WhyTracer:
         #: walk stays purely at signal level — which is the correct answer, not
         #: a degraded one.
         self.txn_index = txn_index
+        # Optional progress observer used by the WebSocket API (§10.2).  It is
+        # called only after a node and all of its children are complete, so a
+        # client never receives a half-populated object.  The analysis itself
+        # does not depend on the observer; REST/CLI callers leave it unset.
+        self.on_node = on_node
         self._memo: dict[tuple[str, int], CausalNode] = {}
         self._stack: set[str] = set()
         self._linked: set[str] = set()
@@ -740,6 +811,94 @@ class WhyTracer:
         self._count = 0
         started = _time.perf_counter()
         root = self._why(sid, t, 0)
+        return WhyResult(
+            root=root,
+            nodes=self._count,
+            elapsed_ms=(_time.perf_counter() - started) * 1000.0,
+            truncated=self._count >= MAX_NODES,
+        )
+
+    def why_not(self, signal: str | SignalId, t: int, desired: BV) -> WhyResult:
+        """Explain which real conditions prevented ``signal`` becoming desired.
+
+        This is §11.4's counterfactual operation, not an expectation note on a
+        normal ``why``.  Drivers whose value evaluates to the requested value
+        are candidates; their false/unknown guard terms are the causes.  If no
+        driver can produce the value under the observed inputs, the active
+        value expression is traced instead and the result says so explicitly.
+        No input is changed and no alternate simulation is invented (P1).
+        """
+        sid = SignalId.parse(signal) if isinstance(signal, str) else signal
+        self._memo.clear()
+        self._stack.clear()
+        self._linked.clear()
+        self._count = 0
+        started = _time.perf_counter()
+
+        sig = self.view.signal(sid)
+        if sig is None:
+            root = self._node(sid, t, NodeKind.TERMINAL, Reason.NOT_TRACED)
+            root.detail = f"cannot ask for {desired}: the signal is not in the RTL graph"
+        else:
+            actual = self.view.value(sid, t)
+            if actual == desired:
+                # The counterfactual is already factual. Return the ordinary
+                # causal answer, but keep a precise note at its root.
+                ordinary = self._why(sid, t, 0)
+                ordinary.detail = (
+                    f"the requested value {desired} is already observed; " + ordinary.detail
+                ).rstrip()
+                root = ordinary
+            else:
+                t_eff, child_before = effective_time(self.view, sig, t)
+                read = lambda s: self.view.value(s, t_eff, child_before)  # noqa: E731
+                candidates: list[tuple[Driver, BV]] = []
+                active: list[Driver] = []
+                for driver in sig.drivers:
+                    guard = evaluate(driver.guard, read).truthy()
+                    if guard.known and guard.v:
+                        active.append(driver)
+                    value = evaluate(driver.value, read)
+                    if value == desired and (guard.x or not guard.v):
+                        candidates.append((driver, guard))
+
+                root = self._node(
+                    sid,
+                    t,
+                    NodeKind.COUNTERFACTUAL,
+                    Reason.COUNTERFACTUAL,
+                    loc=(candidates[0][0].loc if candidates else sig.decl_loc),
+                )
+                root.detail = f"wanted {desired}; observed {actual if actual is not None else '?'}"
+
+                causes: list[SignalId] = []
+                if candidates:
+                    root.detail += "; these guard conditions prevented the assignment"
+                    for driver, guard in candidates:
+                        causes.extend(
+                            relevant_refs(driver.guard, read)
+                            if guard.x
+                            else falsifying_terms(driver.guard, read)
+                        )
+                elif active:
+                    root.detail += "; no active driver evaluated to the requested value"
+                    for driver in active:
+                        causes.extend(relevant_refs(driver.value, read))
+                else:
+                    root.detail += "; no driver can currently produce the requested value"
+                    for driver in sig.drivers:
+                        causes.extend(relevant_refs(driver.guard, read))
+
+                seen: set[str] = set()
+                causes = [
+                    cause
+                    for cause in causes
+                    if not (cause.path() in seen or seen.add(cause.path()))
+                ]
+                root.children = self._children(causes, t_eff, 0, child_before)
+                if self.on_node is not None:
+                    self.on_node(root)
+
         return WhyResult(
             root=root,
             nodes=self._count,
@@ -767,6 +926,7 @@ class WhyTracer:
             # §7.3: this value was evaluated from the graph, not observed. The
             # user has to be able to tell the two apart.
             derived=sig is not None and sig.is_reconstructible,
+            width=sig.width if sig is not None else 1,
             **kw,
         )
 
@@ -790,6 +950,8 @@ class WhyTracer:
 
         if node.reason is not Reason.CYCLE:
             self._memo[key] = node
+        if self.on_node is not None:
+            self.on_node(node)
         return node
 
     # -- §8.16 -----------------------------------------------------------
@@ -845,6 +1007,28 @@ class WhyTracer:
         if sig is None:
             return self._node(sid, t, NodeKind.TERMINAL, Reason.NOT_TRACED, before=before)
 
+        if sig.trace_handle is None and sig.drivers and not sig.is_reconstructible:
+            node = self._node(
+                sid,
+                t,
+                NodeKind.TERMINAL,
+                Reason.NOT_TRACED,
+                before=before,
+                loc=sig.decl_loc,
+            )
+            if sig.kind is Kind.MEM:
+                node.detail = (
+                    f"{sig.id.name} is not available as a complete value in the trace. "
+                    "Dump the required elements explicitly; Verilator needs "
+                    "--trace-max-array N and Icarus needs $dumpvars on each element."
+                )
+            else:
+                node.detail = (
+                    "this is sequential state that was not dumped; its history cannot "
+                    "be reconstructed from the inputs at the current time"
+                )
+            return node
+
         path = sid.path()
         for prefix, module in self.graph.blackboxes.items():
             # Inside the black box, or a wire coming out of it. The second case
@@ -895,7 +1079,7 @@ class WhyTracer:
                     f"window. Trigger on a change of {sid.name} next time, or probe its "
                     "drivers: " + ", ".join(sorted({r.name for d in sig.drivers for r in refs(d.guard)})[:4])
                     if sig.drivers
-                    else f"already settled at the first sample (c0); the cause is before the window"
+                    else "already settled at the first sample (c0); the cause is before the window"
                 )
                 return node
 
@@ -1071,10 +1255,11 @@ class WhyTracer:
 
         The ordering is the heuristic; the set is complete either way.
         """
+        changes = self.view.last_changes(causes, t_eff)
         ranked = sorted(
             causes,
             key=lambda s: (
-                self.view.last_change(s, t_eff) if self.view.last_change(s, t_eff) is not None else -1,
+                changes[s.path()] if changes[s.path()] is not None else -1,
                 s.path(),
             ),
         )

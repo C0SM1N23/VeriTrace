@@ -14,10 +14,11 @@ from fastapi.testclient import TestClient
 
 from veritrace import TraceStore, convert
 from veritrace.analysis import vtq
-from veritrace.analysis.whytrace import NodeKind, Reason, WhyTracer
+from veritrace.analysis.whytrace import BV, NodeKind, Reason, WhyTracer, relevant_refs
 from veritrace.api import create_app
 from veritrace.correlate.resolver import correlate
 from veritrace.graph.elaborate import discover, elaborate
+from veritrace.graph.model import Binary, Ref, SignalId
 
 DESIGNS = Path(__file__).resolve().parents[1] / "designs"
 BUGGY = DESIGNS / "fifo_buggy"
@@ -172,6 +173,45 @@ def test_ordering_puts_the_oldest_transition_first(buggy):
     assert times == sorted(times), times
 
 
+def test_wide_boolean_relevance_is_linear():
+    """A wide elaborated guard must not re-evaluate every expression prefix.
+
+    Slang represents ``s0 | ... | s199`` as a left-associated tree.  The
+    previous relevance walk evaluated each prefix again and made the §4.2
+    200-node query quadratic.  The read count is deterministic and proves the
+    algorithmic property without a flaky wall-clock assertion.
+    """
+    signals = [SignalId(("top",), f"s{i}") for i in range(200)]
+    expr = Ref(signals[0])
+    for signal in signals[1:]:
+        expr = Binary("|", expr, Ref(signal))
+
+    reads = 0
+
+    def read(_signal):
+        nonlocal reads
+        reads += 1
+        return BV.of(0)
+
+    assert relevant_refs(expr, read) == signals
+    assert reads == len(signals)
+
+
+def test_why_not_traces_the_observed_terms_that_prevented_a_value(buggy):
+    """§11.4 counterfactual analysis is not a renamed ordinary why()."""
+    graph, store, _ = buggy
+    _t0, t_end = store.time_range
+    result = WhyTracer(graph, store).why_not(
+        "tb_fifo_buggy.dut.full", t_end, BV.of(0)
+    )
+
+    assert result.root.kind is NodeKind.COUNTERFACTUAL
+    assert result.root.reason is Reason.COUNTERFACTUAL
+    assert result.root.value == "1" and "wanted 0; observed 1" in result.root.detail
+    assert result.root.children, "the counterfactual named no observed cause"
+    assert all(child.signal.path() != result.root.signal.path() for child in result.root.children)
+
+
 def test_sequential_signals_are_explained_at_the_clock_edge(buggy):
     """§5.5 problem 2 inside why-trace, not just in the store.
 
@@ -251,6 +291,18 @@ def test_query_endpoint_returns_the_causal_tree(client):
     assert body["stats"]["ms"] < WHY_BUDGET_MS
     # The injected cause is somewhere in the returned tree.
     assert "rd_rst_n" in r.text
+
+
+def test_query_endpoint_runs_counterfactual_analysis(client):
+    r = client.post(
+        f"/session/{sid(client)}/query",
+        json={"vtq": "why_not(tb_fifo_buggy.dut.full == 0 @ 455000)"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["kind"] == "why_not" and body["expected"] == "0"
+    assert body["root"]["kind"] == "counterfactual"
+    assert body["root"]["children"]
 
 
 def test_query_rejects_unknown_signal_and_bad_syntax(client):
@@ -449,18 +501,31 @@ def test_a_memory_that_was_not_dumped_says_so(tmp_path_factory):
 # --- §7.3 --------------------------------------------------------------------
 
 
-def test_a_reconstructed_value_is_marked_as_derived(tmp_path_factory):
+def test_a_reconstructed_value_is_marked_as_derived(tmp_path):
     """P2: inference must never be presented as observation."""
-    lanes = DESIGNS / "lanes"
-    graph, store, _ = build(
-        tmp_path_factory.mktemp("lanes3"), discover(lanes), lanes / "dump.vcd", "lanes"
+    rtl = tmp_path / "top.sv"
+    rtl.write_text(
+        "module top(input logic a, b, output logic y);\n"
+        "  logic tmp;\n"
+        "  assign tmp = a & b;\n"
+        "  assign y = tmp;\n"
+        "endmodule\n",
+        encoding="utf-8",
     )
-    derivable = [
-        s.path for s in graph if s.trace_handle is None and s.drivers
-    ]
-    assert derivable, "fixture no longer has a signal that is not in the dump"
-    result = WhyTracer(graph, store).why(derivable[0], 200000)
+    vcd = tmp_path / "dump.vcd"
+    vcd.write_text(
+        "$timescale 1ns $end\n$scope module top $end\n"
+        "$var wire 1 ! a $end\n$var wire 1 \" b $end\n"
+        "$var wire 1 # y $end\n$upscope $end\n$enddefinitions $end\n"
+        "#0\n0!\n0\"\n0#\n#10\n1!\n#20\n1\"\n1#\n",
+        encoding="utf-8",
+    )
+    graph, store, _ = build(tmp_path, [rtl], vcd, "derived")
+    sig = graph.get("top.tmp")
+    assert sig is not None and sig.is_reconstructible
+    result = WhyTracer(graph, store).why(sig.path, 20)
     assert result.root.derived is True
+    assert result.root.value == "1"
     assert result.root.to_dict()["derived"] is True
 
 

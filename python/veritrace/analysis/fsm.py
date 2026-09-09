@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterator
 
 from veritrace.graph.model import (
     Binary,
@@ -51,7 +51,6 @@ from veritrace.graph.model import (
     SourceLoc,
     Ternary,
     Unary,
-    refs,
     to_text,
 )
 
@@ -141,6 +140,10 @@ class Machine:
     #: would show the states in declaration order, which is a picture of a run
     #: that did not happen. Capped, and `sequence_truncated` says when.
     sequence: list[tuple[int, int]] = field(default_factory=list)
+    #: Exact half-open [start, end, state] stays, including the final stay.
+    #: Never reconstruct timestamps from a median clock period (gated clocks).
+    intervals: list[tuple[int, int, int]] = field(default_factory=list)
+    clock_path: str | None = None
     sequence_truncated: bool = False
     #: How the candidate was chosen, so a wrong one can be traced to a decision.
     why_candidate: str = ""
@@ -195,6 +198,8 @@ class Machine:
             "cycles_in": {str(k): v for k, v in self.cycles_in.items()},
             "taken": {f"{k[0]}->{k[1]}": v for k, v in self.taken.items()},
             "sequence": [list(p) for p in self.sequence],
+            "intervals": [list(p) for p in self.intervals],
+            "clock_path": self.clock_path,
             "sequence_truncated": self.sequence_truncated,
             "why_candidate": self.why_candidate,
         }
@@ -633,7 +638,7 @@ def extract_one(sig: Signal, graph: Any, elaboration: Any = None) -> Machine:
                         guard=to_text(label) if label is not None else "always",
                         loc=driver.loc,
                         is_reset=is_reset,
-                        full_guard=driver.guard,
+                        full_guard=_and(driver.guard, extra),
                     )
                 )
 
@@ -777,9 +782,25 @@ def overlay(machine: Machine, store: Any, graph: Any, clock: Any = None) -> Mach
     separate pass: everything the checks need is already there without it, and a
     design with no dump still gets every finding.
     """
+    from itertools import groupby
+    from veritrace import clocks
+
+    machine.visits.clear()
+    machine.cycles_in.clear()
+    machine.taken.clear()
+    machine.sequence.clear()
+    machine.intervals.clear()
+    machine.sequence_truncated = False
+    machine.clock_path = None
     sig = graph.get(machine.signal)
     if sig is None or sig.trace_handle is None:
         return machine
+    paths = {d.clock.path() for d in sig.drivers if d.clock}
+    if len(paths) == 1:
+        clock = clocks.clock_at(store, next(iter(paths)))
+    elif paths:
+        clock = None  # More than one actual clock has no single cycle axis.
+    machine.clock_path = clock.path if clock is not None else None
     lo, hi = store.time_range
     events = store.transitions(sig.trace_handle, lo, hi + 1)
     if not events:
@@ -787,8 +808,23 @@ def overlay(machine: Machine, store: Any, graph: Any, clock: Any = None) -> Mach
 
     previous: int | None = None
     previous_t: int | None = None
-    for t, value in events:
+    def stay(start: int, end: int, value: int) -> None:
+        spent = clock.cycles_between(start, end) if clock is not None else end - start
+        machine.cycles_in[value] = machine.cycles_in.get(value, 0) + spent
+        if end > start:
+            if len(machine.intervals) < MAX_SEQUENCE:
+                machine.intervals.append((start, end, value))
+            else:
+                machine.sequence_truncated = True
+
+    # Only the final delta-cycle value describes the settled state at time t.
+    for t, same_time in groupby(events, key=lambda event: event[0]):
+        value = list(same_time)[-1][1]
         current = value.to_int()
+        if current == previous:
+            continue
+        if previous is not None and previous_t is not None:
+            stay(previous_t, t, previous)
         if current is None:
             previous, previous_t = None, None
             continue
@@ -801,16 +837,9 @@ def overlay(machine: Machine, store: Any, graph: Any, clock: Any = None) -> Mach
             machine.sequence_truncated = True
         if previous is not None and previous_t is not None:
             machine.taken[(previous, current)] = machine.taken.get((previous, current), 0) + 1
-            spent = (
-                clock.cycles_between(previous_t, t)
-                if clock is not None
-                else t - previous_t
-            )
-            machine.cycles_in[previous] = machine.cycles_in.get(previous, 0) + spent
         previous, previous_t = current, t
     if previous is not None and previous_t is not None:
-        spent = clock.cycles_between(previous_t, hi) if clock is not None else hi - previous_t
-        machine.cycles_in[previous] = machine.cycles_in.get(previous, 0) + spent
+        stay(previous_t, hi, previous)
     return machine
 
 

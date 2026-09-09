@@ -18,6 +18,7 @@ from veritrace.diff.report import (
     compare,
     compare_transactions,
     explain,
+    select_focus,
 )
 
 __all__ = [
@@ -34,4 +35,5 @@ __all__ = [
     "compare",
     "compare_transactions",
     "explain",
+    "select_focus",
 ]

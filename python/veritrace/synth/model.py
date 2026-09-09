@@ -32,7 +32,9 @@ class SynthDiff:
 
     @property
     def matched(self) -> bool:
-        return self.report is not None and not self.report.divergences
+        return bool(self.ports) and not self.skipped and self.report is not None and (
+            self.report.compared == len(self.ports) and not self.report.divergences
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {

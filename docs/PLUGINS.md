@@ -1,4 +1,4 @@
-# Writing an analysis plugin
+# Writing analysis and exporter plugins
 
 §13.7's promise: **an analysis you add touches neither the core nor the UI.**
 Findings you yield appear in the Checks tab like any built-in check; tables you
@@ -212,3 +212,50 @@ class Name(Analysis):
 That is the entire API. If something you want is not reachable through it, that
 is worth reporting — the surface is deliberately small, but it is meant to be
 sufficient.
+
+---
+
+## Custom report exporters
+
+§13.7's third extension point uses the same file discovery and the same
+`@register` decorator. An exporter receives the same context and returns a
+complete text or binary artifact:
+
+```python
+import json
+
+from veritrace.plugin import Exporter, register
+
+
+@register
+class SignalJson(Exporter):
+    name        = "signal-json"
+    needs       = ["trace"]
+    description = "Signal inventory for another triage tool"
+    extension   = ".json"
+
+    def render(self, ctx):
+        return json.dumps({
+            "trace_sha256": ctx.metadata["trace_sha256"],
+            "query": ctx.query,
+            "signals": [s.path for s in ctx.signals()],
+        }, indent=2)
+```
+
+Run it through the normal application path:
+
+```bash
+veritrace plugins
+veritrace export dump.fst --format signal-json -o signals.json
+veritrace export dump.fst --rtl rtl/ --format signal-json \
+  --why "why(top.ctrl.ready @ c1247)" -o cause.json
+```
+
+`needs` has exactly the same values and semantics as for an analysis. For an
+optional `--why`, `ctx.query` contains the normalized question and `ctx.causal`
+contains the real why-trace result; otherwise both are `None`. `ctx.metadata`
+contains `trace_path`, `trace_sha256`, and `top`.
+
+`render(ctx)` must return `str` or `bytes`. VeriTrace renders first and then
+atomically replaces `-o`; if the exporter raises or returns the wrong type, the
+command fails and an existing report is left untouched.

@@ -53,7 +53,19 @@ jobs:
       # and why the FST job below stays on Linux.
       - name: Install FST build dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libclang-dev
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libclang-dev iverilog
+
+      - name: Install FST build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm zlib icarus-verilog
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+          echo "CPATH=$(brew --prefix zlib)/include" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$(brew --prefix zlib)/lib" >> "$GITHUB_ENV"
+
+      - name: Install Icarus (Windows)
+        if: runner.os == 'Windows'
+        run: choco install iverilog -y --no-progress
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -63,6 +75,12 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+      - name: Formatting and warning-free Rust build
+        if: runner.os == 'Linux' && matrix.python == '3.12'
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+
       - name: cargo test (fst feature)
         if: runner.os == 'Linux'
         run: cargo test -p vt-trace --features fst
@@ -70,8 +88,22 @@ jobs:
       - name: Install project
         run: uv sync --python ${{ matrix.python }}
 
+      - name: The installed native extension advertises only real FST support
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            uv run python -c "from veritrace import has_fst_support; assert not has_fst_support()"
+          else
+            uv run python -c "from veritrace import has_fst_support; assert has_fst_support()"
+            uv run veritrace convert designs/fifo_async/dump.fst -o fst-smoke.vtx
+            uv run veritrace signals fst-smoke.vtx wr_ptr | grep -q wr_ptr
+          fi
+
       - name: pytest
-        run: uv run pytest
+        run: uv run pytest -W error
+
+      - name: Python undefined names and ignored values
+        run: uvx ruff check python tests --select F
 
   # §4.2's stress tier. Heavy (1 GB of scratch, about a minute), so it does not
   # gate every push — but nothing would catch a regression there without it.
@@ -85,6 +117,8 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
+      - name: Install FST build dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libclang-dev
       - name: Tier B — 1 GB over 50k signals
         run: cargo run --release -p vt-trace --example bench -- 1000 50000
       - run: uv sync
@@ -103,6 +137,8 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
+      - name: Install FST build dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libclang-dev
       - run: uv sync
 
       - name: The golden suite — every reference design reaches its own root cause
@@ -325,6 +361,18 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      - name: Install FST build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libclang-dev
+
+      - name: Install FST build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm zlib
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+          echo "CPATH=$(brew --prefix zlib)/include" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$(brew --prefix zlib)/lib" >> "$GITHUB_ENV"
+
       # The wheel is supposed to carry the interface, so the UI has to be built
       # into it here too — a wheel that installs and then serves a 404 is not a
       # wheel that works.
@@ -353,6 +401,16 @@ jobs:
           "$VT/veritrace" signals out.vtx rd_ptr | tee sig.txt
           grep -q "tb_fifo_buggy.dut.rd_ptr" sig.txt
 
+      - name: The wheel's FST capability is real and platform-honest
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            "$VT/python" -c "from veritrace import has_fst_support; assert not has_fst_support()"
+          else
+            "$VT/python" -c "from veritrace import has_fst_support; assert has_fst_support()"
+            "$VT/veritrace" convert designs/fifo_async/dump.fst -o fst.vtx
+            "$VT/veritrace" signals fst.vtx wr_ptr | grep -q wr_ptr
+          fi
+
       - name: The packaged wheel carries its protocol packs
         run: |
           "$VT/veritrace" packs --json | tee packs.json
@@ -376,6 +434,9 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      - name: Install FST build dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libclang-dev
+
       - name: Build the UI into the package
         run: npm ci && npm run build
         working-directory: web
@@ -389,6 +450,12 @@ jobs:
         run: |
           python -m venv /tmp/fresh
           /tmp/fresh/bin/pip install dist/*.whl
+
+      - name: The packaged Linux reader consumes a real FST
+        run: |
+          /tmp/fresh/bin/python -c "from veritrace import has_fst_support; assert has_fst_support()"
+          /tmp/fresh/bin/veritrace convert designs/fifo_async/dump.fst -o /tmp/fst.vtx
+          /tmp/fresh/bin/veritrace signals /tmp/fst.vtx wr_ptr | grep -q wr_ptr
 
       - name: A colleague's first sixty seconds (§13.4)
         run: |
@@ -459,6 +526,9 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: web/package-lock.json
+
+      - name: Install FST build dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libclang-dev
 
       - run: uv sync
 
@@ -531,10 +601,10 @@ jobs:
           pkill -f 'veritrace serve' 2>/dev/null || true
           exit 0
 
-  # The performance thresholds of §4.2 are a build gate, but a 50 MB benchmark
-  # is too slow for every push, so it runs on a schedule and on demand.
+  # §4.2 explicitly makes the typical tier a gate on every commit.  Tier B is
+  # the scheduled job above; this is the full named Tier-A shape, not a smaller
+  # smoke test that can pass while the real workload regresses.
   bench:
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -543,8 +613,10 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
+      - name: Install FST build dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libclang-dev
       - name: Benchmark against the tier-A budget
-        run: cargo run --release -p vt-trace --example bench -- 50
+        run: cargo run --release -p vt-trace --example bench -- 100 5000
 
       # The other half of §4.2's tier A. `bench.rs` covers what is pure Rust;
       # the stuck detector, transaction extraction and `why()` are Python and

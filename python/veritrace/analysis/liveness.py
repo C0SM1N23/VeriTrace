@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any, Iterator
 
-from veritrace.analysis.findings import Finding, Group, Severity
+from veritrace.analysis.findings import Finding, Group, Severity, location_of
 
 CHECK_DEADLOCK = "deadlock"
 CHECK_LIVELOCK = "livelock"
@@ -36,7 +36,12 @@ def _cycles(clock: Any, t: int | None) -> str:
     return "?" if t is None else (f"c{clock.cycle_of(t)}" if clock is not None else str(t))
 
 
-def scan(liveness: Any, clock: Any = None, config: Any = None) -> Iterator[Finding]:
+def scan(
+    liveness: Any,
+    clock: Any = None,
+    config: Any = None,
+    graph: Any = None,
+) -> Iterator[Finding]:
     """Turn a §8.18 scan into findings."""
     if liveness is None:
         return
@@ -56,6 +61,7 @@ def scan(liveness: Any, clock: Any = None, config: Any = None) -> Iterator[Findi
             check=CHECK_DEADLOCK,
             title=f"deadlock: {len(d.agents)} agents in a wait-for cycle ({chain})",
             signal=d.edges[0].resource if d.edges else None,
+            loc=location_of(graph, d.edges[0].resource if d.edges else None),
             time=d.at,
             detail=(
                 f"persisted {d.cycles} cycles from {_cycles(clock, d.at)}; "
@@ -78,6 +84,7 @@ def scan(liveness: Any, clock: Any = None, config: Any = None) -> Iterator[Findi
                 f"{len(lv.states)} states with nothing completing"
             ),
             signal=lv.signal,
+            loc=location_of(graph, lv.signal),
             time=lv.since,
             detail=(
                 f"{_cycles(clock, lv.since)}-{_cycles(clock, lv.until)}, "

@@ -134,10 +134,22 @@ def test_checks_say_what_the_design_says_they_should(name, sessions):
     analysis = engine.extract(store, None, clock, None, use_cache=False)
     report = run_all(store, el.graph, el, clock, None, analysis, None, None, None)
     signals = {f.signal for f in report.findings}
+    checks = {f.check for f in report.findings}
     groups = {f.group.value if hasattr(f.group, "value") else str(f.group) for f in report.findings}
 
     for sig in want.get("required_signals") or []:
         assert sig in signals, f"{name}: nothing was reported about {sig}"
+    for check in want.get("required_checks") or []:
+        assert check in checks, f"{name}: required check {check!r} did not fire; got {sorted(checks)}"
+    if want.get("required_locations"):
+        required = set(want.get("required_signals") or [])
+        relevant = [f for f in report.findings if f.signal in required]
+        assert relevant, f"{name}: no required finding was available for source localization"
+        for finding in relevant:
+            assert finding.loc is not None, (
+                f"{name}: {finding.check} on {finding.signal} has no RTL location"
+            )
+            assert finding.loc.file and finding.loc.line > 0
     for group in want.get("forbidden_groups") or []:
         assert group not in groups, f"{name}: reported {group} on a design with no such bug"
 

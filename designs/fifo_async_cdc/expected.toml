@@ -1,0 +1,12 @@
+design = "fifo_async"
+top = "tb_fifo_async"
+bug = "Gray write pointer crosses into rd_clk through one unreset flop"
+correlation_min = 99
+
+[[why]]
+question = "why(tb_fifo_async.dut.empty @ 0)"
+reaches = "tb_fifo_async.dut.wr_gray_seen"
+
+[checks]
+required_signals = ["tb_fifo_async.dut.wr_gray_seen"]
+required_checks = ["cdc_no_sync"]

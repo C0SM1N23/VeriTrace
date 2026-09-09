@@ -1,7 +1,7 @@
 /**
  * TAB 10 — Memory (§11.4b), and Prompt 11's acceptance criteria in the UI.
  *
- * Runs against `designs/sdram`: a minimal SDR SDRAM controller with four
+ * Runs against `designs/sdram`: a minimal SDR SDRAM controller with three
  * timing violations injected, one from each category, plus the same RTL
  * compiled clean as the control.
  *
@@ -13,6 +13,11 @@
  */
 
 import { expect, test, type Page } from "@playwright/test";
+import { execFileSync } from "node:child_process";
+import { cpSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { resolve, join } from "node:path";
+import { waitForReady } from "./session";
 
 const BACKEND = process.env.VERITRACE_BACKEND ?? "http://127.0.0.1:8765";
 
@@ -23,7 +28,9 @@ test.beforeAll(async ({ request }) => {
   const open = async (trace: string) => {
     const r = await request.post(`${BACKEND}/session`, { data: { trace_path: trace } });
     expect(r.ok(), `could not open ${trace}: ${await r.text()}`).toBeTruthy();
-    return (await r.json()).session_id as string;
+    const sid = (await r.json()).session_id as string;
+    await waitForReady(request, BACKEND, sid);
+    return sid;
   };
   violating = await open("designs/sdram/dump.vtx");
   clean = await open("designs/sdram/dump_ok.vtx");
@@ -63,16 +70,17 @@ test("the Memory tab is reachable by key", async ({ page }) => {
   await expect(page.locator('[data-testid="tab-10"]')).toHaveAttribute("aria-selected", "true");
 });
 
-test("all four injected violations are on screen with their cycles", async ({ page }) => {
+test("real timing violations are shown without flagging the legal four-activate burst", async ({ page }) => {
   // Prompt 11's first acceptance criterion, through the interface.
   await open(page, violating);
   await expect(page.locator('[data-testid="mem-violation-count"]')).toContainText(
-    "4 timing violations",
+    "3 timing violations",
   );
-  for (const constraint of ["tRCD", "tRP", "tRFC", "tFAW"]) {
+  for (const constraint of ["tRCD", "tRP", "tRFC"]) {
     await expect(page.locator(`[data-testid="mem-violation-${constraint}"]`)).toBeVisible();
   }
-  await expect(page.locator('[data-testid="mem-violation-row"]')).toHaveCount(4);
+  await expect(page.locator('[data-testid="mem-violation-row"]')).toHaveCount(3);
+  await expect(page.getByTestId("mem-violation-tFAW")).toHaveCount(0);
 
   // Each row names both commands and the measured-versus-required gap, not
   // just that something is wrong.
@@ -209,12 +217,108 @@ test("the address map inspector decomposes an address", async ({ page }) => {
   // Nonsense is refused rather than decoded into zeroes.
   await page.locator('[data-testid="mem-addr-input"]').fill("not-an-address");
   await expect(page.locator('[data-testid="mem-addr-error"]')).toBeVisible();
+  // The production SDRAM pack maps col from [9:1], not [9:0]: the byte-offset
+  // bit is deliberately ignored. At 2**54, Number loses bit 1; BigInt must not.
+  await page.getByTestId("mem-addr-input").fill("0x40000000000002");
+  await expect(out.locator("tr").filter({ hasText: "col" }).locator("td.num").first()).toHaveText("0x1");
+  await page.getByTestId("mem-addr-input").fill("0x1oops");
+  await expect(page.getByTestId("mem-addr-error")).toBeVisible();
+  await page.getByLabel("Address sequence", { exact: true }).fill("0 4 0x1000 0");
+  await expect(page.getByTestId("mem-pattern-result")).toHaveText("1 hits · 1 misses · 2 conflicts");
+  await page.getByLabel("Address sequence", { exact: true }).fill("0 0x400 4 0x404");
+  await expect(page.getByTestId("mem-pattern-result")).toHaveText("2 hits · 2 misses · 0 conflicts");
 });
 
 test("a timing violation shows up in Checks like any other finding", async ({ request }) => {
   // §11.4, checked over the API so the assertion is about the pipeline.
   const checks = await (await request.get(`${BACKEND}/session/${violating}/checks`)).json();
   const memory = checks.findings.filter((f: { group: string }) => f.group === "memory");
-  expect(memory.length).toBe(4);
+  expect(memory.length).toBe(3);
   expect(memory[0].why).toBeTruthy();
+});
+
+test("real Icarus refresh intervals reach the compliance chart and Wave", async ({ page, request }) => {
+  // The user-facing CLI must create the dump: no handcrafted trace or mocked report.
+  const project = mkdtempSync(join(tmpdir(), "veritrace refresh "));
+  writeFileSync(join(project, "tb.sv"), `\`timescale 1ns/1ps
+module tb;
+  reg clk = 0;
+  always #5 clk = ~clk;
+  reg cs_n = 1, ras_n = 0, cas_n = 0, we_n = 1;
+  reg [1:0] ba = 0;
+  reg [12:0] a = 0;
+  initial begin
+    @(negedge clk); cs_n = 0;
+    @(negedge clk); cs_n = 1;
+    repeat (1600) @(negedge clk);
+    cs_n = 0;
+    @(negedge clk); cs_n = 1;
+    repeat (5) @(posedge clk);
+    $finish;
+  end
+endmodule
+`);
+  const run = JSON.parse(execFileSync("uv", ["run", "--no-sync", "veritrace", "run", project,
+    "--top", "tb", "--json"], { cwd: resolve(".."), encoding: "utf8", timeout: 60_000 }));
+  const response = await request.post(`${BACKEND}/session`, { data: { trace_path: run.dump } });
+  expect(response.ok(), await response.text()).toBeTruthy();
+  const sid = (await response.json()).session_id;
+  await waitForReady(request, BACKEND, sid);
+  await open(page, sid);
+  await expect(page.getByTestId("mem-refresh")).toContainText("15.625us");
+  await expect(page.getByTestId("mem-refresh-chart")).toBeVisible();
+  // A horizontal SVG line paints a stroke but has a zero-height DOM bbox.
+  await expect(page.getByTestId("mem-refresh-limit")).toHaveAttribute("stroke", "currentColor");
+  const interval = page.getByTestId("mem-refresh-interval");
+  await expect(interval).toHaveCount(1);
+  await expect(interval).toHaveAttribute("aria-label", "16.01us, exceeds tREFI");
+  await interval.click();
+  await expect(page.getByTestId("tab-1")).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator('[data-testid="signal-row"][data-path="tb.cs_n"]')).toBeVisible();
+  // Layout is the real persisted state, independent of display unit preferences.
+  await expect.poll(async () => (await (await request.get(
+    `${BACKEND}/session/${sid}/layout`,
+  )).json()).cursors[0]).toBe(16025000);
+});
+
+test("an unobserved refresh interval is not presented as measured compliance", async ({ page }) => {
+  await open(page, violating);
+  await expect(page.getByTestId("mem-refresh")).toContainText("compliance was not measured");
+  await expect(page.getByTestId("mem-refresh-chart")).toHaveCount(0);
+});
+
+test("chip selection and uploaded timings change real findings and survive reload", async ({ page, request }) => {
+  const project = mkdtempSync(join(tmpdir(), "veritrace timing "));
+  const dump = join(project, "dump.vtx");
+  cpSync(resolve("../designs/sdram/dump.vtx"), dump, { recursive: true });
+  const response = await request.post(`${BACKEND}/session`, { data: { trace_path: dump } });
+  expect(response.ok(), await response.text()).toBeTruthy();
+  const sid = (await response.json()).session_id;
+  await waitForReady(request, BACKEND, sid);
+  await open(page, sid);
+  await expect(page.getByTestId("mem-violation-count")).toContainText("3 timing violations");
+  await page.getByLabel("Timing chip", { exact: true }).selectOption("__custom__");
+  const template = await page.getByLabel("Custom timing TOML").inputValue();
+  const custom = template.replace('name = "MT48LC16M16A2"', 'name = "Uploaded test timing"')
+    .replace("tRCD = 20", "tRCD = 5");
+  expect(custom).not.toEqual(template);
+  await page.getByLabel("Custom timing TOML").fill("tRCD = nan");
+  await page.getByRole("button", { name: "Apply timing", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("missing timing parameter");
+  await expect(page.getByTestId("mem-violation-count")).toContainText("3 timing violations");
+  await page.getByLabel("Load timing file").setInputFiles({
+    name: "uploaded.toml", mimeType: "text/plain", buffer: Buffer.from(custom),
+  });
+  await expect(page.getByLabel("Custom timing TOML")).toHaveValue(custom);
+  await page.getByRole("button", { name: "Apply timing", exact: true }).click();
+  await expect(page.getByTestId("mem-violation-count")).toContainText("2 timing violations");
+  await expect(page.getByTestId("mem-violation-tRCD")).toHaveCount(0);
+  const checks = await (await request.get(`${BACKEND}/session/${sid}/checks`)).json();
+  expect(checks.findings.filter((f: { group: string }) => f.group === "memory")).toHaveLength(2);
+  await page.reload();
+  await expect(page.getByTestId("mem-violation-count")).toContainText("2 timing violations");
+  await expect(page.getByLabel("Custom timing TOML")).toHaveValue(custom);
+  await page.getByLabel("Timing chip", { exact: true }).selectOption("mt48lc16m16a2");
+  await expect(page.getByTestId("mem-violation-count")).toContainText("3 timing violations");
+  await expect(page.getByTestId("mem-violation-tRCD")).toBeVisible();
 });

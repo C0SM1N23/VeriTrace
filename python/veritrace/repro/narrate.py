@@ -32,6 +32,7 @@ TEMPLATES: dict[str, str] = {
     # The two structural answers of §8.1.
     "assigned": "{sig} takes {val} at {t}: a driver was enabled and assigned it.",
     "hold": "{sig} stays {val} at {t}: no driver was enabled, so it kept the value it had.",
+    "counterfactual": "{sig} is {val} at {t}. {detail}",
     "conflict": "{sig} is driven by more than one source at {t}, so {val} is whichever won.",
     # Terminals that answer the question (§8.1).
     "primary_input": "{sig} is {val} because it is driven from outside the design.",

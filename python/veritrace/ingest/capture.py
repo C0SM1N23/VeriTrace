@@ -20,15 +20,17 @@ rather than be papered over:
 from __future__ import annotations
 
 import csv
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__all__ = ["Capture", "FORMATS", "read", "to_vcd"]
+__all__ = ["Capture", "FORMATS", "read", "to_vcd", "mark", "marker_path"]
 
 #: The two exporters §8.11b names. Both write CSV; the difference is the
 #: preamble and how a sample column is labelled.
 FORMATS = ("vivado-ila", "signaltap")
+MARKER_SUFFIX = ".capture.json"
 
 #: Vivado writes `Sample in Buffer`, `Sample in Window`, `TRIGGER`; SignalTap
 #: writes an unnamed index column. None of them is a probed signal.
@@ -60,6 +62,28 @@ class Capture:
     @property
     def n_samples(self) -> int:
         return len(self.rows)
+
+
+def marker_path(trace: Path | str) -> Path:
+    """Durable capture metadata beside a raw trace or its converted store."""
+    text = str(Path(trace))
+    if text.endswith(".vtx"):
+        text = text[: -len(".vtx")]
+    return Path(text + MARKER_SUFFIX)
+
+
+def mark(trace: Path | str, capture: Capture, timescale: str) -> Path:
+    """Record that this trace is a sampled capture, not a simulation dump."""
+    path = marker_path(trace)
+    data = {
+        "schema": 1,
+        "format": capture.fmt,
+        "samples": capture.n_samples,
+        "trigger": capture.trigger,
+        "timescale": timescale,
+    }
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return path
 
 
 def read(path: Path | str, fmt: str = "vivado-ila", scope: str = "") -> Capture:

@@ -1,6 +1,6 @@
 /** Shapes shared between the app, the store and the render worker. */
 
-export type Radix = "hex" | "dec" | "bin" | "ascii";
+export type Radix = "hex" | "dec" | "bin" | "ascii" | "enum";
 
 export interface SignalMeta {
   handle: number;
@@ -14,6 +14,10 @@ export interface SignalMeta {
   lsb: number | null;
   array_index: number | null;
   n_events: number;
+  /** Virtual row reconstructed for one causal observation, not a dumped stream. */
+  derived?: boolean;
+  sample_time?: number;
+  sample_value?: string;
 }
 
 /** A row in the wave list: either a signal or a group header. */
@@ -72,6 +76,10 @@ export interface Layout {
   rowH?: number;
   /** The causal question this screen is about (P5, and §13.8's `share`). */
   query?: string;
+  /** VTQ recall and named aliases are session state (§9.4, P5). */
+  queryHistory?: string[];
+  savedQueries?: Record<string, string>;
+  diffOptions?: { other: string; strategy: string; anchor: string; marksA: string; marksB: string; ignore: string[] };
 }
 
 export interface ClockDomain {
@@ -85,15 +93,24 @@ export interface ClockDomain {
   signals: string[];
 }
 
-export interface SessionStatus {
+export interface SessionProgress {
   phase: string;
   progress: number;
+  error?: string;
+}
+
+export interface SessionStatus extends SessionProgress {
   correlation_rate: number | null;
   n_signals: number;
   n_events: number;
   t0: number;
   t1: number;
   timescale: string;
+  /** True for a shallow sampled ILA/SignalTap window, not a simulation history. */
+  capture: boolean;
+  trace?: string;
+  trace_name?: string;
+  top?: string | null;
   source_sha256: string | null;
   /** False when no RTL was supplied: causal analysis is off (§7.4). */
   has_rtl: boolean;
@@ -103,6 +120,8 @@ export interface SessionStatus {
   rtl_changed: boolean;
   n_rtl_signals: number;
   rtl_error: string;
+  layout_error?: string;
+  layout_backup?: string | null;
   /**
    * §5.5, problem 3: every clock domain, so a signal outside the primary one
    * can be shown with its own cycle number and the name of the clock that
@@ -119,6 +138,7 @@ export interface SessionStatus {
   clock: string | null;
   clock_method: string | null;
   n_cycles: number;
+  ui?: { row_height: string; radix: Record<string, string> };
 }
 
 // --- TAB 6, Checks (§11.4) -------------------------------------------------
@@ -224,6 +244,10 @@ export type ToWorker =
       scrollY: number;
       rowH: number;
       rows: RenderRow[];
+      /** Identity of the current chain; starts the brief §11.1 focus fade. */
+      causalKey: string;
+      /** Avoid the fade/pulse animation when the OS asks for reduced motion. */
+      reducedMotion: boolean;
       cursor: number | null;
       markers: number[];
       rulerMode: "time" | "cycle";
@@ -240,6 +264,12 @@ export interface RenderRow {
   label: string;
   width: number;
   radix: Radix;
+  /** Numeric state value -> symbolic RTL enum/localparam name. */
+  enumLabels?: Record<string, string>;
+  /** Reconstructed from RTL expressions; the worker draws it dotted (§7.3). */
+  derived?: boolean;
+  /** §11.1/P4: amber has exactly one meaning — membership in a causal chain. */
+  causal?: "primary" | "secondary" | "hover";
 }
 
 export type FromWorker =
@@ -254,12 +284,14 @@ export interface CausalNode {
   time: number;
   value: string;
   /** `txn_link` is §8.16: the chain crossed into a transaction. */
-  kind: "assigned" | "hold" | "conflict" | "terminal" | "txn_link";
+  kind: "assigned" | "hold" | "conflict" | "terminal" | "txn_link" | "counterfactual";
   reason: string;
   loc: { file: string; line: number; col: number } | null;
   last_change: number | null;
   is_primary_path: boolean;
   detail: string;
+  /** Elaborated width, including for a wholly unknown reconstructed value. */
+  width: number;
   /** `m1.WRITE[7]` on a txn_link node. */
   txn: string | null;
   /** §7.3 — computed from the RTL because the signal is not in the trace. */
@@ -386,6 +418,9 @@ export interface Machine {
    * never happened.
    */
   sequence: [number, number][];
+  /** Exact trace ticks: [start, end, state]. Includes the final observed stay. */
+  intervals: [number, number, number][];
+  clock_path: string | null;
   sequence_truncated: boolean;
   why_candidate: string;
 }
@@ -426,6 +461,10 @@ export interface DiffAlignment {
 }
 
 export interface DiffReport {
+  focus: string | null;
+  wave: { signal: string; start: number; end: number;
+    segments: { start: number; end: number; a: string; b: string; different: boolean;
+      time_a: number; time_b: number }[] } | null;
   a: { session_id: string; name: string };
   b: { session_id: string; name: string };
   alignment: DiffAlignment;
@@ -662,10 +701,35 @@ export interface PerfReport {
   ms: number;
 }
 
+export interface PerfHistoryPoint {
+  run_id: number;
+  ts: string;
+  tag: string;
+  commit: string;
+  value: number;
+  /** The largest observed worsening from the preceding recorded run. */
+  regression: boolean;
+}
+
+export interface PerfHistory {
+  available: boolean;
+  reason: string;
+  iface: string;
+  metric: string;
+  label: string;
+  unit: string;
+  lower_is_better: boolean;
+  points: PerfHistoryPoint[];
+  regression_run_id: number | null;
+  /** Latest minus previous, in the metric's own unit. */
+  delta: number | null;
+}
+
 // --- TAB 10, Memory (§8.20, §11.4b) ----------------------------------------
 
 export interface CmdEvent {
   time: number;
+  cycle: number | null;
   name: string;
   fields: Record<string, number | null>;
 }
@@ -684,8 +748,10 @@ export interface TimingViolation {
   /** null for a device-wide constraint (tFAW, tRFC, tREFI). */
   bank: number | null;
   at: number;
-  measured_cycles: number;
-  limit_cycles: number;
+  measured_cycles: number | null;
+  limit_cycles: number | null;
+  measured_ticks: number;
+  limit_ticks: number;
   /** True only for tREFI, where the limit is a maximum rather than a minimum. */
   is_maximum: boolean;
   first: CmdEvent | null;
@@ -721,6 +787,7 @@ export interface MemoryEfficiency {
 
 export interface MemoryInterface {
   iface: string;
+  clock_path: string | null;
   chip: string;
   n_banks: number;
   signals: Record<string, string>;
@@ -730,6 +797,8 @@ export interface MemoryInterface {
   segments: BankSegment[];
   violations: TimingViolation[];
   efficiency: MemoryEfficiency;
+  refresh_limit: number | null;
+  refresh_intervals: { t0: number; t1: number; elapsed: number }[];
   /** constraint -> violation count, zero included: "conformant" is a fact. */
   checked: Record<string, number>;
   skipped: Record<string, string>;
@@ -739,6 +808,9 @@ export interface MemoryInterface {
 export interface MemoryReport {
   interfaces: MemoryInterface[];
   errors: string[];
+  chips: { name: string; slug: string; [key: string]: string | number }[];
+  timing_errors: string[];
+  selection: Record<string, { chip?: string; toml?: string }>;
 }
 
 export interface CmdsResult {

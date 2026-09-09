@@ -122,6 +122,31 @@ test.describe("causality", () => {
     expect(state.sourceLoc?.line).toBeGreaterThan(0);
   });
 
+  test("hover highlights the same causal signal and Alt+click runs why-not", async ({ page }) => {
+    await open(page);
+    const bar = page.locator('[data-testid="query-bar"]');
+    await bar.fill("why(tb_fifo_buggy.dut.full @ 455000)");
+    await bar.press("Enter");
+
+    const root = page.locator(
+      '[data-testid="causal-card"][data-signal="tb_fifo_buggy.dut.full"]',
+    ).first();
+    await expect(root).toBeVisible({ timeout: 15_000 });
+    await root.hover();
+    await expect.poll(() =>
+      page.evaluate(() => (window as any).__vtStore.getState().hoveredCausal),
+    ).toBe("tb_fifo_buggy.dut.full");
+
+    // The observed value is 1, so the scalar shortcut asks for 0 without a
+    // modal. This must return a counterfactual tree, not an expectation note
+    // attached to the original why().
+    await root.click({ modifiers: ["Alt"] });
+    await expect(bar).toHaveValue(/why_not\(tb_fifo_buggy\.dut\.full == 0/);
+    await expect(
+      page.locator('[data-testid="causal-card"][data-signal="tb_fifo_buggy.dut.full"]'),
+    ).toContainText("wanted 0; observed 1", { timeout: 15_000 });
+  });
+
   test("Source shows the RTL with a causality gutter and value inlays", async ({ page }) => {
     await open(page);
     await rightClickSignal(page, "tb_fifo_buggy.dut.full");
@@ -184,7 +209,7 @@ test.describe("causality", () => {
   test("a bad query reports the problem instead of failing silently", async ({ page }) => {
     await open(page);
     const bar = page.locator('[data-testid="query-bar"]');
-    await bar.fill("cone(tb_fifo_buggy.dut.full)");
+    await bar.fill("why(tb_fifo_buggy.dut.no_such_signal, t=0)");
     await bar.press("Enter");
     await expect(page.locator(".pane-note.error")).toBeVisible({ timeout: 15_000 });
   });

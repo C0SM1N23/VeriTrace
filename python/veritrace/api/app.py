@@ -6,7 +6,13 @@ message framing; it asks the trace store for values and never interprets them.
 
 from __future__ import annotations
 
+import asyncio
+import csv
+import io
 import re
+import shutil
+import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,9 +26,10 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
+from starlette.background import BackgroundTask
 
 from veritrace import __version__
 from veritrace._native import MAX_PX
@@ -55,14 +62,32 @@ PROGRESS_EVERY = 16
 _NEGOTIATED = {"Vary": "Accept", "Cache-Control": "no-store"}
 
 
+def _is_plain_why(text: str) -> bool:
+    """Only ``why(``, not the separate ``why_not(`` command."""
+    return re.match(r"^why\s*\(", text, re.IGNORECASE) is not None
+
+
 class CreateSession(BaseModel):
     trace_path: str
-    rtl_paths: list[str] = Field(default_factory=list)
+    # Omitted means retain an existing session's RTL; [] explicitly requests
+    # waveform-only mode. Do not erase this distinction at the JSON boundary.
+    rtl_paths: list[str] | None = None
     top: str | None = None
 
 
 class QueryBody(BaseModel):
     vtq: str
+
+
+class ValuesBody(BaseModel):
+    """Exact values for Source/Inspector, never downsampled display buckets."""
+
+    handles: list[int] = Field(max_length=5000)
+    time: int
+    #: Negative browser-local handles map to an elaborated signal path.  They
+    #: are never accepted without this map, so an arbitrary integer cannot be
+    #: mistaken for a native trace handle.
+    derived: dict[int, str] = Field(default_factory=dict)
 
 
 class SuppressBody(BaseModel):
@@ -155,6 +180,260 @@ def _subtrace_of(session: Session, text: str):
     return signal, t, headline, result, sub
 
 
+def _causal_target(pipeline: "vtq.Pipeline") -> str:
+    """The single causal question inside ``subtrace()`` or ``repro()``."""
+    call = pipeline.source
+    if pipeline.stages:
+        raise vtq.QueryError(f"`{call.name}()` produces a report and cannot be piped")
+    if call.kwargs or len(call.args) != 1:
+        raise vtq.QueryError(f"`{call.name}()` needs exactly one signal/time question")
+    target = str(call.args[0]).strip()
+    if not target:
+        raise vtq.QueryError(f"`{call.name}()` needs a signal/time question")
+    return target if target.lower().startswith("why(") else f"why({target})"
+
+
+def _why_not_of(
+    session: Session,
+    pipeline: "vtq.Pipeline",
+    on_node: Any = None,
+) -> dict[str, Any]:
+    """Run §11.4's counterfactual through the same graph and trace as why()."""
+    call = pipeline.source
+    if pipeline.stages or call.kwargs or len(call.args) != 1:
+        raise vtq.QueryError(
+            "`why_not()` needs one comparison, for example "
+            "why_not(top.ctrl.ready == 1 @ c1247), and cannot be piped"
+        )
+    target = str(call.args[0]).strip()
+    wrapped = target if target.lower().startswith("why(") else f"why({target})"
+    question = vtq.parse(wrapped)
+    if question.txn is not None:
+        raise vtq.QueryError("`why_not()` asks about a signal value, not a transaction")
+    if question.value is None or question.op != "==":
+        raise vtq.QueryError("`why_not()` needs the value that was wanted, using `signal == value`")
+
+    signal, at, _headline = _question(session, wrapped)
+    sig = session.graph.get(signal) if session.graph is not None else None
+    if sig is None:
+        raise vtq.QueryError(f"unknown signal: {signal}")
+    bits = vtq.literal_bits(question.value, sig.width)
+    if bits is None:
+        raise vtq.QueryError(f"cannot read {question.value!r} as a {sig.width}-bit value")
+
+    from veritrace.analysis.whytrace import bv_from_bits
+
+    result = session.why_not(signal, at, bv_from_bits(bits, sig.width), on_node=on_node)
+    return {
+        "kind": "why_not",
+        "signal": signal,
+        "time": at,
+        "expected": bits,
+        **result.to_dict(),
+    }
+
+
+def _repro_of(
+    session: Session,
+    text: str,
+    *,
+    validate_it: bool,
+    mode: str | None = None,
+    timeout: float = 120.0,
+):
+    """Build §8.3 once for the dedicated route and the global VTQ command."""
+    from veritrace.repro import testbench
+
+    signal, at, headline, result, sub = _subtrace_of(session, text)
+    sources = session.rtl_files()
+    try:
+        built = testbench.build(
+            sub,
+            session.graph,
+            session.store,
+            session.clock,
+            session.elaboration,
+            root=result.root,
+            sources=sources,
+            work=session.trace_path.parent / WORK_DIR / "repro",
+            validate_it=validate_it and bool(sources),
+            timeout=timeout,
+            mode=mode,
+        )
+    except testbench.ReproError as e:
+        raise vtq.QueryError(str(e)) from e
+    return signal, at, headline, built
+
+
+def _diff_report(
+    session: Session,
+    other: Session,
+    strategy: str,
+    anchor: str | None,
+    ignore: list[str],
+    times_a: list[int] | None = None,
+    times_b: list[int] | None = None,
+    focus: str | None = None,
+) -> dict[str, Any]:
+    """One first-divergence implementation for the route and VTQ dispatcher."""
+    from veritrace import diff as diff_mod
+
+    if other.session_id == session.session_id:
+        raise vtq.QueryError("that is the same trace")
+    try:
+        alignment = diff_mod.align(
+            diff_mod.side(session.trace_path.name, session.store, session.clock),
+            diff_mod.side(other.trace_path.name, other.store, other.clock),
+            strategy,
+            protocol_a=session.protocol,
+            protocol_b=other.protocol,
+            signal=anchor,
+            times_a=times_a or [],
+            times_b=times_b or [],
+        )
+    except diff_mod.AlignError as e:
+        raise vtq.QueryError(str(e)) from e
+    patterns = list(ignore) + list(getattr(session.config, "ignore", []) or [])
+    try:
+        report = diff_mod.compare(alignment, patterns)
+        if focus is not None:
+            diff_mod.select_focus(report, focus)
+    except diff_mod.AlignError as e:
+        raise vtq.QueryError(str(e)) from e
+    report.txn_divergences = diff_mod.compare_transactions(
+        alignment, session.protocol, other.protocol
+    )
+    if report.first is not None and session.graph is not None:
+        diff_mod.explain(report, session.graph, other.graph)
+    return {
+        "a": {"session_id": session.session_id, "name": session.trace_path.name},
+        "b": {"session_id": other.session_id, "name": other.trace_path.name},
+        **report.to_dict(),
+    }
+
+
+def _run_pipeline(
+    session: Session,
+    pipeline: "vtq.Pipeline",
+    registry: SessionRegistry | None = None,
+) -> dict[str, Any]:
+    """Execute any non-``why`` VTQ command against one production session.
+
+    The global query bar and the transaction endpoint used to have different
+    dispatch tables.  As a result ``txn()``, ``stalls()``, ``cmds()`` and half
+    the language worked in their tabs but failed in the bar §9.4 calls the
+    application's spine.  One dispatcher keeps REST, WebSocket and the domain
+    tabs on the same runtime path.
+    """
+    from veritrace.analysis import signalq
+    from veritrace.coverage import query as cov_query
+    from veritrace.memory import query as mem_query
+    from veritrace.perf import query as perf_query
+    from veritrace.protocol import query as txn_query
+
+    if pipeline.name == "why_not":
+        return _why_not_of(session, pipeline)
+
+    if pipeline.name == "diff":
+        call = pipeline.source
+        if registry is None:
+            raise vtq.QueryError("`diff()` needs the session registry")
+        if pipeline.stages or len(call.args) != 1:
+            raise vtq.QueryError("`diff()` needs exactly one other trace and cannot be piped")
+        unknown = set(call.kwargs) - {"align", "anchor", "marks"}
+        if unknown:
+            raise vtq.QueryError(f"unknown diff option(s): {', '.join(sorted(unknown))}")
+        try:
+            other = registry.open(str(call.args[0]), session.rtl_paths, session.top)
+        except (FileNotFoundError, ValueError, OSError) as e:
+            raise vtq.QueryError(f"cannot open other trace: {e}") from e
+        strategy = str(call.kwargs.get("align", "cycle"))
+        times_a, times_b = [], []
+        if "marks" in call.kwargs:
+            from veritrace.diff.align import AlignError, parse_marks
+
+            if strategy != "manual":
+                raise vtq.QueryError("marks require align=manual")
+            try:
+                times_a, times_b = parse_marks(call.kwargs["marks"])
+            except AlignError as exc:
+                raise vtq.QueryError(str(exc)) from exc
+        if strategy not in {"cycle", "handshake", "retire", "manual"}:
+            raise vtq.QueryError(
+                "diff align must be cycle, handshake, retire or manual"
+            )
+        return {
+            "kind": "diff",
+            **_diff_report(
+                session,
+                other,
+                strategy,
+                str(call.kwargs["anchor"]) if "anchor" in call.kwargs else None,
+                [],
+                times_a,
+                times_b,
+            ),
+        }
+
+    if pipeline.name == "subtrace":
+        from veritrace.repro import narrate
+
+        target = _causal_target(pipeline)
+        signal, at, headline, _result, sub = _subtrace_of(session, target)
+        return {
+            "kind": "subtrace",
+            "query": target,
+            "signal": signal,
+            "time": at,
+            "headline": headline,
+            "title": narrate.headline(sub),
+            "symptom": narrate.symptom_paragraph(sub, target),
+            "steps": narrate.steps(sub),
+            **sub.to_dict(),
+        }
+    if pipeline.name == "repro":
+        target = _causal_target(pipeline)
+        signal, at, headline, built = _repro_of(session, target, validate_it=False)
+        return {
+            "kind": "repro",
+            "query": target,
+            "signal": signal,
+            "time": at,
+            "headline": headline,
+            **built.to_dict(),
+        }
+
+    if pipeline.name in signalq.COMMANDS:
+        return signalq.run(session, pipeline)
+    if pipeline.name in cov_query.COMMANDS:
+        return cov_query.run(session.integrity, session.coverage, pipeline)
+    if pipeline.name in perf_query.COMMANDS:
+        return perf_query.run(
+            session.performance, session.protocol, session.wait_for, pipeline
+        )
+    if pipeline.name in mem_query.COMMANDS:
+        root = session.config.root if session.config is not None else session.trace_path.parent
+        return mem_query.run(session.memory, pipeline, session.store, session.clock, root)
+    if pipeline.name == "protocol":
+        if session.protocol is None:
+            raise vtq.QueryError("protocol extraction did not run for this session")
+        return txn_query.protocol(session.protocol, pipeline)
+    if pipeline.name == "txn":
+        if session.protocol is None:
+            raise vtq.QueryError("protocol extraction did not run for this session")
+        return {"kind": "txn", **txn_query.run(session.protocol, pipeline).to_dict()}
+    known = sorted(
+        set(signalq.COMMANDS)
+        | set(cov_query.COMMANDS)
+        | set(perf_query.COMMANDS)
+        | set(mem_query.COMMANDS)
+        | {"protocol", "txn", "subtrace", "repro", "diff", "why_not"}
+    )
+    raise vtq.QueryError(
+        f"unknown command `{pipeline.name}()`; try {', '.join(known)}"
+    )
+
+
 class ReproBody(BaseModel):
     # `validate` is the word the API wants and a method pydantic already owns on
     # BaseModel, so the field is named apart and aliased back.
@@ -167,12 +446,36 @@ class ReproBody(BaseModel):
     run_validation: bool = Field(default=True, alias="validate")
 
 
+class ExportBody(BaseModel):
+    """The public §10.1 export contract.
+
+    ``vtq`` remains accepted for clients released before the REST schema was
+    completed; new clients use ``target``.  For the built-in formats the target
+    is a VTQ question, except that SVG also accepts ``fsm(signal)`` or a bare
+    FSM signal name.
+    """
+
+    model_config = {"populate_by_name": True}
+
+    kind: str = "html"
+    target: str | None = None
+    vtq: str | None = None
+    mode: str = Field(default="auto", pattern="^(auto|minimal|focused)$")
+    run_validation: bool = Field(default=True, alias="validate")
+
+    def query(self) -> str | None:
+        return (self.target or self.vtq or "").strip() or None
+
+
 class DiffBody(BaseModel):
     """§8.7. The second trace is named by path; the first is the session's own."""
 
     trace: str
     strategy: str = Field(default="cycle", pattern="^(cycle|handshake|retire|manual)$")
     anchor: str | None = None
+    times_a: list[StrictInt] = Field(default_factory=list)
+    times_b: list[StrictInt] = Field(default_factory=list)
+    focus: str | None = None
     #: §11.4's "ignore this signal", as globs. Counters and timestamps
     #: legitimately differ between two runs.
     ignore: list[str] = Field(default_factory=list)
@@ -187,6 +490,215 @@ class LayoutBody(BaseModel):
     bookmarks: list[Any] = Field(default_factory=list)
     cursors: list[Any] = Field(default_factory=list)
     zoom: Any = None
+
+
+class MemoryTimingBody(BaseModel):
+    model_config = {"extra": "forbid"}
+    iface: str
+    chip: str | None = None
+    toml: str | None = Field(default=None, max_length=64_000)
+
+
+def _machines(session: Session) -> list[Any]:
+    """Extract and overlay FSMs through the one production implementation."""
+    from veritrace.analysis import fsm as fsm_mod
+
+    if session.graph is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No RTL loaded. FSM extraction reads the design graph — start with --rtl.",
+        )
+    machines = fsm_mod.extract(session.graph, session.elaboration, session.store)
+    for machine in machines:
+        fsm_mod.overlay(machine, session.store, session.graph, session.clock)
+    return machines
+
+
+def _simulation_command(trace_path: Path) -> str:
+    """Recall the exact command persisted by ``veritrace run``, if available."""
+    try:
+        return (Path(trace_path).parent / "sim.command").read_text(
+            encoding="utf-8", errors="replace"
+        ).strip()
+    except OSError:
+        return ""
+
+
+def _session_annotations(session: Session) -> list[str]:
+    """Project text annotations included in the standalone report appendix."""
+    from veritrace import notes
+
+    root = Path(getattr(session.config, "root", None) or session.trace_path.parent)
+    out: list[str] = []
+    for path in notes.discover(root):
+        try:
+            out.extend(str(note) for note in notes.read(path))
+        except OSError:
+            # One optional notes file becoming unreadable after session open
+            # must not turn a valid bug report into a fake successful download.
+            continue
+    return out
+
+
+def _plugin_export(session: Session, kind: str, target: str | None) -> Response:
+    """Run a custom exporter with the same production data as the CLI path."""
+    from veritrace import plugin as plugin_mod
+
+    root = Path(getattr(session.config, "root", None) or session.trace_path.parent)
+    plugin_mod.clear()
+    _analyses, errors = plugin_mod.discover(root)
+    matches = [exporter for exporter in plugin_mod.exporters() if exporter.name == kind]
+    if not matches:
+        available = ", ".join(["html", "json", "svg", *(e.name for e in plugin_mod.exporters())])
+        failed = f"; plugin load errors: {errors}" if errors else ""
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown export format {kind!r}; available: {available}{failed}",
+        )
+
+    causal = None
+    rendered_target = target
+    if target is not None:
+        _signal, _time, headline, causal, _sub = _subtrace_of(session, target)
+        rendered_target = headline or target
+    try:
+        artifact = plugin_mod.run_exporter(
+            matches[0],
+            store=session.store,
+            graph=session.graph,
+            elaboration=session.elaboration,
+            clock=session.clock,
+            config=session.config,
+            protocol=session.protocol,
+            coverage=session.coverage,
+            memory=session.memory,
+            performance=session.performance,
+            query=rendered_target,
+            causal=causal,
+            findings=session.report,
+            metadata={
+                "trace_path": str(session.trace_path),
+                "trace_sha256": getattr(session.store, "source_sha256", ""),
+                "top": getattr(session.graph, "top", "") if session.graph is not None else "",
+            },
+        )
+    except plugin_mod.PluginError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+    suffix = matches[0].extension.strip()
+    if not re.fullmatch(r"\.[A-Za-z0-9]{1,12}", suffix):
+        suffix = ".bin"
+    media_types = {
+        ".csv": "text/csv; charset=utf-8",
+        ".html": "text/html; charset=utf-8",
+        ".json": "application/json",
+        ".svg": "image/svg+xml",
+        ".txt": "text/plain; charset=utf-8",
+    }
+    name = _IDENT.sub("_", matches[0].name) or "veritrace_export"
+    return Response(
+        artifact,
+        media_type=media_types.get(suffix.lower(), "application/octet-stream"),
+        headers={"Content-Disposition": f'attachment; filename="{name}{suffix}"'},
+    )
+
+
+def _derived_signal(session: Session, path: str) -> Any:
+    """Resolve one reconstructed RTL signal, refusing guesses and dumped rows."""
+    if session.graph is None:
+        raise ValueError("derived waveform needs RTL")
+    from veritrace.correlate.resolver import resolve_path
+
+    signal, candidates = resolve_path(session.graph, path)
+    if signal is None:
+        if candidates:
+            raise ValueError(f"{path} is ambiguous: {', '.join(candidates[:8])}")
+        raise ValueError(f"unknown RTL signal: {path}")
+    sig = session.graph.get(signal)
+    if sig is None or not sig.is_reconstructible:
+        raise ValueError(f"{signal} is not an undumped reconstructible signal")
+    return sig
+
+
+def _derived_wave(
+    session: Session, path: str, t0: int, t1: int, px_width: int
+) -> dict[str, Any]:
+    """Evaluate an undumped combinational signal over a real trace window.
+
+    Every dumped leaf read by every possible driver is used as an event source.
+    The expression is then evaluated at the settled value of each unique event
+    timestamp.  This is the waveform counterpart of why-trace's §7.3
+    reconstruction, not interpolation from the one causal sample the user
+    happened to click.
+    """
+    from veritrace.analysis.whytrace import TraceView
+    from veritrace.graph.model import refs
+
+    sig = _derived_signal(session, path)
+    leaves: set[int] = set()
+    visiting: set[str] = set()
+
+    def collect(node: Any) -> None:
+        if node.path in visiting:
+            return
+        if node.trace_handle is not None:
+            leaves.add(node.trace_handle)
+            return
+        visiting.add(node.path)
+        try:
+            for driver in node.drivers:
+                for sid in (*refs(driver.guard), *refs(driver.value)):
+                    dep = session.graph.get(sid.path())
+                    if dep is not None:
+                        collect(dep)
+        finally:
+            visiting.discard(node.path)
+
+    collect(sig)
+    times = {t0}
+    for handle in leaves:
+        times.update(t for t, _value in session.store.transitions(handle, t0, t1))
+
+    view = TraceView(session.graph, session.store)
+
+    def value_at(t: int) -> str:
+        value = view.value(sig.id, t)
+        # A hold on an undumped sequential register cannot be reconstructed;
+        # paint X rather than extending the last inferred assignment as fact.
+        out = str(value) if value is not None else "x"
+        view._cache.clear()  # bound memory to one timestamp on huge windows
+        return out
+
+    initial = value_at(t0)
+    points: list[tuple[int, str]] = []
+    previous = initial
+    for t in sorted(times):
+        value = value_at(t)
+        if value != previous:
+            points.append((t, value))
+            previous = value
+
+    if len(points) <= px_width:
+        return {"mode": "exact", "initial": initial, "transitions": points}
+
+    # Pixel-bounded min/max buckets, matching the native wire shape. Unknown
+    # reconstructed values carry the X flag; known values retain numeric order.
+    span = max(t1 - t0, 1)
+    buckets: dict[int, list[tuple[int, str]]] = {}
+    for t, value in points:
+        at = min(px_width - 1, max(0, ((t - t0) * px_width) // span))
+        buckets.setdefault(at, []).append((t, value))
+    reduced: list[tuple[int, str, str, int, int]] = []
+    for rows in buckets.values():
+        known = [(int(v, 2), v) for _t, v in rows if v and set(v) <= {"0", "1"}]
+        flags = 1 if len(known) != len(rows) else 0
+        if known:
+            lo = min(known)[1]
+            hi = max(known)[1]
+        else:
+            lo = hi = "x"
+        reduced.append((rows[0][0], lo, hi, len(rows), flags))
+    return {"mode": "minmax", "initial": initial, "transitions": reduced}
 
 
 def create_app(
@@ -206,6 +718,14 @@ def create_app(
     def require(session_id: str) -> Session:
         session = registry.get(session_id)
         if session is None:
+            pending = registry.status(session_id)
+            if pending is not None:
+                detail = (
+                    pending.get("error")
+                    if pending.get("phase") == "error"
+                    else f"session is still {pending.get('phase', 'opening')}"
+                )
+                raise HTTPException(status_code=409, detail=detail)
             raise HTTPException(status_code=404, detail=f"unknown session: {session_id}")
         return session
 
@@ -242,12 +762,12 @@ def create_app(
     @api.post("/session")
     def create_session(body: CreateSession) -> dict[str, Any]:
         try:
-            session = registry.open(body.trace_path, body.rtl_paths, body.top)
+            session_id, status = registry.start(body.trace_path, body.rtl_paths, body.top)
         except FileNotFoundError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
         except (ValueError, OSError) as e:
             raise HTTPException(status_code=400, detail=f"cannot open trace: {e}") from e
-        return {"session_id": session.session_id, **session.status()}
+        return {"session_id": session_id, **status}
 
     @api.get("/sessions")
     def sessions() -> dict[str, Any]:
@@ -273,7 +793,10 @@ def create_app(
 
     @api.get("/session/{session_id}/status")
     def status(session_id: str) -> dict[str, Any]:
-        return require(session_id).status()
+        value = registry.status(session_id)
+        if value is None:
+            raise HTTPException(status_code=404, detail=f"unknown session: {session_id}")
+        return value
 
     @api.post("/session/{session_id}/diff")
     def diff_route(session_id: str, body: DiffBody) -> dict[str, Any]:
@@ -285,8 +808,6 @@ def create_app(
         case §8.7 is for, and asking the user to name the sources twice would be
         asking them to get it wrong once.
         """
-        from veritrace import diff as diff_mod
-
         session = require(session_id)
         try:
             other = registry.open(body.trace, session.rtl_paths, session.top)
@@ -296,31 +817,19 @@ def create_app(
             raise HTTPException(status_code=400, detail=f"cannot open trace: {e}") from e
         if other.session_id == session.session_id:
             raise HTTPException(status_code=400, detail="that is the same trace")
-
         try:
-            alignment = diff_mod.align(
-                diff_mod.side(session.trace_path.name, session.store, session.clock),
-                diff_mod.side(other.trace_path.name, other.store, other.clock),
+            return _diff_report(
+                session,
+                other,
                 body.strategy,
-                protocol_a=session.protocol,
-                protocol_b=other.protocol,
-                signal=body.anchor,
+                body.anchor,
+                body.ignore,
+                body.times_a,
+                body.times_b,
+                body.focus,
             )
-        except diff_mod.AlignError as e:
+        except vtq.QueryError as e:
             raise HTTPException(status_code=409, detail=str(e)) from e
-
-        patterns = list(body.ignore) + list(getattr(session.config, "ignore", []) or [])
-        report = diff_mod.compare(alignment, patterns)
-        report.txn_divergences = diff_mod.compare_transactions(
-            alignment, session.protocol, other.protocol
-        )
-        if report.first is not None and session.graph is not None:
-            diff_mod.explain(report, session.graph, other.graph)
-        return {
-            "a": {"session_id": session.session_id, "name": session.trace_path.name},
-            "b": {"session_id": other.session_id, "name": other.trace_path.name},
-            **report.to_dict(),
-        }
 
     @api.get("/session/{session_id}/hierarchy")
     def hierarchy(session_id: str, path: str | None = None) -> dict[str, Any]:
@@ -356,6 +865,41 @@ def create_app(
             rows = [signal_json(s) for s in all_signals[:limit]]
         return {"query": q, "count": len(rows), "total": session.store.n_signals, "signals": rows}
 
+    @api.post("/session/{session_id}/values")
+    def values(session_id: str, body: ValuesBody) -> dict[str, Any]:
+        """Settled, exact values at one time for Source and Inspector.
+
+        Waveform chunks are deliberately reduced to pixel resolution.  They
+        are therefore drawing data, not an authority for value inlays.  This
+        small batched endpoint keeps the UI on the trace store's exact
+        ``value_at`` semantics without one HTTP request per signal.
+        """
+        session = require(session_id)
+        rows: list[dict[str, Any]] = []
+        for handle in dict.fromkeys(body.handles):
+            try:
+                if handle < 0:
+                    path = body.derived.get(handle)
+                    if path is None:
+                        raise ValueError("negative handle needs a derived signal path")
+                    from veritrace.analysis.whytrace import TraceView
+
+                    sig = _derived_signal(session, path)
+                    inferred = TraceView(session.graph, session.store).value(sig.id, body.time)
+                    bits = str(inferred) if inferred is not None else "x"
+                else:
+                    value = session.store.value_at(handle, body.time)
+                    bits = value.bits if value is not None else None
+            except (KeyError, TypeError, ValueError) as e:
+                raise HTTPException(status_code=404, detail=f"signal {handle}: {e}") from e
+            rows.append(
+                {
+                    "handle": handle,
+                    "value": bits,
+                }
+            )
+        return {"time": body.time, "values": rows}
+
     @api.get("/session/{session_id}/source/{file:path}")
     def source(session_id: str, file: str) -> dict[str, Any]:
         """RTL text plus the signals declared or driven on each line.
@@ -369,20 +913,46 @@ def create_app(
                 status_code=404,
                 detail="No RTL loaded. Start the server with --rtl to read source.",
             )
-        target = Path(file).name
-        match = next((p for p in session.rtl_files() if p.name == target), None)
-        if match is None or not match.is_file():
-            raise HTTPException(status_code=404, detail=f"no RTL file named {target!r}")
+        requested = file.replace("\\", "/").removeprefix("./")
+        known = sorted({p.resolve() for p in [*session.rtl_files(),
+                       *getattr(session.elaboration, "sources", [])] if p.is_file()})
+        root = Path(getattr(session.config, "root", session.trace_path.parent)).resolve()
+
+        def names(path: Path) -> set[str]:
+            out = {path.name, path.as_posix()}
+            try:
+                out.add(path.relative_to(root).as_posix())
+            except ValueError:
+                pass
+            return out
+
+        matches = [p for p in known if requested in names(p)]
+        if not matches:
+            raise HTTPException(status_code=404, detail=f"no loaded RTL file named {requested!r}")
+        if len(matches) > 1:
+            choices = []
+            for path in matches:
+                try:
+                    choices.append(path.relative_to(root).as_posix())
+                except ValueError:
+                    choices.append(path.as_posix())
+            raise HTTPException(
+                status_code=409,
+                detail=f"RTL file name {requested!r} is ambiguous; use one of: {', '.join(choices)}",
+            )
+        match = matches[0]
+        target = (match.as_posix() if sum(p.name == match.name for p in known) > 1
+                  else match.name)
 
         by_line: dict[int, list[dict[str, Any]]] = {}
         for sig in session.graph:
             for loc, role in [(sig.decl_loc, "decl")] + [(d.loc, "driver") for d in sig.drivers]:
-                if loc and loc.file == match.name:
+                if loc and loc.file.replace("\\", "/") in names(match):
                     by_line.setdefault(loc.line, []).append(
                         {"path": sig.path, "handle": sig.trace_handle, "role": role}
                     )
         return {
-            "file": match.name,
+            "file": target,
             "text": match.read_text(encoding="utf-8", errors="replace"),
             "signals": {str(k): v for k, v in sorted(by_line.items())},
         }
@@ -399,22 +969,16 @@ def create_app(
         into the query bar came back "not supported" for an analysis the same
         session already had a button for.
         """
-        from veritrace.analysis import signalq
-
         session = require(session_id)
         text = (body.vtq or "").strip()
-        if not text.startswith("why"):
+        if not _is_plain_why(text):
             try:
                 pipeline = vtq.parse_pipeline(text)
-            except vtq.QueryError:
-                pipeline = None
-            if pipeline is not None and pipeline.name in signalq.COMMANDS:
-                try:
-                    return {"query": body.vtq, **signalq.run(session, pipeline)}
-                except vtq.QueryError as e:
-                    raise HTTPException(status_code=400, detail=str(e)) from e
-                except KeyError as e:
-                    raise HTTPException(status_code=404, detail=str(e)) from e
+                return {"query": body.vtq, **_run_pipeline(session, pipeline, registry)}
+            except vtq.QueryError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            except KeyError as e:
+                raise HTTPException(status_code=404, detail=str(e)) from e
 
         signal, t, headline = _question(session, body.vtq)
         return {
@@ -451,37 +1015,176 @@ def create_app(
     @api.post("/session/{session_id}/repro")
     def repro_route(session_id: str, body: ReproBody) -> dict[str, Any]:
         """§8.3's testbench, and — unless asked not to — the run that proves it."""
-        from veritrace.repro import testbench
-
         session = require(session_id)
-        _signal, _t, _headline, result, sub = _subtrace_of(session, body.vtq)
-        sources = session.rtl_files()
         try:
-            built = testbench.build(
-                sub,
-                session.graph,
-                session.store,
-                session.clock,
-                session.elaboration,
-                root=result.root,
-                sources=sources,
-                work=session.trace_path.parent / WORK_DIR / "repro",
-                validate_it=body.run_validation and bool(sources),
+            _signal, _time, _headline, built = _repro_of(
+                session,
+                body.vtq,
+                validate_it=body.run_validation,
                 mode=None if body.mode == "auto" else body.mode,
             )
-        except testbench.ReproError as e:
+        except vtq.QueryError as e:
             raise HTTPException(status_code=409, detail=str(e)) from e
         return {"query": body.vtq, **built.to_dict()}
 
     @api.post("/session/{session_id}/export")
-    def export_route(session_id: str, body: ReproBody) -> HTMLResponse:
-        """§12's report, which §11.5 makes the export button of Replay mode."""
+    def export_route(session_id: str, body: ExportBody) -> Response:
+        """Export a real session artifact through the §10.1 format contract.
+
+        HTML and causal SVG reuse the exact cached why-tree behind the Causal
+        tab. JSON executes the same VTQ dispatcher as ``/query``. Custom kinds
+        are exporter plugins discovered from the session's project, rather
+        than an API-only imitation of the CLI exporter path.
+        """
         from veritrace.api.sessions import sha256_files
         from veritrace.export import report as report_mod
         from veritrace.repro import testbench
 
         session = require(session_id)
-        _signal, _t, headline, result, sub = _subtrace_of(session, body.vtq)
+        kind = body.kind.strip().lower()
+        target = body.query()
+
+        if kind in {"csv", "parquet"}:
+            # TAB 8 exports the same transaction table that extraction wrote,
+            # not a UI-shaped summary.  Accept the visible interface name and
+            # the query-language spelling so API and browser clients need no
+            # private target convention.
+            if target is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{kind.upper()} export needs a transaction interface target",
+                )
+            requested = target
+            match = re.fullmatch(r"\s*txn\s*\(\s*([^,()]+?)\s*\)\s*", target, re.I)
+            if match is not None:
+                requested = match.group(1).strip().strip("\"'")
+            elif "(" in target or ")" in target:
+                raise HTTPException(
+                    status_code=400,
+                    detail="transaction export accepts an interface name or txn(interface)",
+                )
+            if session.protocol is None:
+                raise HTTPException(status_code=409, detail="protocol extraction did not run")
+            extraction = session.protocol.get(requested)
+            if extraction is None:
+                known = ", ".join(
+                    e.interface.name for e in session.protocol.extractions
+                ) or "none"
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"no interface named `{requested}`; detected: {known}",
+                )
+
+            from veritrace import clocks
+            from veritrace.protocol import persist
+
+            iface_clock = (
+                clocks.clock_at(session.store, extraction.interface.clock)
+                if extraction.interface.clock
+                else None
+            ) or session.clock
+            columns, _origin = persist.to_columns(extraction, iface_clock)
+            safe_name = _IDENT.sub("_", extraction.interface.name) or "transactions"
+
+            if kind == "csv":
+                out = io.StringIO(newline="")
+                writer = csv.writer(out, lineterminator="\n")
+                writer.writerow(name for name, _values in columns)
+                writer.writerows(zip(*(values for _name, values in columns), strict=True))
+                return Response(
+                    out.getvalue(),
+                    media_type="text/csv",
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{safe_name}.csv"'
+                    },
+                )
+
+            # Normally this is exactly the immutable table produced while the
+            # session opened.  A read-only trace directory can prevent that
+            # cache write; exporting must still work, so materialise the same
+            # columns in a disposable file and remove it after the response.
+            persisted = Path(extraction.parquet) if extraction.parquet else None
+            if persisted is not None and persisted.is_file():
+                return FileResponse(
+                    persisted,
+                    media_type="application/vnd.apache.parquet",
+                    filename=f"{safe_name}.parquet",
+                )
+            from veritrace._native import write_txn_table
+
+            temp_dir = Path(tempfile.mkdtemp(prefix="veritrace-export-"))
+            generated = temp_dir / f"{safe_name}.parquet"
+            try:
+                write_txn_table(str(generated), columns)
+            except Exception:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise
+            return FileResponse(
+                generated,
+                media_type="application/vnd.apache.parquet",
+                filename=generated.name,
+                background=BackgroundTask(shutil.rmtree, temp_dir, ignore_errors=True),
+            )
+
+        if kind == "json":
+            if target is None:
+                raise HTTPException(status_code=400, detail="JSON export needs a VTQ target")
+            command = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_-]*)\s*\(", target)
+            if command is not None and command.group(1).lower() != "why":
+                try:
+                    pipeline = vtq.parse_pipeline(target)
+                    payload = {"query": target, **_run_pipeline(session, pipeline, registry)}
+                except vtq.QueryError as e:
+                    raise HTTPException(status_code=400, detail=str(e)) from e
+                except KeyError as e:
+                    raise HTTPException(status_code=404, detail=str(e)) from e
+            else:
+                signal, t, headline, result, sub = _subtrace_of(session, target)
+                payload = {
+                    "query": target,
+                    "signal": signal,
+                    "time": t,
+                    "headline": headline,
+                    **result.to_dict(),
+                    "subtrace": sub.to_dict(),
+                }
+            return JSONResponse(
+                payload,
+                headers={"Content-Disposition": 'attachment; filename="veritrace.json"'},
+            )
+
+        if kind == "svg":
+            if target is None:
+                raise HTTPException(status_code=400, detail="SVG export needs a target")
+            from veritrace.analysis import fsm as fsm_mod
+            from veritrace.export import fsmsvg
+
+            requested = target
+            match = re.fullmatch(r"\s*fsm\s*\(\s*([^()]+?)\s*\)\s*", target, re.I)
+            if match is not None:
+                requested = match.group(1)
+            machine = fsm_mod.find(_machines(session), requested)
+            if match is not None or machine is not None:
+                if machine is None:
+                    raise HTTPException(status_code=404, detail=f"no state machine on {requested}")
+                svg = fsmsvg.render(machine)
+                name = _IDENT.sub("_", machine.signal) or "fsm"
+            else:
+                signal, _t, _headline, _result, sub = _subtrace_of(session, target)
+                svg = report_mod.waveform_svg(session.store, sub, session.clock)
+                name = _IDENT.sub("_", signal) or "causal_waveform"
+            return Response(
+                svg,
+                media_type="image/svg+xml",
+                headers={"Content-Disposition": f'attachment; filename="{name}.svg"'},
+            )
+
+        if kind != "html":
+            return _plugin_export(session, kind, target)
+
+        if target is None:
+            raise HTTPException(status_code=400, detail="HTML export needs a causal target")
+        _signal, _t, headline, result, sub = _subtrace_of(session, target)
         sources = session.rtl_files()
         built = None
         try:
@@ -506,13 +1209,16 @@ def create_app(
             sub,
             session.store,
             session.clock,
-            query=headline or body.vtq,
-            sources={p.name: p for p in sources},
+            query=headline or target,
+            sources={p.resolve().as_posix(): p for p in
+                     [*sources, *getattr(session.elaboration, "sources", [])]},
             repro=built,
             findings=session.report,
             trace_path=session.trace_path,
             rtl_sha256=session.rtl_sha256 or (sha256_files(sources) if sources else None),
             top=getattr(session.graph, "top", "") or "",
+            command=_simulation_command(session.trace_path),
+            annotations=_session_annotations(session),
         )
         name = _IDENT.sub("_", page.title) or "bug_report"
         return HTMLResponse(
@@ -541,39 +1247,17 @@ def create_app(
         `stalls(m0)` differ in what they return, not in how they are written, and
         splitting them would make the query bar need to know which is which.
         """
-        from veritrace.coverage import query as cov_query
-        from veritrace.memory import query as mem_query
-        from veritrace.perf import query as perf_query
-        from veritrace.protocol import query as txn_query
-
         session = require(session_id)
-        if session.protocol is None:
-            raise HTTPException(
-                status_code=409, detail="protocol extraction did not run for this session"
-            )
         try:
             pipeline = vtq.parse_pipeline(body.vtq)
-            if pipeline.name in cov_query.COMMANDS:
-                got = cov_query.run(session.integrity, session.coverage, pipeline)
-                return {"query": body.vtq, **got}
-            if pipeline.name in perf_query.COMMANDS:
-                got = perf_query.run(
-                    session.performance, session.protocol, session.wait_for, pipeline
-                )
-                return {"query": body.vtq, **got}
-            if pipeline.name in mem_query.COMMANDS:
-                root = session.config.root if session.config is not None else session.trace_path.parent
-                got = mem_query.run(session.memory, pipeline, session.store, session.clock, root)
-                return {"query": body.vtq, **got}
-            if pipeline.name == "protocol":
-                return {"query": body.vtq, **txn_query.protocol(session.protocol, pipeline)}
-            result = txn_query.run(session.protocol, pipeline)
+            return {"query": body.vtq, **_run_pipeline(session, pipeline, registry)}
         except vtq.QueryError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
-        return {"query": body.vtq, "kind": "txn", **result.to_dict()}
 
     @api.get("/session/{session_id}/performance")
-    def performance(session_id: str) -> dict[str, Any]:
+    def performance(
+        session_id: str, t0: int | None = None, t1: int | None = None
+    ) -> dict[str, Any]:
         """§8.17's metrics and §8.18's wait-for graph — TAB 9 (§11.4b).
 
         Computed when the session opened, so this is a read. The wait-for graph
@@ -581,6 +1265,8 @@ def create_app(
         findings, and the graph is what the deadlock rows expand into.
         """
         session = require(session_id)
+        if (t0 is None) != (t1 is None) or (t0 is not None and t1 is not None and t1 < t0):
+            raise HTTPException(status_code=400, detail="performance window needs t0 <= t1")
         if session.performance is None:
             return {
                 "interfaces": [],
@@ -594,11 +1280,44 @@ def create_app(
                 ],
                 "ms": 0,
             }
+        report = session.performance.to_dict()
+        if t0 is not None and t1 is not None and session.protocol is not None:
+            from veritrace.perf import metrics
+
+            extractions = [metrics.in_window(ex, t0, t1) for ex in session.protocol.extractions]
+            report["interfaces"] = [
+                metrics.measure(ex, session.store, session.clock).to_dict() for ex in extractions
+            ]
+            report["fairness"] = metrics.fairness(extractions).to_dict()
         return {
-            **session.performance.to_dict(),
+            **report,
+            "window": {"t0": t0, "t1": t1} if t0 is not None else None,
+            "liveness_scope": "whole run",
             "wait_for": [e.to_dict() for e in session.wait_for],
             "errors": [session.performance_error] if session.performance_error else [],
         }
+
+    @api.get("/session/{session_id}/performance/history")
+    def performance_history(
+        session_id: str,
+        iface: str = Query(min_length=1),
+        metric: str = "p99_latency",
+        limit: int = Query(default=40, ge=2, le=500),
+    ) -> dict[str, Any]:
+        """The selected metric over recorded runs — §11.4 and §13.6.
+
+        Reads the exact DuckDB written by ``veritrace record``.  Missing or
+        damaged history is an explicit empty state, never a flat zero series.
+        """
+        session = require(session_id)
+        from veritrace import regress
+
+        root = getattr(session.config, "root", None) or Path.cwd()
+        path = Path(root) / regress.DEFAULT_DB
+        try:
+            return regress.performance_history(path, iface, metric, limit)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @api.get("/session/{session_id}/memory")
     def memory(session_id: str) -> dict[str, Any]:
@@ -609,16 +1328,39 @@ def create_app(
         `/performance`. `with_commands=False` keeps the summary cheap; the full
         decoded command stream is what `cmds(iface)` is for.
         """
+        from veritrace.memory import timing
+
         session = require(session_id)
+        timing_errors: list[str] = []
+        chips = timing.discover(getattr(session.config, "root", None) or session.trace_path.parent,
+                                errors=timing_errors)
+        selection = session.layout_file.load().get("memoryTiming", {})
+        catalog = {"chips": [c.to_dict() for c in chips], "timing_errors": timing_errors,
+                   "selection": selection}
         if not session.memory:
             return {
+                **catalog,
                 "interfaces": [],
                 "errors": [e for e in (session.memory_error, session.protocol_error) if e],
             }
         return {
+            **catalog,
             "interfaces": [r.to_dict(with_commands=False) for r in session.memory],
             "errors": [session.memory_error] if session.memory_error else [],
         }
+
+    @api.post("/session/{session_id}/memory/timing")
+    def memory_timing(session_id: str, body: MemoryTimingBody) -> dict[str, Any]:
+        from veritrace.memory.timing import TimingError
+
+        choice = body.model_dump(exclude_none=True, exclude={"iface"})
+        try:
+            require(session_id).set_memory_timing(body.iface, choice)
+        except TimingError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=409, detail=f"could not persist timing selection: {exc}") from exc
+        return memory(session_id)
 
     @api.get("/session/{session_id}/coverage")
     def coverage(session_id: str) -> dict[str, Any]:
@@ -758,18 +1500,19 @@ def create_app(
         structure of the code, so it is served beside the code rather than as a
         domain of its own.
         """
+        session = require(session_id)
+        machines = _machines(session)
+        return {"machines": [m.to_dict() for m in machines]}
+
+    @api.get("/session/{session_id}/fsm/{signal}")
+    def fsm_signal(session_id: str, signal: str) -> dict[str, Any]:
+        """The §10.1 per-signal FSM resource (nodes, edges and trace overlay)."""
         from veritrace.analysis import fsm as fsm_mod
 
-        session = require(session_id)
-        if session.graph is None:
-            raise HTTPException(
-                status_code=409,
-                detail="No RTL loaded. FSM extraction reads the design graph — start with --rtl.",
-            )
-        machines = fsm_mod.extract(session.graph, session.elaboration, session.store)
-        for m in machines:
-            fsm_mod.overlay(m, session.store, session.graph, session.clock)
-        return {"machines": [m.to_dict() for m in machines]}
+        machine = fsm_mod.find(_machines(require(session_id)), signal)
+        if machine is None:
+            raise HTTPException(status_code=404, detail=f"no state machine on {signal}")
+        return machine.to_dict()
 
     @api.get("/session/{session_id}/fsm/{signal}/svg")
     def fsm_svg(session_id: str, signal: str) -> HTMLResponse:
@@ -778,13 +1521,9 @@ def create_app(
         from veritrace.export import fsmsvg
 
         session = require(session_id)
-        if session.graph is None:
-            raise HTTPException(status_code=409, detail="No RTL loaded.")
-        machines = fsm_mod.extract(session.graph, session.elaboration, session.store)
-        machine = fsm_mod.find(machines, signal)
+        machine = fsm_mod.find(_machines(session), signal)
         if machine is None:
             raise HTTPException(status_code=404, detail=f"no state machine on {signal}")
-        fsm_mod.overlay(machine, session.store, session.graph, session.clock)
         name = _IDENT.sub("_", machine.signal)
         return HTMLResponse(
             fsmsvg.render(machine),
@@ -853,7 +1592,7 @@ def create_app(
                 if not isinstance(msg, dict):
                     await send(websocket, {"op": "error", "message": "expected a map"})
                     continue
-                await dispatch(websocket, session, msg)
+                await dispatch(websocket, session, msg, registry)
         except WebSocketDisconnect:
             return
 
@@ -903,10 +1642,17 @@ async def send(websocket: WebSocket, payload: dict[str, Any]) -> None:
     await websocket.send_bytes(msgpack.packb(payload, use_bin_type=True))
 
 
-async def dispatch(websocket: WebSocket, session: Session, msg: dict[str, Any]) -> None:
+async def dispatch(
+    websocket: WebSocket,
+    session: Session,
+    msg: dict[str, Any],
+    registry: SessionRegistry | None = None,
+) -> None:
     op = msg.get("op")
     if op == "wave":
         await handle_wave(websocket, session, msg)
+    elif op == "query":
+        await handle_query(websocket, session, msg, registry)
     elif op == "ping":
         await send(websocket, {"op": "pong"})
     else:
@@ -922,6 +1668,15 @@ async def handle_wave(websocket: WebSocket, session: Session, msg: dict[str, Any
     handles = msg.get("signals") or []
     if not isinstance(handles, list):
         await send(websocket, {"op": "error", "message": "signals must be a list"})
+        return
+    raw_derived = msg.get("derived") or {}
+    if not isinstance(raw_derived, dict):
+        await send(websocket, {"op": "error", "message": "derived must be a map"})
+        return
+    try:
+        derived = {int(handle): str(path) for handle, path in raw_derived.items()}
+    except (TypeError, ValueError):
+        await send(websocket, {"op": "error", "message": "derived handles must be integers"})
         return
 
     t_lo, t_hi = session.store.time_range
@@ -945,7 +1700,16 @@ async def handle_wave(websocket: WebSocket, session: Session, msg: dict[str, Any
     for i, h in enumerate(handles):
         last = i == total - 1
         try:
-            chunk = session.store.wave(int(h), t0, t1, px_width)
+            handle = int(h)
+            if handle < 0:
+                path = derived.get(handle)
+                if path is None:
+                    raise ValueError("negative handle needs a derived signal path")
+                chunk = await asyncio.to_thread(
+                    _derived_wave, session, path, t0, t1, min(px_width, MAX_PX)
+                )
+            else:
+                chunk = session.store.wave(handle, t0, t1, px_width)
         except (KeyError, ValueError, TypeError) as e:
             await send(
                 websocket,
@@ -957,7 +1721,7 @@ async def handle_wave(websocket: WebSocket, session: Session, msg: dict[str, Any
             websocket,
             {
                 "op": "wave_chunk",
-                "h": int(h),
+                "h": handle,
                 "t0": t0,
                 "t1": t1,
                 "px_width": px_width,
@@ -973,3 +1737,127 @@ async def handle_wave(websocket: WebSocket, session: Session, msg: dict[str, Any
                 websocket,
                 {"op": "progress", "phase": "wave", "pct": round(100 * (i + 1) / total)},
             )
+
+
+async def handle_query(
+    websocket: WebSocket,
+    session: Session,
+    msg: dict[str, Any],
+    registry: SessionRegistry | None = None,
+) -> None:
+    """Run VTQ without blocking the socket and stream causal nodes as built.
+
+    ``WhyTracer`` is synchronous CPU work.  Running it on the event loop made
+    the nominal streaming endpoint mute until the entire tree was finished.
+    A thread performs the analysis while a queue carries each completed node
+    back to the socket in deterministic post-order.  Non-causal commands use
+    the same dispatcher as REST and are sent as one partial result followed by
+    the mandatory completion statistics.
+    """
+    text = msg.get("vtq")
+    if not isinstance(text, str) or not text.strip():
+        await send(websocket, {"op": "error", "message": "query needs a non-empty vtq string", "done": True})
+        return
+
+    text = text.strip()
+    started = time.perf_counter()
+    if not _is_plain_why(text):
+        try:
+            pipeline = vtq.parse_pipeline(text)
+            task = asyncio.create_task(
+                asyncio.to_thread(_run_pipeline, session, pipeline, registry)
+            )
+            try:
+                result = await asyncio.wait_for(asyncio.shield(task), timeout=0.2)
+            except TimeoutError:
+                # The command has crossed P3's 200 ms boundary. Its analyses do
+                # not all expose a meaningful denominator, so report a live
+                # phase/elapsed heartbeat instead of fabricating a percentage.
+                while not task.done():
+                    await send(
+                        websocket,
+                        {
+                            "op": "progress",
+                            "phase": pipeline.name,
+                            "pct": None,
+                            "elapsed_ms": round((time.perf_counter() - started) * 1000),
+                        },
+                    )
+                    try:
+                        result = await asyncio.wait_for(asyncio.shield(task), timeout=0.5)
+                    except TimeoutError:
+                        continue
+                    break
+                else:
+                    result = await task
+        except HTTPException as e:
+            await send(websocket, {"op": "error", "message": str(e.detail), "done": True})
+            return
+        except (vtq.QueryError, KeyError, ValueError) as e:
+            await send(websocket, {"op": "error", "message": str(e), "done": True})
+            return
+        await send(websocket, {"op": "partial", "result": {"query": text, **result}})
+        await send(
+            websocket,
+            {
+                "op": "done",
+                "stats": {"ms": round((time.perf_counter() - started) * 1000, 3), "nodes": 0},
+            },
+        )
+        return
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    def observe(node: Any) -> None:
+        # Called from the worker thread. ``call_soon_threadsafe`` is the only
+        # supported way to touch an asyncio queue owned by the server loop.
+        loop.call_soon_threadsafe(queue.put_nowait, node.to_dict())
+
+    def analyse() -> dict[str, Any]:
+        signal, at, headline = _question(session, text)
+        result = session.why(signal, at, on_node=observe)
+        return {"query": text, "signal": signal, "time": at, "headline": headline, **result.to_dict()}
+
+    task = asyncio.create_task(asyncio.to_thread(analyse))
+    nodes = 0
+    next_progress = started + 0.2
+    try:
+        while not task.done() or not queue.empty():
+            try:
+                node = await asyncio.wait_for(queue.get(), timeout=0.02)
+            except TimeoutError:
+                now = time.perf_counter()
+                if now >= next_progress:
+                    await send(
+                        websocket,
+                        {
+                            "op": "progress",
+                            "phase": "causal",
+                            "pct": None,
+                            "nodes": nodes,
+                            "elapsed_ms": round((now - started) * 1000),
+                        },
+                    )
+                    next_progress = now + 0.5
+                continue
+            nodes += 1
+            await send(websocket, {"op": "partial", "node": node})
+        # Propagate errors only after draining nodes already completed.  They
+        # remain valid progress even if a later branch failed.
+        result = await task
+    except HTTPException as e:
+        await send(websocket, {"op": "error", "message": str(e.detail), "done": True})
+        return
+    except (vtq.QueryError, KeyError, ValueError) as e:
+        await send(websocket, {"op": "error", "message": str(e), "done": True})
+        return
+
+    await send(
+        websocket,
+        {
+            "op": "done",
+            "result": result,
+            "stats": {"ms": round((time.perf_counter() - started) * 1000, 3), "nodes": nodes},
+        },
+    )

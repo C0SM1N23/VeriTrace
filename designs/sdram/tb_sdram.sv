@@ -1,11 +1,10 @@
 `timescale 1ns / 1ps
 //
 // The §8.20 test design: a minimal SDR SDRAM controller driving a real JEDEC
-// command bus, with four timing violations injected — one from each category
-// Prompt 11's acceptance criterion names.
+// command bus, with three timing violations and a legal four-ACTIVATE burst.
 //
 //     iverilog -g2012 -o sim.vvp *.sv                  && vvp sim.vvp
-//         -> dump.vcd     tRCD, tRP, tRFC and tFAW each violated once
+//         -> dump.vcd     tRCD, tRP, tRFC each violated once; tFAW holds
 //
 //     iverilog -g2012 -DNO_VIOLATION -o sim_ok.vvp *.sv && vvp sim_ok.vvp
 //         -> dump_ok.vcd  the same RTL, conformant

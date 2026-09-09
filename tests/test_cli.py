@@ -56,6 +56,7 @@ def test_init_fails_without_rtl_files(tmp_path, monkeypatch):
 # --- the analysis commands (§13, §13.3, §8.10b) ----------------------------
 
 import shutil
+import time
 from pathlib import Path
 
 import pytest
@@ -69,7 +70,10 @@ DESIGNS = Path(__file__).resolve().parents[1] / "designs"
 def buggy(tmp_path_factory):
     """A copy of the buggy FIFO with its store built, so the CLI has a target."""
     work = tmp_path_factory.mktemp("cli-buggy")
-    shutil.copytree(DESIGNS / "fifo_buggy", work / "fifo_buggy")
+    # These tests deliberately compare trace-only and explicit --rtl paths.
+    # A developer's generated config would auto-load RTL and invalidate that premise.
+    shutil.copytree(DESIGNS / "fifo_buggy", work / "fifo_buggy",
+                    ignore=shutil.ignore_patterns(".veritrace.toml", "*.session.json"))
     design = work / "fifo_buggy"
     convert(str(design / "dump.vcd"), str(design / "dump.vtx"))
     return design
@@ -100,6 +104,20 @@ def test_why_json_is_machine_readable(buggy):
     body = json.loads(r.output)
     assert body["root"]["signal"] == "tb_fifo_buggy.dut.full"
     assert body["stats"]["nodes"] > 1
+
+
+def test_why_not_is_a_real_cli_counterfactual(buggy):
+    import json
+
+    r = run([
+        "why-not", str(buggy / "dump.vtx"),
+        "tb_fifo_buggy.dut.full == 0", "--rtl", str(buggy), "--json",
+    ])
+    assert r.exit_code == 0, r.output
+    body = json.loads(r.output)
+    assert body["expected"] == "0"
+    assert body["root"]["kind"] == "counterfactual"
+    assert body["root"]["children"]
 
 
 def test_why_needs_rtl_and_says_so(buggy):
@@ -251,6 +269,18 @@ def test_every_reporting_command_can_be_scripted():
     # And the exemption list stays honest: a name that no longer exists in it
     # is a stale entry that would hide a real gap.
     assert NOT_A_REPORT <= set(cli.list_commands(ctx))
+
+
+def test_documented_orchestration_option_spellings_are_real():
+    """§9.2's command table is executable documentation, not pseudocode."""
+    synth_help = run(["synth-diff", "--help"])
+    assert synth_help.exit_code == 0 and "--synth" in synth_help.output
+
+    report = DESIGNS / "axi_lite" / "timing_summary.rpt"
+    timed = run(["timing", "--report", str(report), "--json"])
+    assert timed.exit_code == 0, timed.output
+    body = json.loads(timed.output)
+    assert body["paths"] and body["wns"] == -0.417
 
 
 def _json_out(result):
@@ -419,6 +449,51 @@ def test_check_fail_on_is_the_ci_gate(buggy):
     assert ok.exit_code == 0
     gated = run(["check", str(buggy / "dump.vtx"), "--rtl", str(buggy), "--fail-on", "lint"])
     assert gated.exit_code == 1
+
+
+def test_check_static_runs_the_real_graph_checks_without_a_dump():
+    """§8.10c's code-only entry point must not consult or invent a trace."""
+    result = run(["check", "--static", "--rtl", str(DESIGNS / "checks"), "--json"])
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.output)
+    names = {finding["check"] for finding in body["findings"]}
+    assert {"inferred_latch", "cdc_no_sync", "parameter_default"} <= names
+    assert body["correlation"] is None
+    assert body["skipped"]["stuck"] == "static mode has no waveform evidence"
+
+
+def test_check_static_is_a_ci_gate_and_rejects_a_trace(buggy):
+    gated = run(
+        [
+            "check",
+            "--static",
+            "--rtl",
+            str(DESIGNS / "checks"),
+            "--fail-on",
+            "lint",
+        ]
+    )
+    assert gated.exit_code == 1
+
+    mixed = run(
+        [
+            "check",
+            str(buggy / "dump.vtx"),
+            "--static",
+            "--rtl",
+            str(DESIGNS / "checks"),
+        ]
+    )
+    assert mixed.exit_code != 0
+    assert "does not take a trace" in mixed.output
+
+
+def test_check_static_cannot_report_clean_when_rtl_does_not_compile(tmp_path):
+    broken = tmp_path / "broken.sv"
+    broken.write_text("module broken(input logic a) assign nope = ; endmodule")
+    result = run(["check", "--static", "--rtl", str(broken)])
+    assert result.exit_code != 0
+    assert "RTL elaboration" in result.output
 
 
 def test_probes_needs_only_the_graph(buggy):
@@ -660,8 +735,9 @@ def test_memory_reports_every_injected_violation(sdram):
     r = run(["memory", str(sdram / "dump.vtx")])
     assert r.exit_code == 0, r.output
     assert "mt48lc16m16a2" in r.output and "4 banks" in r.output
-    for constraint in ("tRCD", "tRP", "tRFC", "tFAW"):
+    for constraint in ("tRCD", "tRP", "tRFC"):
         assert f"! {constraint} violated 1 time(s)" in r.output, constraint
+    assert "! tFAW" not in r.output  # The fourth ACTIVATE is permitted.
     # §8.20's report names both commands and the required minimum.
     assert "ACTIVATE@c8 -> READ@c9" in r.output
     assert "min 2" in r.output
@@ -808,7 +884,14 @@ def test_the_rest_api_accepts_a_raw_dump(tmp_path):
     with TestClient(create_app()) as c:
         r = c.post("/session", json={"trace_path": str(raw)})
         assert r.status_code == 200, r.text
-        assert r.json()["n_signals"] > 0
+        body = r.json()
+        sid = body["session_id"]
+        deadline = time.monotonic() + 5
+        while body["phase"] != "ready" and time.monotonic() < deadline:
+            time.sleep(0.01)
+            body = c.get(f"/session/{sid}/status").json()
+        assert body["phase"] == "ready", body
+        assert body["n_signals"] > 0
 
 
 # --- §4.3 config precedence -------------------------------------------------

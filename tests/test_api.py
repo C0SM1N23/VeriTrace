@@ -8,18 +8,22 @@ on the wire.
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import shutil
+import threading
+import time
 from pathlib import Path
 
 import msgpack
 import pytest
 from fastapi.testclient import TestClient
 
-from conftest import SMALL_VCD, make_vtx
-from veritrace import convert
+from conftest import SMALL_VCD, design_store, make_vtx
+from veritrace import convert, regress
 from veritrace.api import create_app
-from veritrace.api.sessions import Session, SessionRegistry, session_id_for
+from veritrace.api.sessions import LayoutFile, Session, SessionRegistry, session_id_for
 
 DESIGNS = Path(__file__).resolve().parents[1] / "designs"
 
@@ -56,11 +60,66 @@ def test_create_session(client, tmp_path):
     r = client.post("/session", json={"trace_path": str(other)})
     assert r.status_code == 200
     body = r.json()
-    assert body["session_id"]
+    sid = body["session_id"]
+    assert sid
+    deadline = time.monotonic() + 5
+    while body["phase"] != "ready" and time.monotonic() < deadline:
+        time.sleep(0.01)
+        body = client.get(f"/session/{sid}/status").json()
+    assert body["phase"] == "ready", body
     # tb.clk, tb.data, tb.dut.clk, tb.dut.state — clk is aliased into dut, so it
     # is two signals over one stream.
     assert body["n_signals"] == 4
     assert body["phase"] == "ready"
+
+
+def test_create_session_exposes_real_progress_before_it_is_ready(client, tmp_path, monkeypatch):
+    other = make_vtx(tmp_path, name="slow")
+    gate = threading.Event()
+    original = Session.open.__func__
+
+    def slow_open(cls, trace_path, rtl_paths=None, top=None, progress=None):
+        if progress:
+            progress("converting", 0.1)
+        gate.wait(timeout=5)
+        return original(cls, trace_path, rtl_paths, top, progress)
+
+    monkeypatch.setattr(Session, "open", classmethod(slow_open))
+    posted = client.post("/session", json={"trace_path": str(other)}).json()
+    sid = posted["session_id"]
+    status = client.get(f"/session/{sid}/status").json()
+    assert status["phase"] in {"queued", "converting"}
+    assert status["progress"] < 1.0
+    blocked = client.get(f"/session/{sid}/signals")
+    assert blocked.status_code == 409
+    assert "still" in blocked.json()["detail"]
+
+    gate.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        status = client.get(f"/session/{sid}/status").json()
+        if status["phase"] == "ready":
+            break
+        time.sleep(0.01)
+    assert status["phase"] == "ready", status
+    assert status["progress"] == 1.0
+
+
+def test_background_session_failure_cannot_become_ready(client, tmp_path):
+    broken = tmp_path / "broken.vcd"
+    broken.write_text("this is not a waveform", encoding="utf-8")
+    posted = client.post("/session", json={"trace_path": str(broken)}).json()
+    sid = posted["session_id"]
+    deadline = time.monotonic() + 5
+    status = posted
+    while time.monotonic() < deadline:
+        status = client.get(f"/session/{sid}/status").json()
+        if status["phase"] == "error":
+            break
+        time.sleep(0.01)
+    assert status["phase"] == "error", status
+    assert status["error"]
+    assert client.get(f"/session/{sid}/signals").status_code == 409
 
 
 def test_create_session_is_idempotent_per_trace(client, vtx, session_id):
@@ -83,6 +142,7 @@ def test_status(client, session_id):
     assert body["t0"] == 0
     assert body["t1"] == 30
     assert body["timescale"] == "1ns"
+    assert body["capture"] is False
 
 
 def test_unknown_session_is_404(client):
@@ -122,6 +182,19 @@ def test_signal_search(client, session_id):
     assert r["count"] == 0
 
 
+def test_exact_values_endpoint_reads_the_store_not_a_wave_bucket(client, session_id):
+    data = client.get(f"/session/{session_id}/signals", params={"q": "tb.data"}).json()["signals"][0]
+    got = client.post(
+        f"/session/{session_id}/values",
+        json={"handles": [data["handle"]], "time": 15},
+    )
+    assert got.status_code == 200, got.text
+    assert got.json() == {
+        "time": 15,
+        "values": [{"handle": data["handle"], "value": "10100000"}],
+    }
+
+
 def test_search_is_deterministic(client, session_id):
     first = client.get(f"/session/{session_id}/signals", params={"q": "c"}).json()
     for _ in range(3):
@@ -132,6 +205,37 @@ def test_source_returns_404_for_now(client, session_id):
     r = client.get(f"/session/{session_id}/source/rtl/fifo.sv")
     assert r.status_code == 404
     assert "RTL" in r.json()["detail"]
+
+
+def test_source_keeps_duplicate_basenames_and_included_headers_distinct(vtx, tmp_path):
+    a, b = tmp_path / "a" / "part.sv", tmp_path / "b" / "part.sv"
+    for path, module, signal in [(a, "first", "left"), (b, "second", "right")]:
+        path.parent.mkdir()
+        path.write_text(f"module {module};\nlogic {signal};\nassign {signal} = 1'b1;\nendmodule\n")
+    header = tmp_path / "inside.vh"
+    header.write_text("logic from_header;\n")
+    top = tmp_path / "top.sv"
+    top.write_text('module top;\n`include "inside.vh"\nfirst x(); second y();\nendmodule\n')
+    with TestClient(create_app(default_trace=vtx, rtl=[str(p) for p in [top, a, b]],
+                               top="top")) as c:
+        sid = c.get("/").json()["default_session"]
+        graph = c.app.state.registry.get(sid).graph
+        assert graph.get("top.x.left").decl_loc.file == a.resolve().as_posix()
+        assert graph.get("top.y.right").decl_loc.file == b.resolve().as_posix()
+        assert c.get(f"/session/{sid}/source/part.sv").status_code == 409
+        for path, signal in [(a, "top.x.left"), (b, "top.y.right")]:
+            response = c.get(f"/session/{sid}/source/{path.resolve().as_posix()}")
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["file"] == path.resolve().as_posix()
+            assert body["text"] == path.read_text()
+            assert {s["path"] for rows in body["signals"].values() for s in rows} == {signal}
+        included = c.get(f"/session/{sid}/source/inside.vh")
+        assert included.status_code == 200, included.text
+        assert included.json()["signals"]["1"][0]["path"] == "top.from_header"
+        outside = tmp_path / "not_loaded.sv"
+        outside.write_text("not loaded by slang")
+        assert c.get(f"/session/{sid}/source/{outside.as_posix()}").status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -154,12 +258,48 @@ def test_layout_round_trips(client, session_id):
         "bookmarks": [{"t": 20, "label": "first write"}],
         "cursors": [10],
         "zoom": {"t0": 0, "t1": 30},
+        "queryHistory": ["find(clk)", "why(tb.dut.state @ 20)"],
+        "savedQueries": {"clock": "find(clk)"},
     }
     r = client.put(f"/session/{session_id}/layout", json=layout)
     assert r.status_code == 200
     got = client.get(f"/session/{session_id}/layout").json()
     for k, v in layout.items():
         assert got[k] == v
+
+
+def test_concurrent_layout_saves_are_serialized(tmp_path, monkeypatch):
+    """Parallel browser PUTs cannot collide on the atomic-save temporary file."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    target = tmp_path / "dump.vtx.session.json"
+    layout_file = LayoutFile(target)
+    original = Path.write_text
+    active = 0
+    maximum = 0
+    guard = threading.Lock()
+
+    def observed_write(path, *args, **kwargs):
+        nonlocal active, maximum
+        if path == target.with_suffix(target.suffix + ".tmp"):
+            with guard:
+                active += 1
+                maximum = max(maximum, active)
+            time.sleep(0.01)
+            try:
+                return original(path, *args, **kwargs)
+            finally:
+                with guard:
+                    active -= 1
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", observed_write)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        saved = list(pool.map(lambda n: layout_file.save({"signals": [n]}), range(16)))
+
+    assert len(saved) == 16
+    assert maximum == 1
+    assert json.loads(target.read_text(encoding="utf-8"))["signals"][0] in range(16)
 
 
 def test_layout_is_written_beside_the_store(client, session_id, vtx):
@@ -189,6 +329,45 @@ def test_layout_survives_a_server_restart(vtx):
         assert got["zoom"] == {"t0": 5, "t1": 25}
 
 
+def test_configured_row_height_and_radix_are_real_layout_defaults(tmp_path, monkeypatch):
+    vtx = make_vtx(tmp_path)
+    (tmp_path / ".veritrace.toml").write_text(
+        '[ui]\nrow_height = "comfortable"\n\n'
+        '[ui.radix]\n"*state" = "enum"\n"*data" = "dec"\n'
+    )
+    monkeypatch.chdir(tmp_path)
+    with TestClient(create_app(default_trace=vtx)) as c:
+        sid = c.get("/").json()["default_session"]
+        layout = c.get(f"/session/{sid}/layout").json()
+        assert layout["rowH"] == 28
+        assert layout["radix"] == {"tb.data": "dec", "tb.dut.state": "enum"}
+
+
+def test_server_elaboration_receives_config_include_dirs_and_defines(tmp_path, monkeypatch):
+    vtx = make_vtx(tmp_path)
+    rtl = tmp_path / "rtl"
+    inc = tmp_path / "include"
+    rtl.mkdir()
+    inc.mkdir()
+    (inc / "width.svh").write_text("`define VT_WIDTH 8\n")
+    source = rtl / "tb.sv"
+    source.write_text(
+        '`include "width.svh"\nmodule tb;\nlogic [`VT_WIDTH-1:0] data;\n'
+        "`ifdef FEATURE\nlogic enabled;\n`endif\nendmodule\n"
+    )
+    (tmp_path / ".veritrace.toml").write_text(
+        '[design]\ntop = "tb"\nincdirs = ["include"]\n\n'
+        '[design.defines]\nFEATURE = 1\n'
+    )
+    monkeypatch.chdir(tmp_path)
+    with TestClient(create_app(default_trace=vtx, rtl=[str(source)])) as c:
+        sid = c.get("/").json()["default_session"]
+        session = c.app.state.registry.get(sid)
+        assert session.graph is not None, session.rtl_error
+        assert session.graph.get("tb.data").width == 8
+        assert session.graph.get("tb.enabled") is not None
+
+
 def test_corrupt_layout_file_does_not_break_the_session(vtx):
     sidecar = vtx.with_name(vtx.name + ".session.json")
     sidecar.write_text("{ this is not json")
@@ -196,11 +375,188 @@ def test_corrupt_layout_file_does_not_break_the_session(vtx):
         sid = c.get("/").json()["default_session"]
         # Falls back to defaults rather than refusing to open the trace (P7).
         assert c.get(f"/session/{sid}/layout").json()["signals"] == []
+        status = c.get(f"/session/{sid}/status").json()
+        assert "could not read saved layout" in status["layout_error"]
+        # Merely opening/reading must not replace the bytes that might be
+        # repaired by hand.
+        assert sidecar.read_text() == "{ this is not json"
+        c.put(f"/session/{sid}/layout", json={"signals": [0]})
+        assert json.loads(sidecar.read_text())["signals"] == [0]
+        backups = list(sidecar.parent.glob(sidecar.name + ".corrupt*"))
+        assert len(backups) == 1 and backups[0].read_text() == "{ this is not json"
 
 
 def test_session_id_is_stable_and_path_based(tmp_path, vtx):
     assert session_id_for(vtx) == session_id_for(vtx)
     assert session_id_for(vtx) != session_id_for(tmp_path)
+
+
+def test_reopening_same_trace_with_empty_rtl_clears_dependent_state(tmp_path):
+    design = tmp_path / "rtl"
+    design.mkdir()
+    (design / "tb.sv").write_text(
+        "module tb; logic clk; logic [7:0] data; dut u(.clk(clk)); endmodule\n"
+        "module dut(input logic clk); logic [3:0] state; always_ff @(posedge clk) state <= 1; endmodule\n"
+    )
+    trace = make_vtx(tmp_path)
+    registry = SessionRegistry()
+    loaded = registry.open(trace, [str(design)], "tb")
+    assert loaded.graph is not None
+    loaded._why[("stale", 0)] = object()  # type: ignore[assignment]
+    loaded._why_not[("stale", 0, "1")] = object()
+
+    waveform_only = registry.open(trace, [], None)
+    assert waveform_only is loaded
+    assert waveform_only.graph is None
+    assert waveform_only.rtl_paths == []
+    assert waveform_only._why == {}
+    assert waveform_only._why_not == {}
+    assert waveform_only.status()["has_rtl"] is False
+
+
+def test_configured_rtl_is_used_on_first_open_but_explicit_empty_still_disables_it(tmp_path, monkeypatch):
+    design = tmp_path / "tb.sv"
+    design.write_text("module tb; logic clk; logic [7:0] data; endmodule\n")
+    (tmp_path / ".veritrace.toml").write_text('[design]\ntop="tb"\nrtl=["tb.sv"]\n')
+    trace = make_vtx(tmp_path)
+    caller = tmp_path / "elsewhere"
+    caller.mkdir()
+    monkeypatch.chdir(caller)
+    for explicit in (None, []):
+        with TestClient(create_app(default_trace=trace, rtl=explicit)) as client:
+            sid = client.get("/").json()["default_session"]
+            status = client.get(f"/session/{sid}/status").json()
+            assert status["has_rtl"] is (explicit is None), status
+            assert not status["rtl_error"]
+    with TestClient(create_app()) as client:
+        response = client.post("/session", json={"trace_path": str(trace)})
+        sid = response.json()["session_id"]
+        status = _wait_session_ready(client, sid)
+        assert status["has_rtl"] and status["top"] == "tb", status
+        client.post("/session", json={"trace_path": str(trace), "rtl_paths": []})
+        assert not _wait_session_ready(client, sid)["has_rtl"]
+
+
+def test_reopening_replaces_a_session_when_store_provenance_changes(vtx):
+    registry = SessionRegistry()
+    first = registry.open(vtx)
+    meta_path = vtx / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["source_sha256"] = "f" * 64
+    meta_path.write_text(json.dumps(meta))
+
+    second = registry.open(vtx)
+    assert second is not first
+    assert second.session_id == first.session_id
+    assert second.store.source_sha256 == "f" * 64
+
+
+def _wait_session_ready(client, sid):
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        status = client.get(f"/session/{sid}/status").json()
+        assert status.get("phase") != "error", status
+        if status.get("phase") == "ready":
+            return status
+        time.sleep(0.01)
+    pytest.fail(f"session did not become ready: {status}")
+
+
+def test_post_session_reopens_changed_top_and_rtl_in_production(tmp_path):
+    rtl = tmp_path / "tops.sv"
+    rtl.write_text("module tb; logic clk; endmodule\nmodule alternate; logic other; endmodule\n")
+    trace = make_vtx(tmp_path)
+    with TestClient(create_app(default_trace=trace, rtl=[str(rtl)], top="tb")) as c:
+        sid = c.get("/").json()["default_session"]
+        r = c.post("/session", json={"trace_path": str(trace), "top": "alternate"})
+        assert r.status_code == 200 and r.json()["session_id"] == sid
+        _wait_session_ready(c, sid)
+        selected = c.app.state.registry.get(sid)
+        assert selected.top == "alternate"
+        assert selected.graph.get("alternate.other") is not None
+        assert selected.graph.get("tb.clk") is None
+
+        c.post("/session", json={"trace_path": str(trace), "rtl_paths": []})
+        status = _wait_session_ready(c, sid)
+        assert status["has_rtl"] is False
+
+
+def test_post_session_rerun_uses_new_waveform_and_preserves_layout(tmp_path):
+    raw = tmp_path / "rerun.vcd"
+    raw.write_text(SMALL_VCD)
+    with TestClient(create_app(default_trace=raw)) as c:
+        sid = c.get("/").json()["default_session"]
+        first = c.app.state.registry.get(sid)
+        c.put(f"/session/{sid}/layout", json={"signals": [1], "query": "find(data)"})
+        # The old native store stays open, exactly as when a user reruns while
+        # the UI still has the earlier simulation loaded on Windows.
+        raw.write_text(SMALL_VCD.replace("#30", "#40"))
+        posted = c.post("/session", json={"trace_path": str(raw)})
+        assert posted.json()["session_id"] == sid
+        status = _wait_session_ready(c, sid)
+        assert status["t1"] == 40
+        second = c.app.state.registry.get(sid)
+        assert first.store.time_range[1] == 30
+        assert second.trace_path != first.trace_path
+        assert c.get(f"/session/{sid}/layout").json()["query"] == "find(data)"
+
+
+def test_session_can_retry_a_failed_open_after_the_dump_is_repaired(tmp_path):
+    raw = tmp_path / "repair.vcd"
+    raw.write_text("broken waveform")
+    with TestClient(create_app()) as c:
+        sid = c.post("/session", json={"trace_path": str(raw)}).json()["session_id"]
+        deadline = time.monotonic() + 5
+        while c.get(f"/session/{sid}/status").json()["phase"] != "error":
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        raw.write_text(SMALL_VCD)
+        c.post("/session", json={"trace_path": str(raw)})
+        assert _wait_session_ready(c, sid)["n_signals"] == 4
+
+
+def test_cached_session_keeps_bandwidth_events_and_export(tmp_path):
+    raw = tmp_path / "bus.vcd"
+    shutil.copy2(DESIGNS / "deadlock" / "dump_ok.vcd", raw)
+    responses = []
+    for _ in range(2):
+        with TestClient(create_app(default_trace=raw)) as c:
+            sid = c.get("/").json()["default_session"]
+            perf = c.get(f"/session/{sid}/performance").json()
+            assert all(row["bytes_moved"] > 0 for row in perf["interfaces"])
+            iface = perf["interfaces"][0]["iface"]
+            exported = c.post(f"/session/{sid}/export", json={"kind": "csv", "target": iface})
+            assert exported.status_code == 200
+            rows = list(csv.DictReader(io.StringIO(exported.text)))
+            assert all(int(row["n_beats"]) > 0 for row in rows)
+            responses.append((perf["interfaces"], rows))
+    assert responses[0] == responses[1]
+
+
+def test_performance_window_recalculates_all_metrics_without_changing_the_run(tmp_path):
+    raw = tmp_path / "bus.vcd"
+    shutil.copy2(DESIGNS / "deadlock" / "dump_ok.vcd", raw)
+    with TestClient(create_app(default_trace=raw)) as c:
+        sid = c.get("/").json()["default_session"]
+        session = c.app.state.registry.get(sid)
+        full = c.get(f"/session/{sid}/performance").json()
+        ex = session.protocol.extractions[0]
+        transfer_channels = ex.interface.pack.perf.channels(ex.interface.pack)
+        at = next(e.time for t in ex.transactions for e in t.events if e.channel in transfer_channels)
+        response = c.get(f"/session/{sid}/performance", params={"t0": at, "t1": at})
+        assert response.status_code == 200, response.text
+        selected = response.json()
+        assert selected["window"] == {"t0": at, "t1": at}
+        assert sum(i["bytes_moved"] for i in selected["interfaces"]) > 0
+        for before, after in zip(full["interfaces"], selected["interfaces"], strict=True):
+            assert after["stalls"]["total"] == 1
+            assert after["bytes_moved"] < before["bytes_moved"]
+            assert after["latency"]["n"] < before["latency"]["n"]
+            assert len(after["outstanding"]["points"]) == 1
+        assert selected["fairness"] != full["fairness"]
+        assert c.get(f"/session/{sid}/performance").json() == full
+        assert c.get(f"/session/{sid}/performance", params={"t0": 10}).status_code == 400
+        assert c.get(f"/session/{sid}/performance", params={"t0": 20, "t1": 10}).status_code == 400
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +582,66 @@ def test_ws_ping(client, session_id):
     with client.websocket_connect(f"/session/{session_id}/ws") as ws:
         ws.send_bytes(msgpack.packb({"op": "ping"}))
         assert msgpack.unpackb(ws.receive_bytes(), raw=False)["op"] == "pong"
+
+
+def test_ws_runs_generic_queries_and_finishes(client, session_id):
+    with client.websocket_connect(f"/session/{session_id}/ws") as ws:
+        ws.send_bytes(msgpack.packb({"op": "query", "vtq": "find(state)"}))
+        partial = msgpack.unpackb(ws.receive_bytes(), raw=False)
+        done = msgpack.unpackb(ws.receive_bytes(), raw=False)
+    assert partial["op"] == "partial"
+    assert partial["result"]["signals"][0]["path"] == "tb.dut.state"
+    assert done["op"] == "done" and done["stats"]["nodes"] == 0
+
+
+def test_ws_reports_progress_when_a_generic_query_crosses_200ms(
+    client, session_id, monkeypatch
+):
+    import veritrace.api.app as app_mod
+
+    original = app_mod._run_pipeline
+
+    def slow(session, pipeline, registry=None):
+        time.sleep(0.3)
+        return original(session, pipeline, registry)
+
+    monkeypatch.setattr(app_mod, "_run_pipeline", slow)
+    messages = []
+    with client.websocket_connect(f"/session/{session_id}/ws") as ws:
+        ws.send_bytes(msgpack.packb({"op": "query", "vtq": "find(state)"}))
+        while True:
+            message = msgpack.unpackb(ws.receive_bytes(), raw=False)
+            messages.append(message)
+            if message["op"] == "done":
+                break
+    ops = [message["op"] for message in messages]
+    assert "progress" in ops
+    assert ops.index("progress") < ops.index("partial")
+    progress = next(message for message in messages if message["op"] == "progress")
+    assert progress["phase"] == "find"
+    # Verify real progress and its ordering, not Windows timer granularity.
+    assert progress["elapsed_ms"] > 0
+    assert messages[-1]["stats"]["ms"] >= progress["elapsed_ms"]
+
+
+def test_ws_causal_query_streams_nodes_before_done(checks_client):
+    client, sid = checks_client
+    with client.websocket_connect(f"/session/{sid}/ws") as ws:
+        ws.send_bytes(msgpack.packb({"op": "query", "vtq": "why(u_dut.lock_r)"}))
+        partials = []
+        while True:
+            msg = msgpack.unpackb(ws.receive_bytes(), raw=False)
+            if msg["op"] == "partial":
+                partials.append(msg["node"])
+            elif msg["op"] == "done":
+                done = msg
+                break
+            elif msg["op"] == "error":
+                pytest.fail(msg)
+    assert partials
+    assert partials[-1]["signal"].endswith("u_dut.lock_r")
+    assert done["stats"]["nodes"] == len(partials)
+    assert done["result"]["root"]["signal"].endswith("u_dut.lock_r")
 
 
 def test_ws_streams_wave_chunks(client, session_id):
@@ -283,6 +699,123 @@ def test_ws_bad_handle_does_not_kill_the_connection(client, session_id):
         # Still usable afterwards.
         ws.send_bytes(msgpack.packb({"op": "ping"}))
         assert msgpack.unpackb(ws.receive_bytes(), raw=False)["op"] == "pong"
+
+
+def test_undumped_signal_is_reconstructed_over_the_real_wave_window(tmp_path):
+    """§7.3 is a waveform, not a single value copied from a causal card.
+
+    ``tmp`` is deliberately absent from the dump while both operands are real
+    trace streams. The WebSocket must evaluate the combinational RTL expression
+    at their transition times, label the local negative handle, and obey the
+    same pixel bound as an observed signal.
+    """
+    rtl = tmp_path / "top.sv"
+    rtl.write_text(
+        "module top(input logic a, b, output logic y);\n"
+        "  logic tmp;\n"
+        "  assign tmp = a & b;\n"
+        "  assign y = tmp;\n"
+        "endmodule\n",
+        encoding="utf-8",
+    )
+    vcd = tmp_path / "dump.vcd"
+    vcd.write_text(
+        "$timescale 1ns $end\n"
+        "$scope module top $end\n"
+        "$var wire 1 ! a $end\n"
+        "$var wire 1 \" b $end\n"
+        "$var wire 1 # y $end\n"
+        "$upscope $end\n$enddefinitions $end\n"
+        "#0\n0!\n0\"\n0#\n"
+        "#10\n1!\n"
+        "#20\n1\"\n1#\n"
+        "#30\n0!\n0#\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "dump.vtx"
+    convert(str(vcd), str(out))
+    app = create_app(default_trace=out, rtl=[str(rtl)], top="top")
+    with TestClient(app) as c:
+        sid = c.get("/").json()["default_session"]
+        session = app.state.registry.get(sid)
+        derived = session.graph.get("top.tmp")
+        assert derived is not None and derived.is_reconstructible
+        handle = -17
+
+        exact = ws_roundtrip(
+            c,
+            sid,
+            {
+                "op": "wave",
+                "signals": [handle],
+                "derived": {str(handle): derived.path},
+                "t0": 0,
+                "t1": 31,
+                "px_width": 100,
+            },
+        )[0]
+        assert exact["h"] == handle
+        assert exact["mode"] == "exact"
+        assert exact["initial"] == "0"
+        assert exact["transitions"] == [[20, "1"], [30, "0"]]
+
+        reduced = ws_roundtrip(
+            c,
+            sid,
+            {
+                "op": "wave",
+                "signals": [handle],
+                "derived": {str(handle): derived.path},
+                "t0": 0,
+                "t1": 31,
+                "px_width": 1,
+            },
+        )[0]
+        assert reduced["mode"] == "minmax"
+        assert len(reduced["transitions"]) <= 1
+
+        at = c.post(
+            f"/session/{sid}/values",
+            json={"handles": [handle], "time": 25, "derived": {handle: derived.path}},
+        )
+        assert at.status_code == 200, at.text
+        assert at.json()["values"][0]["value"] == "1"
+
+
+def test_undumped_memory_is_not_fabricated_as_a_derived_wave():
+    """§5.6: current write data is not the historical contents of an array."""
+    app = create_app(
+        default_trace=design_store("lanes"), rtl=[str(DESIGNS / "lanes")], top="tb_lanes"
+    )
+    with TestClient(app) as c:
+        sid = c.get("/").json()["default_session"]
+        session = app.state.registry.get(sid)
+        memory = next(sig for sig in session.graph if sig.kind.value == "mem")
+        assert not memory.is_reconstructible
+        with c.websocket_connect(f"/session/{sid}/ws") as ws:
+            ws.send_bytes(
+                msgpack.packb(
+                    {
+                        "op": "wave",
+                        "signals": [-17],
+                        "derived": {"-17": memory.path},
+                        "t0": 0,
+                        "t1": 300_000,
+                        "px_width": 100,
+                    }
+                )
+            )
+            message = msgpack.unpackb(ws.receive_bytes(), raw=False)
+        assert message["op"] == "error"
+        assert "not an undumped reconstructible signal" in message["message"]
+
+
+def test_negative_wave_handle_without_a_derived_path_is_rejected(client, session_id):
+    with client.websocket_connect(f"/session/{session_id}/ws") as ws:
+        ws.send_bytes(msgpack.packb({"op": "wave", "signals": [-1], "px_width": 10}))
+        message = msgpack.unpackb(ws.receive_bytes(), raw=False)
+        assert message["op"] == "error"
+        assert "derived signal path" in message["message"]
 
 
 def test_ws_unknown_session(client):
@@ -547,15 +1080,30 @@ def test_the_query_bar_runs_the_rest_of_the_vtq_table(checks_client):
     assert spans and spans[0]["from"] < spans[-1]["to"]
 
 
-def test_a_vtq_command_that_would_be_accepted_and_ignored_is_refused(checks_client):
-    """`stuck(after=...)` is in §10.1's table and the detector has no such
-    knob — it always measures back from the end of the run. Accepting the
-    argument and quietly dropping it is the one answer worse than refusing."""
+def test_stuck_after_really_narrows_the_observation_window(checks_client):
+    """Both arguments in §9.2 must affect the detector, not merely parse."""
     client, sid = checks_client
-    r = client.post(f"/session/{sid}/query", json={"vtq": "stuck(after=c100)"})
-    assert r.status_code == 400
-    assert "accepted and ignored" in r.json()["detail"]
-    assert "min_duration" in r.json()["detail"]
+    whole = client.post(
+        f"/session/{sid}/query", json={"vtq": "stuck(min_duration=c50)"}
+    ).json()
+    narrowed = client.post(
+        f"/session/{sid}/query",
+        json={"vtq": "stuck(after=c100, min_duration=c50)"},
+    )
+    assert narrowed.status_code == 200, narrowed.text
+    body = narrowed.json()
+    assert body["after"] > 0
+    assert len(body["findings"]) <= len(whole["findings"])
+
+    # There are fewer than 700 cycles in the fixture. A late 100-cycle window
+    # cannot produce a finding inherited from before its requested start.
+    late = client.post(
+        f"/session/{sid}/query",
+        json={"vtq": "stuck(after=c600, min_duration=c100)"},
+    )
+    assert late.status_code == 200, late.text
+    assert late.json()["findings"] == []
+    assert "requested window" in late.json()["unreachable"]
 
 
 def test_a_vtq_command_that_needs_rtl_says_which_half_is_missing(client, session_id):
@@ -762,6 +1310,14 @@ def test_a_bad_transaction_query_is_a_400_with_the_reason(arb):
     assert "detected: m0, m1, slv" in r.json()["detail"]
 
 
+def test_global_query_endpoint_runs_transaction_commands_too(arb):
+    client, sid = arb
+    r = client.post(f"/session/{sid}/query", json={"vtq": "txn(m0) | slowest(2)"})
+    assert r.status_code == 200, r.text
+    assert r.json()["kind"] == "txn"
+    assert r.json()["n"] == 2
+
+
 def test_why_at_transaction_level_crosses_into_the_other_master(arb):
     """§8.16, end to end over the API."""
     client, sid = arb
@@ -841,6 +1397,88 @@ def test_performance_endpoint_carries_the_whole_tab(arb):
     assert body["errors"] == []
 
 
+def test_transaction_exports_are_the_real_csv_and_parquet_tables(arb, tmp_path):
+    """TAB 8 exports the production extraction, not a browser-side mock."""
+    from veritrace._native import read_txn_table
+
+    client, sid = arb
+    csv_response = client.post(
+        f"/session/{sid}/export", json={"kind": "csv", "target": "txn(m0)"}
+    )
+    assert csv_response.status_code == 200, csv_response.text
+    assert csv_response.headers["content-disposition"] == 'attachment; filename="m0.csv"'
+    rows = list(csv.DictReader(io.StringIO(csv_response.text)))
+    assert len(rows) == 10
+    assert {"kind", "start_time", "start_cycle", "addr", "latency"} <= set(rows[0])
+    assert {row["kind"] for row in rows} == {"WRITE"}
+
+    parquet_response = client.post(
+        f"/session/{sid}/export", json={"kind": "parquet", "target": "m0"}
+    )
+    assert parquet_response.status_code == 200, parquet_response.text
+    assert "m0.parquet" in parquet_response.headers["content-disposition"]
+    exported = tmp_path / "m0.parquet"
+    exported.write_bytes(parquet_response.content)
+    columns = dict(read_txn_table(str(exported)))
+    assert len(columns["index"]) == 10
+    assert columns["kind"] == ["WRITE"] * 10
+    assert columns["start_cycle"] != columns["start_time"]
+
+
+def test_transaction_export_refuses_ambiguous_or_unknown_targets(arb):
+    client, sid = arb
+    assert client.post(f"/session/{sid}/export", json={"kind": "csv"}).status_code == 400
+    unknown = client.post(
+        f"/session/{sid}/export", json={"kind": "csv", "target": "txn(nope)"}
+    )
+    assert unknown.status_code == 404
+    assert "detected: m0, m1, slv" in unknown.json()["detail"]
+    filtered = client.post(
+        f"/session/{sid}/export",
+        json={"kind": "csv", "target": "txn(m0, type=WRITE)"},
+    )
+    assert filtered.status_code == 400
+
+
+def test_performance_history_endpoint_reads_the_record_database(tmp_path, monkeypatch):
+    """UI history and `veritrace history` consume the same DuckDB rows."""
+    monkeypatch.chdir(tmp_path)
+    vtx = make_vtx(tmp_path, name="history")
+    db_path = tmp_path / regress.DEFAULT_DB
+    con = regress.connect(db_path)
+    for commit, p99 in (("before", 8.0), ("regression", 13.0), ("after", 14.0)):
+        run = regress.Run(
+            seed=7,
+            simulator="icarus",
+            simulator_version="12.0",
+            rtl_sha256="a" * 64,
+            commit_sha=commit,
+            command="iverilog -o sim.vvp tb.v",
+        )
+        run.txn.append({"iface": "dma0", "pack": "AXI4", "n": 3, "p99": p99})
+        regress.record(con, run)
+    con.close()
+
+    with TestClient(create_app(default_trace=vtx)) as c:
+        sid = c.get("/").json()["default_session"]
+        r = c.get(
+            f"/session/{sid}/performance/history",
+            params={"iface": "dma0", "metric": "p99_latency"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert [p["commit"] for p in body["points"]] == ["before", "regression", "after"]
+        assert body["regression_run_id"] == body["points"][1]["run_id"]
+        assert body["delta"] == 1.0
+
+        bad = c.get(
+            f"/session/{sid}/performance/history",
+            params={"iface": "dma0", "metric": "fabricated"},
+        )
+        assert bad.status_code == 400
+        assert "unknown performance metric" in bad.json()["detail"]
+
+
 def test_the_injected_deadlock_is_on_the_wire_when_the_session_opens(deadlock_api):
     """§8.18: the scan runs on open, so this is a read and not a request to
     compute."""
@@ -916,7 +1554,7 @@ def test_the_memory_endpoint_carries_the_whole_tab(sdram_api):
     iface = body["interfaces"][0]
     assert iface["chip"] == "mt48lc16m16a2"
     assert iface["n_banks"] == 4
-    assert {v["constraint"] for v in iface["violations"]} == {"tRCD", "tRP", "tRFC", "tFAW"}
+    assert {v["constraint"] for v in iface["violations"]} == {"tRCD", "tRP", "tRFC"}
     assert iface["segments"]
     # The address map arrives as resolved bit ranges, so the browser does not
     # need an expression evaluator to decompose an address (§8.20).
@@ -949,8 +1587,67 @@ def test_timing_violations_are_findings_in_checks(sdram_api):
     client, sid = sdram_api
     body = client.get(f"/session/{sid}/checks").json()
     memory = [f for f in body["findings"] if f["group"] == "memory"]
-    assert len(memory) == 4
+    assert len(memory) == 3
     assert memory[0]["check"] == "memory_timing"
+
+
+def test_memory_chip_selection_recomputes_all_consumers_and_survives_reopen(tmp_path):
+    from veritrace.memory import timing
+
+    dump = tmp_path / "dump.vtx"
+    convert(str(DESIGNS / "sdram" / "dump.vcd"), str(dump))
+    custom = timing.find("mt48lc16m16a2").path.read_text().replace("tRCD  = 20", "tRCD  = 5")
+    custom = custom.replace('name = "MT48LC16M16A2"', 'name = "Audited custom"')
+    with TestClient(create_app(default_trace=dump)) as client:
+        sid = client.get("/").json()["default_session"]
+        base = f"/session/{sid}"
+        before = client.get(base + "/memory").json()
+        iface = before["interfaces"][0]["iface"]
+        assert before["chips"][0]["slug"] == "mt48lc16m16a2"
+        selected = client.post(base + "/memory/timing", json={"iface": iface, "toml": custom})
+        assert selected.status_code == 200, selected.text
+        report = selected.json()["interfaces"][0]
+        assert report["chip"] == "audited_custom"
+        assert {v["constraint"] for v in report["violations"]} == {"tRP", "tRFC"}
+        query = client.post(base + "/query", json={"vtq": f"timing({iface})"}).json()
+        assert query["violations"] == report["violations"]
+        findings = client.get(base + "/checks").json()["findings"]
+        assert len([f for f in findings if f["group"] == "memory"]) == 2
+        # A normal Wave save does not own or erase the chosen memory timings.
+        assert client.put(base + "/layout", json={"signals": []}).status_code == 200
+        assert client.get(base + "/layout").json()["memoryTiming"][iface] == {"toml": custom}
+        from click.testing import CliRunner
+        from veritrace.cli import main
+
+        cli = CliRunner().invoke(main, ["memory", str(dump), "--json"])
+        assert cli.exit_code == 0, cli.output
+        assert len(json.loads(cli.stdout)[0]["violations"]) == 2
+        for invalid in ({}, {"chip": "missing"}, {"toml": "tRCD = nan"},
+                        {"chip": "mt48lc16m16a2", "toml": custom}):
+            response = client.post(base + "/memory/timing", json={"iface": iface, **invalid})
+            assert response.status_code == 400, response.text
+            assert client.get(base + "/memory").json()["interfaces"][0]["chip"] == "audited_custom"
+    with TestClient(create_app(default_trace=dump)) as reopened:
+        report = reopened.get(base + "/memory").json()["interfaces"][0]
+        assert report["chip"] == "audited_custom"
+        assert len(report["violations"]) == 2
+        reset = reopened.post(base + "/memory/timing", json={"iface": iface, "chip": "mt48lc16m16a2"})
+        assert reset.status_code == 200, reset.text
+        assert len(reset.json()["interfaces"][0]["violations"]) == 3
+
+
+def test_invalid_timing_catalog_entry_does_not_hide_usable_chips(tmp_path):
+    dump = tmp_path / "dump.vtx"
+    convert(str(DESIGNS / "sdram" / "dump.vcd"), str(dump))
+    (tmp_path / ".veritrace.toml").write_text("[design]\n")
+    (tmp_path / "timing").mkdir()
+    (tmp_path / "timing" / "broken.toml").write_text("tRCD = nan")
+    with TestClient(create_app(default_trace=dump)) as client:
+        sid = client.get("/").json()["default_session"]
+        response = client.get(f"/session/{sid}/memory")
+        assert response.status_code == 200
+        assert len(response.json()["chips"]) == 1
+        assert "missing timing parameter" in response.json()["timing_errors"][0]
 
 
 # ---------------------------------------------------------------------------
@@ -1082,6 +1779,31 @@ def test_the_query_bar_completes_the_signal_level_table(checks_client):
     assert body["kind"] == "uncovered"
 
 
+def test_uncovered_query_uses_the_renderable_coverage_shape_for_fsm_edges(tmp_path):
+    """An untaken diagram edge must reach TAB 7 with its real guard."""
+    design = tmp_path / "fsm"
+    shutil.copytree(DESIGNS / "fsm", design, ignore=shutil.ignore_patterns("*.vtx*", "sim.vvp"))
+    convert(str(design / "dump.vcd"), str(design / "dump.vtx"))
+    with TestClient(create_app(design / "dump.vtx", rtl=[str(design)])) as client:
+        sid = client.get("/").json()["default_session"]
+        response = client.post(
+            f"/session/{sid}/query", json={"vtq": "uncovered(fsm_dut.sv)"}
+        )
+        assert response.status_code == 200, response.text
+        holes = response.json()["holes"]
+        transitions = [hole for hole in holes if hole["kind"] == "fsm-transition"]
+        assert transitions
+        first = transitions[0]
+        assert first["label"] and first["text"]
+        assert first["conditions"]
+        assert all(condition["sampled"] > 0 for condition in first["conditions"])
+        assert any(condition["ever"] is False for hole in transitions for condition in hole["conditions"])
+        # The ordinary Coverage tab receives the same measured conditions even
+        # before a diagram click or an uncovered() query has been made.
+        reported = client.get(f"/session/{sid}/coverage").json()["holes"]
+        assert first in reported
+
+
 def test_a_pipeline_narrows_each_stage_to_the_one_before_it(checks_client):
     """§9.3, with the spec's own two examples.
 
@@ -1115,6 +1837,29 @@ def test_a_pipeline_narrows_each_stage_to_the_one_before_it(checks_client):
     # A command that needs a signal of its own cannot be a stage, and says so.
     code, body = run("find(lock) | cone(x)")
     assert code == 400 and "cannot follow a `|`" in body["detail"]
+
+    # A typed but empty SignalSet remains a valid input to the next stage.
+    code, body = run("find(no_signal_can_match_this) | stuck(min_duration=c1)")
+    assert code == 200, body
+    assert body["kind"] == "stuck" and body["findings"] == []
+
+
+def test_positional_cone_depth_affects_the_real_query(checks_client):
+    """§9.3's `cone(ready, 4)` form must not silently use a default depth."""
+    client, sid = checks_client
+
+    def paths(depth: int) -> set[str]:
+        response = client.post(
+            f"/session/{sid}/query", json={"vtq": f"cone(u_dut.lock_r, {depth})"}
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["depth"] == depth
+        return {node["path"] for node in body["nodes"]}
+
+    shallow = paths(1)
+    deep = paths(4)
+    assert shallow < deep
 
 
 def test_a_glob_in_find_is_a_glob(checks_client):
@@ -1157,3 +1902,23 @@ def test_a_cycle_range_parses_as_a_range():
     assert vtq.parse_pipeline("txn(m0, addr=0x4000:0x5000)").source.kwargs == {
         "addr": (0x4000, 0x5000)
     }
+
+
+def test_vtq_list_arguments_are_values_not_bracketed_check_names(checks_client):
+    """The exact §9.2 `checks=[cdc,latch]` form filters the real lint path."""
+    from veritrace.analysis import vtq
+
+    parsed = vtq.parse_pipeline("lint(tb_checks.dut, checks=[cdc,latch])")
+    assert parsed.source.kwargs["checks"] == ["cdc", "latch"]
+
+    client, sid = checks_client
+    response = client.post(
+        f"/session/{sid}/query",
+        json={"vtq": "lint(tb_checks.dut, checks=[cdc,latch])"},
+    )
+    assert response.status_code == 200, response.text
+    findings = response.json()["findings"]
+    assert findings, "the documented list syntax silently filtered every check"
+    from veritrace.analysis.checks import expand_checks
+
+    assert {finding["check"] for finding in findings} <= expand_checks(["cdc", "latch"])

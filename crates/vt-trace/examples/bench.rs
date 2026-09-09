@@ -67,8 +67,9 @@ fn code_for(mut n: u32) -> String {
 /// allocator.
 fn generate(path: &Path, target_bytes: usize, n_signals: usize) -> u64 {
     let mut rng = Rng(0x1234_5678_9abc_def0);
-    let widths: Vec<u32> =
-        (0..n_signals).map(|i| if i % 3 == 0 { 1 } else { [4, 8, 16, 32][i % 4] }).collect();
+    let widths: Vec<u32> = (0..n_signals)
+        .map(|i| if i % 3 == 0 { 1 } else { [4, 8, 16, 32][i % 4] })
+        .collect();
     let codes: Vec<String> = (0..n_signals).map(|i| code_for(i as u32)).collect();
 
     let file = File::create(path).unwrap();
@@ -195,7 +196,7 @@ fn main() {
 
     // --- whole-trace scan --------------------------------------------------
     let t5 = Instant::now();
-    let consts = s.constant_signals(t_min, t_max);
+    let consts = s.constant_signals(t_min, t_max).unwrap();
     let scan_ms = t5.elapsed().as_secs_f64() * 1e3;
 
     // §4.2 has two tiers with different numbers, and comparing a stress run

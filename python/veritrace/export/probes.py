@@ -101,7 +101,7 @@ def vivado(plan: ProbePlan) -> str:
         "create_debug_core u_ila_0 ila",
         f"set_property C_DATA_DEPTH {plan.depth} [get_debug_cores u_ila_0]",
         "set_property C_TRIGIN_EN false [get_debug_cores u_ila_0]",
-        f"set_property port_width 1 [get_debug_ports u_ila_0/clk]",
+        "set_property port_width 1 [get_debug_ports u_ila_0/clk]",
         f"connect_debug_port u_ila_0/clk [get_nets {{{_vivado_net(clock)}}}]",
     ]
     for i, path in enumerate(plan.signals):
@@ -109,7 +109,7 @@ def vivado(plan: ProbePlan) -> str:
         out += [
             "",
             f"# {path}",
-            f"create_debug_port u_ila_0 probe" if i else "",
+            "create_debug_port u_ila_0 probe" if i else "",
             f"set_property port_width {width} [get_debug_ports u_ila_0/probe{i}]",
             f"set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe{i}]",
             f"connect_debug_port u_ila_0/probe{i} [get_nets [list {{{_vivado_net(path)}}}]]",

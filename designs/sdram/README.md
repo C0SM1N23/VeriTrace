@@ -1,8 +1,11 @@
-# designs/sdram — a command bus with four timing bugs in it
+# designs/sdram — a command bus with three timing bugs and a legal tFAW burst
 
-The design behind Prompt 11's acceptance criteria: **four injected SDRAM timing
-violations, one from each category**, and the same RTL compiled clean so that
-"none found" is as checkable as "four found".
+The design contains three real timing violations (tRCD, tRP, tRFC), and a
+four-ACTIVATE burst that must not be reported as a tFAW violation. The audit
+found that both the checker and its original golden expected the fourth
+activation to fail. Section 8.20 permits four: only a fifth inside the window
+violates tFAW. `tests/test_run.py` now also exercises four and five activations
+through real Icarus simulation and the production Memory API.
 
 ```
 tb_sdram
@@ -22,17 +25,17 @@ localparam int BUG = VIOLATE ? 1 : 0;
 localparam int S_RD0  = S_ACT0 + T_RCD - BUG;   // (1) tRCD
 localparam int S_ACT1 = S_PRE0 + T_RP  - BUG;   // (2) tRP
 localparam int S_ACT2 = S_REF  + T_RFC - BUG;   // (3) tRFC
-localparam int S_FAW3 = S_FAW0 + T_FAW - BUG;   // (4) tFAW
+localparam int S_FAW3 = S_FAW0 + T_FAW - BUG;   // legal fourth ACTIVATE
 ```
 
-Four commands, each landing exactly one cycle early. At 100 MHz one step is
+Three violating commands, each landing exactly one cycle early. At 100 MHz one step is
 10 ns, so the MT48LC16M16A2 minima come out in whole cycles and the injected
 gap is unambiguous.
 
 Every *other* gap in the sequence was worked out by hand to sit clear of every
-constraint — which is why the run produces these four violations and no
+constraint — which is why the run produces these three violations and no
 collateral ones, and why the test can assert an exact set rather than "at
-least four". `ROW_OPEN = 6` exists for precisely that reason: at 5 it would
+least three". `ROW_OPEN = 6` exists for precisely that reason: at 5 it would
 still satisfy tRAS, but the injected tRP bug would then drag the second
 ACTIVATE inside tRC and turn one bug into two.
 
@@ -47,8 +50,9 @@ iverilog -g2012 -DNO_VIOLATION -o sim_ok.vvp *.sv && vvp sim_ok.vvp  # dump_ok.v
 | | `dump.vcd` | `dump_ok.vcd` |
 |---|---|---|
 | commands decoded | 13 | 13 |
-| timing violations | **4** | **0** |
-| tRCD / tRP / tRFC / tFAW | 1 each | conformant |
+| timing violations | **3** | **0** |
+| tRCD / tRP / tRFC | 1 each | conformant |
+| tFAW | no violation | no violation |
 
 ## What the tool says
 
@@ -57,15 +61,15 @@ $ veritrace memory designs/sdram/dump.vcd
 
 ctrl   [mt48lc16m16a2]   4 banks   13 commands
     ACTIVATE=7  PRECHARGE=3  READ=1  REFRESH=1  WRITE=1
-    ! tFAW violated 1 time(s)
-        c44  ACTIVATE@c37 -> ACTIVATE@c44  (7 cycles, min 8)
     ! tRCD violated 1 time(s)
         c9   bank 0  ACTIVATE@c8 -> READ@c9  (1 cycles, min 2)
     ! tRFC violated 1 time(s)
         c29  REFRESH@c23 -> ACTIVATE@c29  (6 cycles, min 7)
     ! tRP violated 1 time(s)
         c15  bank 0  PRECHARGE@c14 -> ACTIVATE@c15  (1 cycles, min 2)
-    ok  tRAS, tRC, tREFI, tRRD, tRTP, tWR, tWTR: conformant
+    ok  tRAS, tRC, tRRD, tRTP, tFAW: conformant
+    skipped tREFI: no consecutive refreshes observed
+    skipped tWR: no last data beat observed (command-only lower bound)
 ```
 
 Two things there are the point of the exercise. Each violation names **both
@@ -91,7 +95,5 @@ value in `packs/timing/mt48lc16m16a2.toml` is therefore a controller-level
 power policy rather than a datasheet number, and it is set at **5 × tRRD**,
 the proportion the DDR generations that *do* specify tFAW land on.
 
-That ratio also happens to be what makes the two constraints independently
-testable at a 10 ns clock: at 60 ns, four ACTIVATEs at the tRRD minimum span
-exactly 60 ns, so no stimulus could violate tFAW without violating tRRD at the
-same time, and the injected bug would fire two constraints instead of one.
+This synthetic policy is not a claim about an SDR device's datasheet. Four
+ACTIVATEs are legal even inside this window; the fifth is the binding case.

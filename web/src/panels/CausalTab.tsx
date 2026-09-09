@@ -28,6 +28,7 @@ const REASON_TEXT: Record<string, string> = {
   capture_boundary: "already settled when the capture began",
   hold: "held: no driver was enabled",
   assigned: "assigned by an active driver",
+  counterfactual: "condition that prevented the requested value",
   // §8.16 — the chain crossed into the transaction layer.
   txn_open: "a transaction that was never completed",
   txn_in_flight: "a transaction that was still running at this instant",
@@ -89,8 +90,17 @@ export function CausalTab() {
         <div className="spine">
           <Card node={causal.root} depth={0} />
         </div>
-        <SubtraceSection />
-        <ReproSection />
+        {/^why_not\s*\(/i.test(causal.query) ? (
+          <div className="pane-hint">
+            Counterfactual chains identify the observed guard/value terms that prevented the
+            requested value. Replay and repro remain tied to an observed <code>why()</code> event.
+          </div>
+        ) : (
+          <>
+            <SubtraceSection />
+            <ReproSection />
+          </>
+        )}
       </div>
     </div>
   );
@@ -256,6 +266,7 @@ function ReproSection() {
 function Card({ node, depth }: { node: CausalNode; depth: number }) {
   const activeNode = useWave((s) => s.activeNode);
   const select = useWave((s) => s.selectCausal);
+  const setHovered = useWave((s) => s.setHoveredCausal);
   const timescale = useWave((s) => s.status?.timescale ?? "1ns");
   const cursor = useWave((s) => s.cursor);
   // Secondary branches start collapsed: nothing hidden, the likely path open.
@@ -276,7 +287,25 @@ function Card({ node, depth }: { node: CausalNode; depth: number }) {
         className={`card${isActive ? " active" : ""}${primary ? " primary" : ""}${
           isTxn ? " txn" : ""
         }`}
-        onClick={() => select(node)}
+        onClick={(event) => {
+          if (event.altKey && !isTxn) {
+            const suggested = node.width === 1 && node.value === "0" ? "1" : "0";
+            const desired =
+              node.width === 1 && /^[01]$/.test(node.value)
+                ? suggested
+                : window.prompt(`Value expected for ${node.signal}`, suggested);
+            if (desired !== null && desired.trim()) {
+              void useWave
+                .getState()
+                .runQueryText(`why_not(${node.signal} == ${desired.trim()} @ ${node.time})`);
+            }
+            return;
+          }
+          select(node);
+        }}
+        title="Click to synchronize panels; Alt+click asks why a different value did not occur"
+        onMouseEnter={() => !isTxn && setHovered(node.signal)}
+        onMouseLeave={() => setHovered(null)}
         data-testid={isTxn ? "causal-txn-card" : "causal-card"}
         data-signal={node.signal}
         data-txn={node.txn ?? undefined}

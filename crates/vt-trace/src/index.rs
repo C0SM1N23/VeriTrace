@@ -159,10 +159,15 @@ impl Index {
         let i64_at = |o: usize| i64::from_le_bytes(map[o..o + 8].try_into().unwrap());
         let version = u32_at(4);
         if version != VERSION {
-            return Err(Error::Store(format!("index.bin: version {version}, expected {VERSION}")));
+            return Err(Error::Store(format!(
+                "index.bin: version {version}, expected {VERSION}"
+            )));
         }
         let header = Header {
-            timescale: Timescale { num: u32_at(8), unit_exp: i32_at(12) },
+            timescale: Timescale {
+                num: u32_at(8),
+                unit_exp: i32_at(12),
+            },
             n_signals: u32_at(16),
             n_streams: u32_at(20),
             t_min: i64_at(24),
@@ -176,7 +181,36 @@ impl Index {
             + header.n_summaries as usize * SUMMARY_LEN
             + header.blob_len as usize;
         if map.len() < need {
-            return Err(Error::Store(format!("index.bin: truncated ({} < {need})", map.len())));
+            return Err(Error::Store(format!(
+                "index.bin: truncated ({} < {need})",
+                map.len()
+            )));
+        }
+        let summary_base = HEADER_LEN + header.n_chunks as usize * ENTRY_LEN;
+        let mut previous: Option<u32> = None;
+        for i in 0..header.n_summaries as usize {
+            let o = summary_base + i * SUMMARY_LEN;
+            let stream = u32::from_le_bytes(map[o..o + 4].try_into().unwrap());
+            let off = u32::from_le_bytes(map[o + 4..o + 8].try_into().unwrap());
+            let len = u32::from_le_bytes(map[o + 8..o + 12].try_into().unwrap());
+            if stream >= header.n_streams {
+                return Err(Error::Store(format!(
+                    "index.bin: summary {i} references stream {stream} of {}",
+                    header.n_streams
+                )));
+            }
+            if previous.is_some_and(|p| p >= stream) {
+                return Err(Error::Store(format!(
+                    "index.bin: summaries are not strictly sorted at stream {stream}"
+                )));
+            }
+            let end = off as u64 + len as u64;
+            if end > header.blob_len as u64 {
+                return Err(Error::Store(format!(
+                    "index.bin: summary {i} points outside its value blob"
+                )));
+            }
+            previous = Some(stream);
         }
         Ok(Index { map, header })
     }
@@ -301,9 +335,16 @@ mod tests {
         ];
         // Deliberately ragged: two streams with values of different lengths and
         // one with none, which is what the blob offsets have to survive.
-        let summaries = vec![(0u32, vec![1u8, 2, 3]), (2u32, vec![9u8]), (5u32, vec![7u8, 7])];
+        let summaries = vec![
+            (0u32, vec![1u8, 2, 3]),
+            (2u32, vec![9u8]),
+            (5u32, vec![7u8, 7]),
+        ];
         let h = Header {
-            timescale: Timescale { num: 1, unit_exp: -12 },
+            timescale: Timescale {
+                num: 1,
+                unit_exp: -12,
+            },
             n_signals: 7,
             n_streams: 6,
             t_min: 0,
@@ -334,7 +375,10 @@ mod tests {
         let path = dir.path().join("index.bin");
         let entries = vec![entry(0, 0, 30, 0)];
         let h = Header {
-            timescale: Timescale { num: 1, unit_exp: -12 },
+            timescale: Timescale {
+                num: 1,
+                unit_exp: -12,
+            },
             n_signals: 1,
             n_streams: 1,
             t_min: 0,

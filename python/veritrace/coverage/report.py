@@ -24,6 +24,7 @@ def build(
     coverage_path: Any = None,
     project_root: Any = None,
     source: str | None = None,
+    elaboration: Any = None,
 ) -> CoverageReport:
     """§8.21 from the transactions, §8.12 from whatever coverage database exists.
 
@@ -66,6 +67,8 @@ def build(
         out.holes, note = holes.derive(out.code, graph, store, clock, project_root)
         if note:
             out.skipped["holes"] = note
+
+    out.holes.extend(holes.fsm_holes(graph, store, clock, elaboration))
 
     out.elapsed_ms = (_time.perf_counter() - started) * 1000.0
     return out

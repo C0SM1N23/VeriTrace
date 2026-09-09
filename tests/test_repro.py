@@ -14,8 +14,10 @@ unconditionally, because those are where the reasoning lives.
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
+import msgpack
 import pytest
 
 from conftest import design_store
@@ -383,6 +385,27 @@ def test_repro_command_writes_a_testbench(tmp_path):
     assert "module tb_repro_full;" in out.read_text(encoding="utf-8")
 
 
+def test_subtrace_command_uses_the_real_causal_path():
+    got = CliRunner().invoke(
+        main,
+        [
+            "subtrace",
+            str(BUGGY / "dump.vcd"),
+            f"{SYMPTOM}",
+            "--rtl",
+            str(BUGGY),
+            "--json",
+        ],
+    )
+    assert got.exit_code == 0, got.output
+    import json
+
+    payload = json.loads(got.output)
+    assert payload["signal"] == SYMPTOM
+    assert payload["events"]
+    assert payload["steps"][0]["is_root_cause"]
+
+
 def test_export_command_writes_a_report(tmp_path):
     out = tmp_path / "bug.html"
     got = CliRunner().invoke(
@@ -403,6 +426,47 @@ def test_export_command_writes_a_report(tmp_path):
     text = out.read_text(encoding="utf-8")
     assert text.startswith("<!doctype html>")
     assert "full stuck at 1" in text
+
+
+def test_export_includes_recorded_command_and_project_notes(tmp_path, monkeypatch):
+    """The API/CLI must feed §12's header and appendix, not only render slots."""
+    project = tmp_path / "project"
+    project.mkdir()
+    for source in [*BUGGY_RTL, BUGGY / "dump.vcd"]:
+        shutil.copy2(source, project / source.name)
+    (project / ".veritrace.toml").write_text(
+        '[design]\ntop = "tb_fifo_buggy"\nrtl = ["fifo_buggy.sv", "tb_fifo_buggy.sv"]\n',
+        encoding="utf-8",
+    )
+    (project / "sim.command").write_text(
+        "iverilog -g2012 -s tb_fifo_buggy fifo_buggy.sv tb_fifo_buggy.sv\n",
+        encoding="utf-8",
+    )
+    (project / "notes").mkdir()
+    (project / "notes" / "fifo.vtnotes").write_text(
+        f"{SYMPTOM} @ 180 :: grant stayed asserted after reset\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project)
+    out = project / "bug.html"
+
+    got = CliRunner().invoke(
+        main,
+        [
+            "export",
+            str(project / "dump.vcd"),
+            "--why",
+            f"why({SYMPTOM})",
+            "-o",
+            str(out),
+            "--no-repro",
+        ],
+    )
+
+    assert got.exit_code == 0, got.output
+    text = out.read_text(encoding="utf-8")
+    assert "iverilog -g2012 -s tb_fifo_buggy" in text
+    assert "grant stayed asserted after reset" in text
 
 
 # --- §10.1, the routes ------------------------------------------------------
@@ -454,6 +518,76 @@ def test_export_route_returns_an_attachment(client):
     assert got.status_code == 200, got.text
     assert "attachment" in got.headers["content-disposition"]
     assert got.text.startswith("<!doctype html>")
+
+
+def test_export_route_honours_the_documented_kind_and_target(client):
+    sid = _session(client)
+    query = f"why({SYMPTOM})"
+
+    html = client.post(
+        f"/session/{sid}/export",
+        json={"kind": "html", "target": query, "validate": False},
+    )
+    assert html.status_code == 200, html.text
+    assert html.headers["content-type"].startswith("text/html")
+
+    structured = client.post(
+        f"/session/{sid}/export", json={"kind": "json", "target": query}
+    )
+    assert structured.status_code == 200, structured.text
+    assert structured.headers["content-type"].startswith("application/json")
+    assert structured.json()["root"]["signal"] == SYMPTOM
+    assert structured.json()["subtrace"]["events"]
+
+    svg = client.post(
+        f"/session/{sid}/export", json={"kind": "svg", "target": query}
+    )
+    assert svg.status_code == 200, svg.text
+    assert svg.headers["content-type"].startswith("image/svg+xml")
+    assert svg.text.startswith("<svg")
+    assert "<style>" in svg.text
+
+
+def test_export_route_rejects_unknown_formats_instead_of_returning_html(client):
+    sid = _session(client)
+    got = client.post(
+        f"/session/{sid}/export",
+        json={"kind": "not-a-format", "target": f"why({SYMPTOM})"},
+    )
+    assert got.status_code == 400
+    assert "unknown export format" in got.json()["detail"]
+
+
+def test_global_query_dispatches_subtrace_and_repro(client):
+    sid = _session(client)
+    sub = client.post(
+        f"/session/{sid}/query", json={"vtq": f"subtrace({SYMPTOM})"}
+    )
+    assert sub.status_code == 200, sub.text
+    assert sub.json()["kind"] == "subtrace"
+    assert sub.json()["events"] and sub.json()["steps"]
+
+    repro = client.post(
+        f"/session/{sid}/query", json={"vtq": f"repro({SYMPTOM})"}
+    )
+    assert repro.status_code == 200, repro.text
+    assert repro.json()["kind"] == "repro"
+    assert repro.json()["code"].startswith("`timescale")
+    assert not repro.json()["validation"]["ran"]
+
+
+def test_global_websocket_dispatches_subtrace(client):
+    sid = _session(client)
+    with client.websocket_connect(f"/session/{sid}/ws") as ws:
+        ws.send_bytes(
+            msgpack.packb({"op": "query", "vtq": f"subtrace({SYMPTOM})"})
+        )
+        partial = msgpack.unpackb(ws.receive_bytes(), raw=False)
+        done = msgpack.unpackb(ws.receive_bytes(), raw=False)
+    assert partial["op"] == "partial"
+    assert partial["result"]["kind"] == "subtrace"
+    assert partial["result"]["events"]
+    assert done["op"] == "done"
 
 
 def test_asking_the_same_question_twice_reuses_the_tree(client):

@@ -13,6 +13,7 @@
  */
 
 import { expect, test, type Page } from "@playwright/test";
+import { waitForReady } from "./session";
 
 const BACKEND = process.env.VERITRACE_BACKEND ?? "http://127.0.0.1:8765";
 
@@ -24,6 +25,7 @@ test.beforeAll(async ({ request }) => {
   });
   expect(r.ok(), `could not open designs/axi_arb: ${await r.text()}`).toBeTruthy();
   sessionId = (await r.json()).session_id;
+  await waitForReady(request, BACKEND, sessionId);
 });
 
 /**
@@ -182,6 +184,21 @@ test("the field table carries the pack's own fields and metrics", async ({ page 
   await expect(page.locator('[data-testid="txn-table"] tbody tr')).toHaveCount(10);
 });
 
+test("the visible interface exports its real CSV and Parquet tables", async ({ page }) => {
+  await open(page);
+
+  const csvPromise = page.waitForEvent("download");
+  await page.locator('[data-testid="txn-export-csv"]').click();
+  const csv = await csvPromise;
+  expect(csv.suggestedFilename()).toBe("m0.csv");
+  expect((await csv.createReadStream()).readable).toBeTruthy();
+
+  const parquetPromise = page.waitForEvent("download");
+  await page.locator('[data-testid="txn-export-parquet"]').click();
+  const parquet = await parquetPromise;
+  expect(parquet.suggestedFilename()).toBe("m0.parquet");
+});
+
 test("the table sorts on a metric", async ({ page }) => {
   await open(page);
   const cell = (row: number) =>
@@ -194,6 +211,29 @@ test("the table sorts on a metric", async ({ page }) => {
   // Sorting must not lose or duplicate rows.
   await expect(page.locator('[data-testid="txn-table"] tbody tr')).toHaveCount(10);
   expect(firstBefore).toBeTruthy();
+});
+
+test("transactions can be filtered by any displayed field", async ({ page }) => {
+  await open(page);
+  await page.locator('[data-testid="txn-filter"]').fill("WRITE[0]");
+  await expect(page.locator('[data-testid="txn-table"] tbody tr')).toHaveCount(1);
+  await expect(page.locator('[data-testid="txn-table"] tbody tr').first()).toContainText("WRITE#0");
+
+  await page.locator('[data-testid="txn-filter"]').fill("not-a-real-transaction");
+  await expect(page.locator('[data-testid="txn-table"] tbody tr')).toHaveCount(0);
+  await expect(page.getByText("No transaction matches this filter.")).toBeVisible();
+});
+
+test("Gantt rows group by ID and the group is collapsible", async ({ page }) => {
+  await open(page);
+  await page.locator('[data-testid="txn-group-by"]').selectOption("id");
+  const group = page.locator('[data-testid="txn-group-id:no ID"]');
+  await expect(group).toContainText("ID no ID");
+  await expect(page.locator('[data-testid^="txn-band-"]')).toHaveCount(10);
+  await group.click();
+  await expect(page.locator('[data-testid^="txn-band-"]')).toHaveCount(0);
+  await group.click();
+  await expect(page.locator('[data-testid^="txn-band-"]')).toHaveCount(10);
 });
 
 test("why at transaction level crosses the arbiter to the other master", async ({ page }) => {
@@ -226,7 +266,11 @@ test("a protocol violation shows up in Checks like any other finding", async ({ 
     data: { trace_path: "designs/axi_lite/dump.vtx", rtl_paths: ["designs/axi_lite"] },
   });
   const sid = (await r.json()).session_id;
-  const checks = await (await request.get(`${BACKEND}/session/${sid}/checks`)).json();
+  expect(r.ok(), await r.text()).toBeTruthy();
+  await waitForReady(request, BACKEND, sid);
+  const response = await request.get(`${BACKEND}/session/${sid}/checks`);
+  expect(response.ok(), await response.text()).toBeTruthy();
+  const checks = await response.json();
   const protocol = checks.findings.filter((f: { group: string }) => f.group === "protocol");
   expect(protocol.length).toBeGreaterThan(0);
   expect(protocol[0].why).toBeTruthy();

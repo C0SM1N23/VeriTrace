@@ -6,13 +6,13 @@
 //! callbacks. Exists because "0 signals, 0 events" from the converter says
 //! nothing about *which* of those two steps came back empty.
 
-#[cfg(not(feature = "fst"))]
+#[cfg(not(all(feature = "fst", not(windows))))]
 fn main() {
-    eprintln!("build with --features fst");
+    eprintln!("FST inspection requires a non-Windows build with --features fst");
     std::process::exit(2);
 }
 
-#[cfg(feature = "fst")]
+#[cfg(all(feature = "fst", not(windows)))]
 fn main() {
     use fstapi::{Hier, Reader};
 

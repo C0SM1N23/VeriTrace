@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use fstapi::{var_type, Hier, Reader};
+use fstapi::{scope_type, var_type, Hier, Reader};
 
 use crate::model::{EventStream, Kind, Scope, Signal, SignalId, Timescale, Trace};
 use crate::value::{parse_vcd_vector, Value};
@@ -48,6 +48,24 @@ fn kind_of(ty: fstapi::VarType) -> Kind {
         t if t == var_type::VCD_WOR => Kind::WOr,
         t if t == var_type::GEN_STRING => Kind::String,
         _ => Kind::Wire,
+    }
+}
+
+fn scope_kind(ty: fstapi::ScopeType) -> &'static str {
+    match ty {
+        t if t == scope_type::VCD_MODULE => "module",
+        t if t == scope_type::VCD_TASK => "task",
+        t if t == scope_type::VCD_FUNCTION => "function",
+        t if t == scope_type::VCD_BEGIN => "begin",
+        t if t == scope_type::VCD_FORK => "fork",
+        t if t == scope_type::VCD_GENERATE => "generate",
+        t if t == scope_type::VCD_CLASS => "class",
+        t if t == scope_type::VCD_INTERFACE => "interface",
+        t if t == scope_type::VCD_PACKAGE => "package",
+        t if t == scope_type::VCD_PROGRAM => "program",
+        t if t == scope_type::VCD_STRUCT => "struct",
+        t if t == scope_type::VCD_UNION => "union",
+        _ => "scope",
     }
 }
 
@@ -90,9 +108,15 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Trace> {
     let mut r = Reader::open(path).map_err(fe)?;
 
     let mut trace = Trace::default();
-    trace.timescale = timescale_from_exp(r.timescale());
-    trace.date = r.date().ok().map(|s| s.trim().to_string());
-    trace.version = r.version().ok().map(|s| s.trim().to_string());
+    let timescale_exp = r.timescale();
+    if !(-15..=2).contains(&timescale_exp) {
+        return Err(Error::Fst(format!(
+            "unsupported timescale exponent {timescale_exp}; VeriTrace represents femtoseconds through hundreds of seconds"
+        )));
+    }
+    trace.timescale = timescale_from_exp(timescale_exp);
+    trace.date = Some(r.date().map_err(fe)?.trim().to_string());
+    trace.version = Some(r.version().map_err(fe)?.trim().to_string());
 
     // Hierarchy first: FST handles play the role VCD identifier codes do, and
     // aliased variables share one, so they map onto one stream.
@@ -104,20 +128,25 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Trace> {
         match h {
             Hier::Scope(s) => {
                 let name = s.name().map_err(fe)?.to_string();
+                let kind = scope_kind(s.ty()).to_string();
                 let parent = stack.last().copied();
-                let existing =
-                    trace.scopes.iter().position(|x| x.parent == parent && x.name == name);
+                let existing = trace
+                    .scopes
+                    .iter()
+                    .position(|x| x.parent == parent && x.name == name && x.kind == kind);
                 let idx = match existing {
                     Some(i) => i as u32,
                     None => {
-                        trace.scopes.push(Scope { name, kind: "module".into(), parent });
+                        trace.scopes.push(Scope { name, kind, parent });
                         (trace.scopes.len() - 1) as u32
                     }
                 };
                 stack.push(idx);
             }
             Hier::Upscope => {
-                stack.pop();
+                if stack.pop().is_none() {
+                    return Err(Error::Fst("hierarchy contains an unmatched upscope".into()));
+                }
             }
             Hier::Var(v) => {
                 let raw = v.name().map_err(fe)?.to_string();
@@ -137,10 +166,15 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Trace> {
                     }
                 };
 
-                let hier: Vec<String> =
-                    stack.iter().map(|i| trace.scopes[*i as usize].name.clone()).collect();
+                let hier: Vec<String> = stack
+                    .iter()
+                    .map(|i| trace.scopes[*i as usize].name.clone())
+                    .collect();
                 trace.signals.push(Signal {
-                    id: SignalId { hier, name: name.clone() },
+                    id: SignalId {
+                        hier,
+                        name: name.clone(),
+                    },
                     width,
                     kind,
                     stream,
@@ -154,6 +188,13 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Trace> {
         }
     }
 
+    if !stack.is_empty() {
+        return Err(Error::Fst(format!(
+            "hierarchy ended with {} unclosed scope(s)",
+            stack.len()
+        )));
+    }
+
     // The header says how many variables the file declares. If the hierarchy
     // iterator produced fewer, libfst could not inflate the hierarchy block —
     // and the values still arrive, so the result would be a store full of
@@ -164,8 +205,9 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Trace> {
     // descriptor and hands it to `gzdopen`, having "flushed" an input stream —
     // undefined behaviour that glibc tolerates and the MSVC CRT does not. The
     // scratch file it writes beside the dump comes out zero bytes long.
-    let declared = r.var_count() as usize;
-    if trace.signals.len() < declared {
+    let declared = usize::try_from(r.var_count())
+        .map_err(|_| Error::Fst("variable count does not fit this platform".into()))?;
+    if trace.signals.len() != declared {
         return Err(Error::Fst(format!(
             "the FST hierarchy could not be read: the file declares {declared} variable(s) \
              and libfst returned {}. The value data is intact, so this is a limitation of \
@@ -177,37 +219,72 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Trace> {
 
     // Values. Without an explicit mask the reader emits nothing.
     r.set_mask_all();
+    // This makes real callbacks unambiguous.  Without it an eight-character
+    // ASCII real is indistinguishable by length from the native payload and
+    // was previously decoded as arbitrary binary data.
+    r.set_native_doubles_on_callback(true);
     let mut t_min: Option<i64> = None;
     let mut t_max = 0i64;
+    let mut value_error: Option<Error> = None;
     {
         let streams = &mut trace.streams;
         r.for_each_block(|time, handle, value, _var_len| {
+            if value_error.is_some() {
+                return;
+            }
             let stream = match handle_to_stream.get(&u32::from(handle)) {
                 Some(s) => *s as usize,
-                None => return,
+                None => {
+                    value_error = Some(Error::Fst(format!(
+                        "value block references undeclared handle {}",
+                        u32::from(handle)
+                    )));
+                    return;
+                }
             };
             let (width, kind) = stream_meta[stream];
-            let t = time as i64;
+            let t = match i64::try_from(time) {
+                Ok(t) => t,
+                Err(_) => {
+                    value_error = Some(Error::Fst(format!(
+                        "timestamp {time} exceeds VeriTrace's signed time range"
+                    )));
+                    return;
+                }
+            };
             let v = match kind {
                 Kind::Real => {
-                    if value.len() == 8 {
-                        // Native doubles, when the reader hands them over raw.
-                        let mut b = [0u8; 8];
-                        b.copy_from_slice(value);
-                        Value::Real(f64::from_le_bytes(b))
-                    } else {
-                        Value::Real(
-                            std::str::from_utf8(value)
-                                .ok()
-                                .and_then(|s| s.trim().parse().ok())
-                                .unwrap_or(0.0),
-                        )
+                    if value.len() != 8 {
+                        value_error = Some(Error::Fst(format!(
+                            "real value for handle {} has {} bytes, expected 8",
+                            u32::from(handle),
+                            value.len()
+                        )));
+                        return;
                     }
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(value);
+                    Value::Real(f64::from_ne_bytes(b))
                 }
-                Kind::String => Value::Str(String::from_utf8_lossy(value).to_string()),
+                Kind::String => match std::str::from_utf8(value) {
+                    Ok(s) => Value::Str(s.to_string()),
+                    Err(e) => {
+                        value_error = Some(Error::Fst(format!(
+                            "string value for handle {} is not UTF-8: {e}",
+                            u32::from(handle)
+                        )));
+                        return;
+                    }
+                },
                 _ => match parse_vcd_vector(value, width) {
                     Some(v) => v,
-                    None => return,
+                    None => {
+                        value_error = Some(Error::Fst(format!(
+                            "invalid bit-vector value for handle {} at time {time}",
+                            u32::from(handle)
+                        )));
+                        return;
+                    }
                 },
             };
             if t_min.is_none() {
@@ -220,9 +297,16 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Trace> {
         })
         .map_err(fe)?;
     }
+    if let Some(e) = value_error {
+        return Err(e);
+    }
 
-    trace.t_min = t_min.unwrap_or(r.start_time() as i64);
-    trace.t_max = t_max.max(trace.t_min);
+    let header_start = i64::try_from(r.start_time())
+        .map_err(|_| Error::Fst("start timestamp exceeds VeriTrace's signed time range".into()))?;
+    let header_end = i64::try_from(r.end_time())
+        .map_err(|_| Error::Fst("end timestamp exceeds VeriTrace's signed time range".into()))?;
+    trace.t_min = t_min.map_or(header_start, |t| t.min(header_start));
+    trace.t_max = t_max.max(header_end).max(trace.t_min);
     Ok(trace)
 }
 
@@ -250,8 +334,14 @@ mod tests {
     #[test]
     fn names_split_from_ranges() {
         assert_eq!(split_name_range("clk"), ("clk".into(), None, None));
-        assert_eq!(split_name_range("data [7:0]"), ("data".into(), Some(7), Some(0)));
-        assert_eq!(split_name_range("mem[3] [7:0]"), ("mem[3]".into(), Some(7), Some(0)));
+        assert_eq!(
+            split_name_range("data [7:0]"),
+            ("data".into(), Some(7), Some(0))
+        );
+        assert_eq!(
+            split_name_range("mem[3] [7:0]"),
+            ("mem[3]".into(), Some(7), Some(0))
+        );
     }
 
     #[test]

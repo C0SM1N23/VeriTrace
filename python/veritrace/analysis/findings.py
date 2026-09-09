@@ -27,6 +27,25 @@ from typing import Any, Iterable
 from veritrace.graph.model import SourceLoc
 
 
+def location_of(graph: Any, signal: str | None) -> SourceLoc | None:
+    """Best production source location for a signal-backed observation.
+
+    Transaction, timing and integrity checks originate in trace-derived tables,
+    but P2 still requires their row to lead back to RTL. Prefer the assignment
+    that produces the observed wire; fall back to its declaration when it is a
+    port/stimulus with no driver in this compilation.
+    """
+    if graph is None or not signal:
+        return None
+    sig = graph.get(signal)
+    if sig is None:
+        return None
+    for driver in sig.drivers:
+        if driver.loc is not None:
+            return driver.loc
+    return sig.decl_loc
+
+
 class Severity(IntEnum):
     """Sorted descending in every report, so the worst thing is the first."""
 

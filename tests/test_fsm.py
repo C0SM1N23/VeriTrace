@@ -395,6 +395,11 @@ def test_the_fsm_route_serves_machines_and_a_diagram():
     # The overlay travels with it (§8.8 step 5).
     assert dead["visits"] and "2" not in dead["visits"]
 
+    one = client.get(f"/session/{sid}/fsm/tb_fsm.bad_dead.state")
+    assert one.status_code == 200, one.text
+    assert one.json()["signal"] == "tb_fsm.bad_dead.state"
+    assert one.json()["transitions"] == dead["transitions"]
+
     svg = client.get(f"/session/{sid}/fsm/tb_fsm.bad_dead.state/svg")
     assert svg.status_code == 200
     assert svg.headers["content-type"].startswith("image/svg+xml")

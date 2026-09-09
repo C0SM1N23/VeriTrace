@@ -30,6 +30,7 @@ __all__ = [
     "Pipeline",
     "parse",
     "parse_pipeline",
+    "literal_bits",
     "ASPECTS",
 ]
 
@@ -206,6 +207,12 @@ def _bits(text: str, width: int) -> str | None:
     return format(n, "b").rjust(width, "0")
 
 
+def literal_bits(text: str, width: int) -> str | None:
+    """Public conversion used by the counterfactual runtime path."""
+    bits = _bits(text, width)
+    return bits[-width:] if bits is not None else None
+
+
 # --- the general call form ---------------------------------------------------
 
 
@@ -241,6 +248,13 @@ def _value(text: str) -> Any:
     s = text.strip()
     if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
         return s[1:-1]
+    if len(s) >= 2 and s[0] == "[" and s[-1] == "]":
+        # §9.2 writes `lint(scope, checks=[cdc,latch])`. Keeping the brackets
+        # as a string made the executor look for checks literally named
+        # `[cdc` and `latch]`, so the query succeeded with an empty result.
+        # Parse list values through the same scalar grammar; nested commas and
+        # quoted items are already handled by `_split`.
+        return [_value(item) for item in _split(s[1:-1])]
     m = _RANGE.match(s)
     if m:
         return (_endpoint(m.group("lo")), _endpoint(m.group("hi")))

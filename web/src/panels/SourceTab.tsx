@@ -27,8 +27,8 @@ import {
 
 import { format } from "../lib/radix";
 import type { CausalNode, SourceFile } from "../lib/types";
-import { useWave } from "../state/store";
-import { valueAt } from "../state/values";
+import { fetchValues } from "../api/client";
+import { enumLabelsFor, useWave } from "../state/store";
 
 /** Lines that belong to the current causal chain. */
 const setCausalLines = StateEffect.define<Set<number>>();
@@ -150,6 +150,7 @@ export function SourceTab() {
   const status = useWave((s) => s.status);
   const causal = useWave((s) => s.causal);
   const sourceLoc = useWave((s) => s.sourceLoc);
+  const machines = useWave((s) => s.machines);
 
   const lang = useMemo(() => StreamLanguage.define(verilog), []);
 
@@ -193,29 +194,60 @@ export function SourceTab() {
   // Value inlays follow the cursor, imperatively.
   useEffect(() => {
     if (!source) return;
-    const write = () => {
+    let serial = 0;
+    let live = true;
+    const handles = [
+      ...new Set(
+        Object.values(source.signals)
+          .flat()
+          .flatMap((sig) => (sig.handle === null ? [] : [sig.handle])),
+      ),
+    ];
+    const write = async () => {
       const view = viewRef.current;
       const s = useWave.getState();
-      if (!view || s.cursor === null) return;
+      if (!view || s.cursor === null || !s.session) return;
+      const mine = ++serial;
+      let values: Map<number, string | null>;
+      try {
+        values = await fetchValues(s.session, handles, s.cursor);
+      } catch {
+        if (live && mine === serial) view.dispatch({ effects: setInlays.of(new Map()) });
+        return;
+      }
+      if (!live || mine !== serial) return;
       const inlays = new Map<number, string>();
       for (const [line, sigs] of Object.entries(source.signals)) {
         const parts: string[] = [];
         for (const sig of sigs.slice(0, 4)) {
           if (sig.handle === null) continue;
           const meta = s.signalsByHandle.get(sig.handle);
-          const bits = valueAt(sig.handle, s.cursor);
+          const bits = values.get(sig.handle) ?? null;
           if (bits === null || !meta) continue;
-          parts.push(`${meta.name} = ${format(bits, meta.width, s.radix[sig.path] ?? "hex")}`);
+          parts.push(
+            `${meta.name} = ${format(
+              bits,
+              meta.width,
+              s.radix[sig.path] ?? "hex",
+              enumLabelsFor(s.machines, sig.path),
+            )}`,
+          );
         }
         if (parts.length) inlays.set(Number(line), parts.join("   "));
       }
       view.dispatch({ effects: setInlays.of(inlays) });
     };
-    write();
-    return useWave.subscribe((s, prev) => {
-      if (s.cursor !== prev.cursor || s.radix !== prev.radix) write();
+    void write();
+    const unsubscribe = useWave.subscribe((s, prev) => {
+      if (s.cursor !== prev.cursor || s.radix !== prev.radix || s.machines !== prev.machines) {
+        void write();
+      }
     });
-  }, [source]);
+    return () => {
+      live = false;
+      unsubscribe();
+    };
+  }, [source, machines]);
 
   // Scroll to the selected line.
   useEffect(() => {

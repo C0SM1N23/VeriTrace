@@ -1,11 +1,10 @@
-import { useEffect } from "react";
+import { lazy, Suspense, useEffect } from "react";
 import { WaveCanvas } from "./canvas/WaveCanvas";
 import { CausalTab } from "./panels/CausalTab";
 import { ChecksTab } from "./panels/ChecksTab";
 import { CommandPalette } from "./panels/CommandPalette";
 import { CoverageTab } from "./panels/CoverageTab";
 import { DiffTab } from "./panels/DiffTab";
-import { FsmMode } from "./panels/FsmMode";
 import { FIXED_TABS, HelpOverlay, QueryBar, StatusBar, TabStrip, TopBar } from "./panels/Chrome";
 import { Inspector } from "./panels/Inspector";
 import { PluginTab } from "./panels/PluginTab";
@@ -15,7 +14,6 @@ import type { PluginTable } from "./lib/types";
 const NO_TABLES: PluginTable[] = [];
 import { HierarchyPanel } from "./panels/HierarchyPanel";
 import { SignalPanel } from "./panels/SignalPanel";
-import { SourceTab } from "./panels/SourceTab";
 import { MemoryTab } from "./panels/MemoryTab";
 import { PerformanceTab } from "./panels/PerformanceTab";
 import { ReplayMode } from "./panels/ReplayMode";
@@ -23,9 +21,20 @@ import { TransactionsTab } from "./panels/TransactionsTab";
 import { WaveMenu } from "./panels/WaveMenu";
 import { flushPersist, useWave } from "./state/store";
 
+// Source pulls in CodeMirror and FSM pulls in the graph-layout client. Neither
+// belongs on the critical path for the default waveform tab, so load the pane
+// selected by the user only when they first open it.
+const SourceTab = lazy(() =>
+  import("./panels/SourceTab").then(({ SourceTab }) => ({ default: SourceTab })),
+);
+const FsmMode = lazy(() =>
+  import("./panels/FsmMode").then(({ FsmMode }) => ({ default: FsmMode })),
+);
+
 export default function App() {
   const ready = useWave((s) => s.ready);
   const error = useWave((s) => s.error);
+  const loadingNote = useWave((s) => s.note);
   const load = useWave((s) => s.load);
   const tab = useWave((s) => s.activeTab);
   const replay = useWave((s) => s.replay);
@@ -44,10 +53,14 @@ export default function App() {
   useEffect(() => {
     const onHide = () => void flushPersist();
     window.addEventListener("pagehide", onHide);
-    document.addEventListener("visibilitychange", () => {
+    const onVisibility = () => {
       if (document.visibilityState === "hidden") onHide();
-    });
-    return () => window.removeEventListener("pagehide", onHide);
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("pagehide", onHide);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, []);
 
   useKeyboard();
@@ -106,17 +119,19 @@ export default function App() {
               {/* §11.4: FSM took the Source pane rather than a tab of its own —
                   "FSM e o vedere asupra structurii codului, nu un domeniu
                   separat". Leaving the mode puts the code back. */}
-              {fsmOpen ? <FsmMode /> : <SourceTab />}
+              <Suspense fallback={<div className="pane-note">Opening source view…</div>}>
+                {fsmOpen ? <FsmMode /> : <SourceTab />}
+              </Suspense>
             </div>
           )}
           {tab === 5 && (
             <div className="pane on">
-              <ChecksTab />
+              <DiffTab />
             </div>
           )}
           {tab === 6 && (
             <div className="pane on">
-              <DiffTab />
+              <ChecksTab />
             </div>
           )}
           {tab === 7 && (
@@ -154,7 +169,7 @@ export default function App() {
       <CommandPalette />
       <HelpOverlay />
       <WaveMenu />
-      {!ready && <div className="loading">Opening trace…</div>}
+      {!ready && <div className="loading" role="status">Opening trace… {loadingNote}</div>}
     </div>
   );
 }
@@ -175,16 +190,22 @@ function useKeyboard() {
         s.setPalette(true);
         return;
       }
+      if (mod && e.shiftKey && e.key.toLowerCase() === "f") {
+        // §11.4 Source: design-wide search returns indexed signals, whereas
+        // plain ⌘F remains CodeMirror's search inside the open file.
+        e.preventDefault();
+        s.setPalette(true);
+        return;
+      }
       if (mod && e.key.toLowerCase() === "k") {
         e.preventDefault();
         window.dispatchEvent(new Event("vt:focus-query"));
         return;
       }
       if (mod && e.key === "\\") {
-        // The chord the help overlay has always advertised (§11.3: every column
-        // is collapsible). It was in the list and did nothing.
+        // §11.7 says panels (plural): clear or restore both side columns.
         e.preventDefault();
-        s.toggleTree();
+        s.toggleSidePanels();
         return;
       }
       if (mod && e.key.toLowerCase() === "m") {
@@ -235,6 +256,13 @@ function useKeyboard() {
       }
       if (e.key === "w" && !mod) {
         // §11.7: why on the current selection.
+        if (s.activeTab === 8 && s.txnSelected) {
+          const txn = s.txnRows.find((row) => row.ref === s.txnSelected);
+          if (txn?.status === "open") {
+            void s.runQueryText(`why(txn.${txn.ref}.not_completed)`);
+            return;
+          }
+        }
         const sig = s.selected !== null ? s.signalsByHandle.get(s.selected) : undefined;
         if (sig) void s.runWhy(sig.path, s.cursor ?? s.view.t1);
         return;

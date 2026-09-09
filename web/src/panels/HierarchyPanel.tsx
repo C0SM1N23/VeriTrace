@@ -26,6 +26,7 @@ import { useWave } from "../state/store";
 export function HierarchyPanel() {
   const session = useWave((s) => s.session);
   const addSignals = useWave((s) => s.addSignals);
+  const registerSignals = useWave((s) => s.registerSignals);
   const [levels, setLevels] = useState<Record<string, HierarchyLevel>>({});
   const [open, setOpen] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState<string | null>(null);
@@ -102,6 +103,10 @@ export function HierarchyPanel() {
     setError("");
     try {
       const rows = await fetchSubtreeSignals(session, scope.path);
+      // The session bootstrap intentionally fetches only the first 5k signal
+      // descriptors.  A lazy subtree may contain handles beyond that prefix;
+      // register the metadata returned by this request before adding them.
+      registerSignals(rows);
       const n = addSignals(
         rows.map((r) => r.handle),
         scope.name,

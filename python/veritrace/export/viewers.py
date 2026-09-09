@@ -100,7 +100,7 @@ def gtkw(sel: Selection) -> str:
         # GTKWave has markers A..Z; the first is the primary cursor.
         out.append(f"[markername] {chr(ord('A') + i)} {m.name}" if m.name else "")
         out.append(f"[marker] {m.time}")
-    out.append(f"@800200")
+    out.append("@800200")
     out.append(f"-{sel.group}")
     for path in sel.unique():
         radix = sel.radix.get(path)

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import pyslang
-from pyslang import ast as A, driver as D
+from pyslang import driver as D
 
 from veritrace.config import WORK_DIR
 from veritrace.graph import conditions as C
@@ -99,6 +99,8 @@ class Diag:
 @dataclass(slots=True)
 class Elaboration:
     graph: DesignGraph
+    #: Physical files read by slang, including headers reached via `include.
+    sources: list[Path] = field(default_factory=list)
     #: Diagnostics from slang's parser and its dataflow analysis pass. Errors do
     #: not abort: a partially elaborated design is still worth analysing (P7).
     diagnostics: list[Diag] = field(default_factory=list)
@@ -182,9 +184,27 @@ def _depth(sym) -> int:
     return int(getattr(rng, "width", 0) or 0) if rng is not None else 0
 
 
-class _Elaborator:
+class _SourceNames:
+    """Keep short, stable names only when they identify exactly one source."""
+
     def __init__(self, sm) -> None:
         self.sm = sm
+        self.paths = sorted({Path(sm.getFullPath(b)).resolve() for b in sm.getAllBuffers()
+                             if sm.getFullPath(b)})
+        self.duplicates = {p.name for p in self.paths
+                           if sum(q.name == p.name for q in self.paths) > 1}
+
+    def name(self, loc) -> str:
+        name = Path(self.sm.getFileName(loc)).name
+        if name in self.duplicates:
+            return Path(self.sm.getFullPath(loc.buffer)).resolve().as_posix()
+        return name
+
+
+class _Elaborator:
+    def __init__(self, sm, sources: _SourceNames) -> None:
+        self.sm = sm
+        self.sources = sources
         self.graph = DesignGraph()
         self.aliases: list[tuple[str, str]] = []
         self.parameters: dict[str, dict[str, ParamValue]] = {}
@@ -203,7 +223,7 @@ class _Elaborator:
             sr = getattr(obj, "sourceRange", None)
             loc = sr.start if sr is not None else obj.location
             return SourceLoc(
-                Path(self.sm.getFileName(loc)).name,
+                self.sources.name(loc),
                 int(self.sm.getLineNumber(loc)),
                 int(self.sm.getColumnNumber(loc)),
             )
@@ -504,7 +524,7 @@ class _Elaborator:
         self.graph.invalidate()
 
 
-def _to_diag(d, sm, engine) -> Diag:
+def _to_diag(d, sm, engine, sources: _SourceNames) -> Diag:
     """slang `Diagnostic` -> `Diag`, keeping code, severity, text and symbol.
 
     The engine renders the message, which is worth having verbatim: "latch
@@ -516,7 +536,7 @@ def _to_diag(d, sm, engine) -> Diag:
     severity, message, symbol = "warning", code, None
     try:
         loc = SourceLoc(
-            Path(sm.getFileName(d.location)).name,
+            sources.name(d.location),
             int(sm.getLineNumber(d.location)),
             int(sm.getColumnNumber(d.location)),
         )
@@ -691,7 +711,8 @@ def elaborate(
             # the inferred-latch and multi-driver checks simply produce nothing
             # and the Checks tab looks like a clean design.
             analysis_error = f"the dataflow analysis did not run: {e}"
-    diags = [_to_diag(d, sm, engine) for d in raw]
+    sources = _SourceNames(sm)
+    diags = [_to_diag(d, sm, engine, sources) for d in raw]
     if analysis_error:
         diags.append(
             Diag(
@@ -703,7 +724,7 @@ def elaborate(
             )
         )
 
-    el = _Elaborator(sm)
+    el = _Elaborator(sm, sources)
     root = comp.getRoot()
     tops = list(root.topInstances)
     if top and not tops:
@@ -738,6 +759,7 @@ def elaborate(
 
     return Elaboration(
         graph=el.graph,
+        sources=sources.paths,
         diagnostics=diags,
         aliases=el.aliases,
         parameters=el.parameters,

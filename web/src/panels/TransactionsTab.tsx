@@ -21,6 +21,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { downloadTransactions } from "../api/client";
 import { cycleAt, formatTime } from "../lib/time";
 import type { InterfaceReport, Transaction } from "../lib/types";
 import { useWave } from "../state/store";
@@ -35,13 +36,18 @@ export function TransactionsTab() {
   const load = useWave((s) => s.loadTransactions);
   const iface = useWave((s) => s.txnIface);
   const select = useWave((s) => s.selectIface);
+  const session = useWave((s) => s.session);
+  const [exporting, setExporting] = useState<"csv" | "parquet" | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [groupBy, setGroupBy] = useState<"none" | "master" | "id">("none");
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
-    if (!report && !busy) void load();
-  }, [report, busy, load]);
+    if (!report && !busy && !error) void load();
+  }, [report, busy, error, load]);
 
   if (busy && !report) return <div className="pane-note">Extracting transactions…</div>;
-  if (error && !report) return <div className="pane-note">{error}</div>;
+  if (error && !report) return <div className="pane-note" role="alert">{error} <button onClick={() => void load()}>Retry</button></div>;
   if (!report) return <div className="pane-note">No transactions yet.</div>;
 
   if (!report.interfaces.length) {
@@ -65,6 +71,19 @@ export function TransactionsTab() {
   const current =
     report.interfaces.find((i) => i.interface.name === iface) ?? report.interfaces[0];
 
+  const exportTable = async (kind: "csv" | "parquet") => {
+    if (!session) return;
+    setExporting(kind);
+    setExportError(null);
+    try {
+      await downloadTransactions(session, current.interface.name, kind);
+    } catch (e) {
+      setExportError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setExporting(null);
+    }
+  };
+
   return (
     <div className="txn" data-testid="transactions-tab">
       <div className="txn-head">
@@ -81,8 +100,54 @@ export function TransactionsTab() {
           ))}
         </select>
         <Summary report={current} />
+        <label className="txn-group-control">
+          group
+          <select
+            className="txn-iface"
+            value={groupBy}
+            data-testid="txn-group-by"
+            onChange={(event) => {
+              setGroupBy(event.target.value as "none" | "master" | "id");
+              setCollapsed(new Set());
+            }}
+          >
+            <option value="none">none</option>
+            <option value="master">master</option>
+            <option value="id">ID</option>
+          </select>
+        </label>
+        <span className="txn-actions">
+          <button
+            className="chrome-button"
+            data-testid="txn-export-csv"
+            disabled={exporting !== null}
+            onClick={() => void exportTable("csv")}
+          >
+            {exporting === "csv" ? "Exporting…" : "Export CSV"}
+          </button>
+          <button
+            className="chrome-button"
+            data-testid="txn-export-parquet"
+            disabled={exporting !== null}
+            onClick={() => void exportTable("parquet")}
+          >
+            {exporting === "parquet" ? "Exporting…" : "Export Parquet"}
+          </button>
+        </span>
       </div>
-      <Gantt />
+      {exportError && <div className="pane-note warn">Export failed: {exportError}</div>}
+      <Gantt
+        groupBy={groupBy}
+        collapsed={collapsed}
+        toggle={(key) =>
+          setCollapsed((before) => {
+            const next = new Set(before);
+            if (next.has(key)) next.delete(key);
+            else next.add(key);
+            return next;
+          })
+        }
+      />
       <FieldTable />
     </div>
   );
@@ -128,7 +193,15 @@ const Dot = () => <span className="dot">·</span>;
  * header): `view` changes on every frame of a pan, and putting a React render
  * on that path would cost the frame budget.
  */
-function Gantt() {
+function Gantt({
+  groupBy,
+  collapsed,
+  toggle,
+}: {
+  groupBy: "none" | "master" | "id";
+  collapsed: Set<string>;
+  toggle: (key: string) => void;
+}) {
   const rows = useWave((s) => s.txnRows);
   const selected = useWave((s) => s.txnSelected);
   const open = useWave((s) => s.openTransaction);
@@ -152,7 +225,7 @@ function Gantt() {
     const paint = () => {
       const { view } = useWave.getState();
       const span = Math.max(1, view.t1 - view.t0);
-      for (const child of Array.from(el.children) as HTMLElement[]) {
+      for (const child of Array.from(el.querySelectorAll<HTMLElement>("[data-t0]"))) {
         const t0 = Number(child.dataset.t0);
         const t1 = Number(child.dataset.t1);
         // Zoomed in, most transactions are far outside the window. Leaving them
@@ -169,14 +242,19 @@ function Gantt() {
     };
     paint();
     return useWave.subscribe(paint);
-  }, [rows]);
+  }, [rows, groupBy, collapsed]);
 
   if (!rows.length) return <div className="pane-note">No transactions on this interface.</div>;
 
-  return (
-    <div className="txn-gantt" data-testid="txn-gantt" style={{ height: rows.length * BAND_H }}>
-      <div className="txn-bands" ref={ref}>
-        {rows.map((t, i) => {
+  const groups = grouped(rows, groupBy);
+  const height = groups.reduce(
+    (sum, group) =>
+      sum + (groupBy === "none" ? 0 : BAND_H + 4) + (collapsed.has(group.key) ? 0 : group.rows.length * BAND_H),
+    0,
+  );
+
+  const bands = (items: Transaction[]) =>
+    items.map((t, i) => {
           const end = t.end_time ?? t.start_time;
           const cls = [
             "txn-band",
@@ -207,10 +285,49 @@ function Gantt() {
               </span>
             </button>
           );
-        })}
-      </div>
+        });
+
+  return (
+    <div className="txn-gantt" data-testid="txn-gantt" style={{ height }} ref={ref}>
+      {groups.map((group) => (
+        <div className="txn-group" key={group.key}>
+          {groupBy !== "none" && (
+            <button
+              className="txn-group-head"
+              data-testid={`txn-group-${group.key}`}
+              onClick={() => toggle(group.key)}
+            >
+              {collapsed.has(group.key) ? "▸" : "▾"} {group.label}
+              <span>{group.rows.length}</span>
+            </button>
+          )}
+          {!collapsed.has(group.key) && (
+            <div className="txn-bands" style={{ height: group.rows.length * BAND_H }}>
+              {bands(group.rows)}
+            </div>
+          )}
+        </div>
+      ))}
     </div>
   );
+}
+
+function grouped(
+  rows: Transaction[],
+  by: "none" | "master" | "id",
+): { key: string; label: string; rows: Transaction[] }[] {
+  if (by === "none") return [{ key: "all", label: "all", rows }];
+  const found = new Map<string, Transaction[]>();
+  for (const row of rows) {
+    const value = by === "master" ? row.iface : row.id === null ? "no ID" : String(row.id);
+    const key = `${by}:${value}`;
+    found.set(key, [...(found.get(key) ?? []), row]);
+  }
+  return [...found].map(([key, items]) => ({
+    key,
+    label: `${by === "master" ? "master" : "ID"} ${key.slice(key.indexOf(":") + 1)}`,
+    rows: items,
+  }));
 }
 
 /** Every field and metric, sortable — the lower half of §11.4b's TAB 8. */
@@ -224,12 +341,21 @@ function FieldTable() {
   const origin = useWave((s) => s.clockOrigin);
   const timescale = useWave((s) => s.status?.timescale ?? "1ns");
   const [sort, setSort] = useState<{ key: string; desc: boolean }>({ key: "", desc: false });
+  const [filter, setFilter] = useState("");
 
   const columns = useMemo(() => keysOf(rows), [rows]);
   const sorted = useMemo(() => {
-    if (!sort.key) return rows;
+    const needle = filter.trim().toLowerCase();
+    const filtered = needle
+      ? rows.filter((row) =>
+          [row.ref, row.kind, row.id, ...Object.values(row.fields), ...Object.values(row.metrics)]
+            .filter((value) => value !== null)
+            .some((value) => String(value).toLowerCase().includes(needle)),
+        )
+      : rows;
+    if (!sort.key) return filtered;
     const val = (t: Transaction) => cellValue(t, sort.key);
-    return [...rows].sort((a, b) => {
+    return [...filtered].sort((a, b) => {
       const x = val(a);
       const y = val(b);
       if (x === y) return 0;
@@ -237,7 +363,7 @@ function FieldTable() {
       if (y === null) return -1;
       return (x < y ? -1 : 1) * (sort.desc ? -1 : 1);
     });
-  }, [rows, sort]);
+  }, [rows, sort, filter]);
 
   // Cycles when a clock is known, raw time otherwise — §5.5's rule that a cycle
   // number is meaningless without one, applied here too.
@@ -248,6 +374,14 @@ function FieldTable() {
 
   return (
     <div className="txn-table-wrap">
+      <input
+        className="txn-filter"
+        value={filter}
+        onChange={(event) => setFilter(event.target.value)}
+        placeholder="Filter transactions by type, ID, field or metric…"
+        aria-label="Filter transactions"
+        data-testid="txn-filter"
+      />
       <table className="txn-table" data-testid="txn-table">
         <thead>
           <tr>
@@ -300,6 +434,7 @@ function FieldTable() {
           ))}
         </tbody>
       </table>
+      {sorted.length === 0 && <div className="pane-note">No transaction matches this filter.</div>}
     </div>
   );
 }

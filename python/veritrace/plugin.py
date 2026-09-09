@@ -1,4 +1,4 @@
-"""Analysis plugins — §13.7's second extension point.
+"""Analysis and exporter plugins — §13.7's second and third extension points.
 
 §13.7's promise is short and testable: **an analysis you add does not touch the
 core, and does not touch the UI.** Findings a plugin yields appear in the Checks
@@ -37,12 +37,15 @@ powerful and less useful:
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import sys
+import threading
 import traceback
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from veritrace.analysis.findings import Finding, Group, Severity
 
@@ -54,8 +57,21 @@ CAPABILITIES = ("trace", "graph", "transactions", "coverage", "memory", "perform
 USER_DIR = Path.home() / ".veritrace" / "plugins"
 PROJECT_DIR = "plugins"
 
-#: Registry, filled by `@register` when a plugin module is imported.
-_REGISTERED: list[type["Analysis"]] = []
+#: Registries filled by ``@register`` while a plugin module is imported.
+#:
+#: A process-wide mutable list looks harmless in a command-line program, but
+#: the API analyses and exports several projects concurrently.  In that case a
+#: discovery for project B could clear/replace the classes project A was about
+#: to use.  Context-local immutable snapshots isolate threads and async tasks;
+#: mutating a copied list in :func:`register` also prevents inherited contexts
+#: from sharing list storage.
+_REGISTERED: ContextVar[tuple[type["Analysis"], ...]] = ContextVar(
+    "veritrace_plugin_analyses", default=()
+)
+_EXPORTERS: ContextVar[tuple[type["Exporter"], ...]] = ContextVar(
+    "veritrace_plugin_exporters", default=()
+)
+_IMPORT_LOCK = threading.RLock()
 
 
 class PluginError(RuntimeError):
@@ -108,6 +124,10 @@ class Context:
         memory: Any = None,
         performance: Any = None,
         plugin: str = "",
+        query: str | None = None,
+        causal: Any = None,
+        findings: Any = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
         self.store = store
         self.graph = graph
@@ -122,6 +142,13 @@ class Context:
         self.coverage = coverage
         self.memory = memory
         self.performance = performance
+        #: Exporters receive the same narrow, stable view as analyses plus the
+        #: optional question/result that led to the report.  Analysis plugins
+        #: simply see these as ``None``.
+        self.query = query
+        self.causal = causal
+        self.findings = findings
+        self.metadata = dict(metadata or {})
         self._plugin = plugin
 
     # -- the trace -------------------------------------------------------
@@ -294,27 +321,78 @@ class Analysis:
         raise NotImplementedError
 
 
-def register(cls: type[Analysis]) -> type[Analysis]:
-    """Make a plugin visible. Idempotent, so re-importing a module is harmless."""
+class Exporter:
+    """Base class for a custom report format (§13.7).
+
+    Subclass it, set :attr:`name` and optional :attr:`needs`, then implement
+    :meth:`render`.  The returned text/bytes are written atomically by the real
+    ``veritrace export`` command; a plugin never has to know CLI paths.
+    """
+
+    #: Stable value accepted by ``veritrace export --format``.
+    name: str = ""
+    #: The same capability contract analysis plugins use.
+    needs: Sequence[str] = ()
+    #: One line shown by ``veritrace plugins``.
+    description: str = ""
+    #: Suggested suffix, for documentation/discovery.  The caller's explicit
+    #: output path remains authoritative.
+    extension: str = ""
+
+    def render(self, ctx: Context) -> str | bytes:
+        """Return the complete standalone artifact."""
+        raise NotImplementedError
+
+
+def register(cls):
+    """Make an :class:`Analysis` or :class:`Exporter` visible.
+
+    The one decorator is the "same mechanism" promised by §13.7.  Discovery
+    imports user plugins first and project plugins second, so replacement by
+    stable name makes the nearer project definition win deterministically.
+    """
     if not getattr(cls, "name", ""):
         raise PluginError(f"{cls.__name__} has no `name`")
+    if not issubclass(cls, (Analysis, Exporter)):
+        raise PluginError(f"{cls.__name__} must inherit Analysis or Exporter")
     bad = [n for n in cls.needs if n not in CAPABILITIES]
     if bad:
         raise PluginError(
             f"{cls.name} asks for {', '.join(bad)}; try one of {', '.join(CAPABILITIES)}"
         )
-    if cls not in _REGISTERED:
-        _REGISTERED.append(cls)
+    variable = _REGISTERED if issubclass(cls, Analysis) else _EXPORTERS
+    registry = list(variable.get())
+    # Discovery imports the user directory first and the project directory
+    # second.  Replacement by stable name is what makes the documented
+    # "project overrides user" rule real.
+    for i, old in enumerate(registry):
+        if old.name == cls.name:
+            registry[i] = cls
+            break
+    else:
+        registry.append(cls)
+    variable.set(tuple(registry))
     return cls
 
 
 def registered() -> list[type[Analysis]]:
-    return list(_REGISTERED)
+    return list(_REGISTERED.get())
+
+
+def exporters() -> list[type[Exporter]]:
+    """Every discovered exporter, in deterministic discovery order."""
+    return list(_EXPORTERS.get())
 
 
 def clear() -> None:
-    """Forget every plugin. For tests, and for a session that reloads them."""
-    _REGISTERED.clear()
+    """Forget plugins in this execution context.
+
+    Other request threads/tasks keep their own immutable snapshots.  This is
+    intentionally not a process-wide reset: one session reloading its project
+    must not invalidate an export already running for another session.
+    """
+    _REGISTERED.set(())
+    _EXPORTERS.set(())
 
 
 # --- discovery --------------------------------------------------------------
@@ -335,14 +413,24 @@ def discover(project_root: Path | str | None = None) -> tuple[list[type[Analysis
     still gets the other three, and the broken one is named. A discovery step
     that aborts on the first bad file is one people stop using.
     """
+    # Discovery describes exactly one user/project search path.  Retaining the
+    # preceding project's registry made a plugin appear installed merely
+    # because another session happened to have loaded it earlier.
+    clear()
     errors: dict[str, str] = {}
     for directory in search_path(project_root):
         for path in sorted(directory.glob("*.py")):
             if path.name.startswith("_"):
                 continue
+            analyses_before = _REGISTERED.get()
+            exporters_before = _EXPORTERS.get()
             try:
                 _import(path)
             except Exception as e:  # noqa: BLE001 - a bad plugin is data, not a crash
+                # A file may register one class and then fail.  Treat the file
+                # atomically so a reported-broken plugin cannot still execute.
+                _REGISTERED.set(analyses_before)
+                _EXPORTERS.set(exporters_before)
                 errors[path.name] = f"{type(e).__name__}: {e}"
     return registered(), errors
 
@@ -354,17 +442,26 @@ def _import(path: Path) -> None:
     `os` or `json` for the rest of the process, which is what appending it to
     `sys.path` would allow.
     """
-    name = f"veritrace_plugin_{path.stem}"
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise PluginError(f"cannot import {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(name, None)
-        raise
+    # A basename-only module key collided when two projects both contained
+    # ``plugins/checks.py``. Include the canonical path, while keeping the name
+    # stable so class introspection/pickling can still resolve its module.
+    identity = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:16]
+    name = f"veritrace_plugin_{path.stem}_{identity}"
+    # ``exec_module`` itself is not protected by Python's normal import lock.
+    # Serialising this small discovery boundary prevents two requests loading
+    # the same file from replacing its sys.modules entry during execution.
+    with _IMPORT_LOCK:
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise PluginError(f"cannot import {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            if sys.modules.get(name) is module:
+                sys.modules.pop(name, None)
+            raise
 
 
 # --- running ----------------------------------------------------------------
@@ -447,3 +544,62 @@ def run_all(
             if getattr(config, "debug", False):
                 traceback.print_exc()
     return out
+
+
+def run_exporter(
+    exporter: type[Exporter],
+    *,
+    store: Any = None,
+    graph: Any = None,
+    elaboration: Any = None,
+    clock: Any = None,
+    config: Any = None,
+    protocol: Any = None,
+    coverage: Any = None,
+    memory: Any = None,
+    performance: Any = None,
+    query: str | None = None,
+    causal: Any = None,
+    findings: Any = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> str | bytes:
+    """Render one exporter against production session data.
+
+    Unlike analysis plugins, an exporter failure is not a skippable finding:
+    it is the operation the user explicitly requested.  Raise a named
+    :class:`PluginError` so the CLI/API cannot claim an artifact was produced.
+    """
+    ctx = Context(
+        store=store,
+        graph=graph,
+        elaboration=elaboration,
+        clock=clock,
+        config=config,
+        protocol=protocol,
+        coverage=coverage,
+        memory=memory,
+        performance=performance,
+        query=query,
+        causal=causal,
+        findings=findings,
+        metadata=metadata,
+        plugin=exporter.name,
+    )
+    missing = [name for name in exporter.needs if not _available(ctx).get(name, False)]
+    if missing:
+        raise PluginError(
+            f"exporter {exporter.name!r} needs {', '.join(missing)}, "
+            "which this session has not got"
+        )
+    try:
+        artifact = exporter().render(ctx)
+    except Exception as exc:
+        raise PluginError(
+            f"exporter {exporter.name!r} failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(artifact, (str, bytes)):
+        raise PluginError(
+            f"exporter {exporter.name!r} returned {type(artifact).__name__}; "
+            "expected str or bytes"
+        )
+    return artifact

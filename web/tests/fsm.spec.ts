@@ -13,6 +13,7 @@
  */
 
 import { expect, test, type Page } from "@playwright/test";
+import { waitForReady } from "./session";
 
 const BACKEND = process.env.VERITRACE_BACKEND ?? "http://127.0.0.1:8765";
 
@@ -24,6 +25,7 @@ test.beforeAll(async ({ request }) => {
   });
   expect(r.ok(), await r.text()).toBeTruthy();
   session = (await r.json()).session_id as string;
+  await waitForReady(request, BACKEND, session);
 });
 
 /**
@@ -111,6 +113,54 @@ test("the diagram distinguishes what the run reached from what it did not", asyn
   await expect(diagram.locator(".fsm-edge.untaken")).not.toHaveCount(0);
 });
 
+test("clicking a visited state focuses Wave on a real interval in that state", async ({ page }) => {
+  await openFsm(page);
+  await page.locator('[data-testid="fsm-select"]').selectOption("tb_fsm.bad_dead.state");
+  const idle = page.locator('[data-testid="fsm-state-S_IDLE"]');
+  await expect(idle).toBeVisible({ timeout: 30_000 });
+  await idle.click();
+
+  await expect(page.locator('[data-testid="tab-1"]')).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator('[data-testid="status-note"]')).toContainText("interval 1 of");
+  const focused = await page.evaluate(() => {
+    const state = (
+      window as never as {
+        __vtStore: { getState(): { rows: { path?: string }[]; view: { t0: number; t1: number } } };
+      }
+    ).__vtStore.getState();
+    return { paths: state.rows.map((row) => row.path ?? ""), view: state.view };
+  });
+  expect(focused.paths).toContain("tb_fsm.bad_dead.state");
+  expect(focused.view.t1).toBeGreaterThan(focused.view.t0);
+});
+
+test("clicking an untaken transition runs uncovered and shows its guard", async ({ page }) => {
+  await openFsm(page);
+  await page.locator('[data-testid="fsm-select"]').selectOption("tb_fsm.bad_dead.state");
+  // SVG groups have no painted box of their own; exercise the visible guard
+  // label a user actually clicks (the event bubbles to the transition group).
+  const edge = page.locator(".fsm-edge.untaken text").first();
+  await expect(edge).toBeVisible({ timeout: 30_000 });
+  await edge.click();
+
+  await expect(page.locator('[data-testid="tab-7"]')).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator('[data-testid="insp-condition"]').first()).toBeVisible();
+  const holes = page.locator('[data-testid="cov-holes"]');
+  await expect(holes).toBeVisible();
+  const selected = holes.locator(".cov-hole.on");
+  await expect(selected).toHaveCount(1);
+  await selected.getByRole("button", { name: "open in Source" }).click();
+  await expect(page.locator('[data-testid="tab-3"]')).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator('[data-testid="insp-condition"]').first()).toBeVisible();
+  const query = await page.evaluate(
+    () =>
+      (
+        window as never as { __vtStore: { getState(): { queryText: string } } }
+      ).__vtStore.getState().queryText,
+  );
+  expect(query).toBe("uncovered(fsm_dut.sv)");
+});
+
 test("scrubbing the timeline moves the shared cursor", async ({ page }) => {
   await openFsm(page);
   const before = await page.evaluate(
@@ -149,7 +199,7 @@ test("the diagram exports as SVG", async ({ page }) => {
 
 test("the static findings are in the Checks tab", async ({ page }) => {
   await ready(page);
-  await page.locator('[data-testid="tab-5"]').click();
+  await page.locator('[data-testid="tab-6"]').click();
   const checks = page.locator('[data-testid="checks-tab"], .checks');
   await expect(checks.first()).toBeVisible();
   // §8.8: "apar direct in tab-ul Checks" — and the run that produced this dump

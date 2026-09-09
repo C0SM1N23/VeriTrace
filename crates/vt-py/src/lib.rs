@@ -70,7 +70,11 @@ impl Value {
     }
 
     fn __repr__(&self) -> String {
-        format!("Value('{}', width={})", self.inner.to_vcd_bits(), self.inner.width())
+        format!(
+            "Value('{}', width={})",
+            self.inner.to_vcd_bits(),
+            self.inner.width()
+        )
     }
 
     fn __eq__(&self, other: &Value) -> bool {
@@ -107,7 +111,10 @@ pub struct Signal {
 #[pymethods]
 impl Signal {
     fn __repr__(&self) -> String {
-        format!("Signal('{}', width={}, kind='{}')", self.path, self.width, self.kind)
+        format!(
+            "Signal('{}', width={}, kind='{}')",
+            self.path, self.width, self.kind
+        )
     }
 }
 
@@ -147,15 +154,19 @@ pub struct TraceStore {
 impl TraceStore {
     #[new]
     fn new(path: &str) -> PyResult<Self> {
-        Ok(TraceStore { inner: RsStore::open(path).map_err(map_err)? })
+        Ok(TraceStore {
+            inner: RsStore::open(path).map_err(map_err)?,
+        })
     }
 
     /// Convert a VCD (or FST, when built with the `fst` feature) to `.vtx` and
     /// open it.
     #[classmethod]
-    fn convert(_cls: &Bound<'_, PyType>, src: &str, out: &str) -> PyResult<Self> {
-        convert(src, out)?;
-        Ok(TraceStore { inner: RsStore::open(out).map_err(map_err)? })
+    fn convert(_cls: &Bound<'_, PyType>, py: Python<'_>, src: &str, out: &str) -> PyResult<Self> {
+        convert(py, src, out)?;
+        Ok(TraceStore {
+            inner: RsStore::open(out).map_err(map_err)?,
+        })
     }
 
     #[getter]
@@ -192,6 +203,19 @@ impl TraceStore {
     #[getter]
     fn source_bytes(&self) -> Option<u64> {
         self.inner.meta.source_bytes
+    }
+
+    /// Whether a dump still has the precise file identity recorded when this
+    /// store was built. `None` identifies a legacy store without that metadata;
+    /// callers then rebuild rather than treating size/mtime as proof.
+    fn source_identity_matches(&self, path: &str) -> PyResult<Option<bool>> {
+        self.inner.source_identity_matches(path).map_err(map_err)
+    }
+
+    /// Fast identity comparison, with a one-time hash fallback when metadata
+    /// changed. Equal bytes refresh provenance; unequal bytes return false.
+    fn verify_source(&mut self, path: &str) -> PyResult<bool> {
+        self.inner.verify_source(path).map_err(map_err)
     }
 
     fn signals(&self) -> Vec<Signal> {
@@ -246,7 +270,11 @@ impl TraceStore {
     fn transitions(&self, handle: u32, start: i64, end: i64) -> PyResult<Vec<(i64, Value)>> {
         self.inner
             .transitions(handle, start, end)
-            .map(|v| v.into_iter().map(|(t, val)| (t, Value { inner: val })).collect())
+            .map(|v| {
+                v.into_iter()
+                    .map(|(t, val)| (t, Value { inner: val }))
+                    .collect()
+            })
             .map_err(map_err)
     }
 
@@ -280,7 +308,10 @@ impl TraceStore {
     /// Settled value strictly before `t`. This is what NBA evaluation at a
     /// clock edge must use, not `value_at`.
     fn value_before(&self, handle: u32, t: i64) -> PyResult<Option<Value>> {
-        self.inner.value_before(handle, t).map(wrap).map_err(map_err)
+        self.inner
+            .value_before(handle, t)
+            .map(wrap)
+            .map_err(map_err)
     }
 
     /// Number of writes at exactly `t`; more than one means a combinational
@@ -291,7 +322,10 @@ impl TraceStore {
 
     /// Value at a specific delta of `t`, for inspecting a glitch.
     fn value_at_delta(&self, handle: u32, t: i64, delta: usize) -> PyResult<Option<Value>> {
-        self.inner.value_at_delta(handle, t, delta).map(wrap).map_err(map_err)
+        self.inner
+            .value_at_delta(handle, t, delta)
+            .map(wrap)
+            .map_err(map_err)
     }
 
     // ---- rendering windows (§10.2) --------------------------------------
@@ -322,8 +356,11 @@ impl TraceStore {
             }
             vt_trace::query::WaveMode::MinMax => {
                 d.set_item("mode", "minmax")?;
-                let rows: Vec<(i64, String, String, u32, u8)> =
-                    w.buckets.into_iter().map(|b| (b.t, b.min, b.max, b.n, b.flags)).collect();
+                let rows: Vec<(i64, String, String, u32, u8)> = w
+                    .buckets
+                    .into_iter()
+                    .map(|b| (b.t, b.min, b.max, b.n, b.flags))
+                    .collect();
                 d.set_item("transitions", rows)?;
             }
         }
@@ -332,12 +369,13 @@ impl TraceStore {
 
     // ---- whole-trace scans ----------------------------------------------
 
-    fn first_x_all(&self, py: Python<'_>) -> Vec<(u32, i64)> {
-        py.detach(|| self.inner.first_x_all())
+    fn first_x_all(&self, py: Python<'_>) -> PyResult<Vec<(u32, i64)>> {
+        py.detach(|| self.inner.first_x_all()).map_err(map_err)
     }
 
-    fn constant_signals(&self, py: Python<'_>, start: i64, end: i64) -> Vec<u32> {
+    fn constant_signals(&self, py: Python<'_>, start: i64, end: i64) -> PyResult<Vec<u32>> {
         py.detach(|| self.inner.constant_signals(start, end))
+            .map_err(map_err)
     }
 
     /// `last_change_before(t)` for every signal, indexed by handle.
@@ -345,17 +383,27 @@ impl TraceStore {
     /// Detaches from the interpreter for the duration: the scan is pure Rust
     /// over rayon's pool, so holding the GIL would serialise the very
     /// parallelism this call exists for.
-    fn last_change_all(&self, py: Python<'_>, t: i64) -> Vec<Option<i64>> {
-        py.detach(|| self.inner.last_change_all(t))
+    fn last_change_all(&self, py: Python<'_>, t: i64) -> PyResult<Vec<Option<i64>>> {
+        py.detach(|| self.inner.last_change_all(t)).map_err(map_err)
     }
 
     /// `value_at(t)` for many signals, in one parallel pass.
     ///
     /// The scan runs detached for the same reason `last_change_all` does; only
     /// the wrapping of the results into Python objects takes the GIL back.
-    fn value_at_all(&self, py: Python<'_>, handles: Vec<u32>, t: i64) -> Vec<Option<Value>> {
-        let got = py.detach(|| self.inner.value_at_all(&handles, t));
-        got.into_iter().map(|v| v.map(|inner| Value { inner })).collect()
+    fn value_at_all(
+        &self,
+        py: Python<'_>,
+        handles: Vec<u32>,
+        t: i64,
+    ) -> PyResult<Vec<Option<Value>>> {
+        let got = py
+            .detach(|| self.inner.value_at_all(&handles, t))
+            .map_err(map_err)?;
+        Ok(got
+            .into_iter()
+            .map(|v| v.map(|inner| Value { inner }))
+            .collect())
     }
 
     /// Timestamps where this signal's settled value becomes 1.
@@ -363,7 +411,8 @@ impl TraceStore {
     /// The clock edge list every cycle number is counted against (§5.5), and
     /// the sample points of a channel scan (§8.14).
     fn rising_edges(&self, py: Python<'_>, handle: u32) -> PyResult<Vec<i64>> {
-        py.detach(|| self.inner.rising_edges(handle)).map_err(map_err)
+        py.detach(|| self.inner.rising_edges(handle))
+            .map_err(map_err)
     }
 
     /// `value_before` for many signals at many timestamps, one linear pass each.
@@ -383,7 +432,11 @@ impl TraceStore {
             .map_err(map_err)?;
         Ok(rows
             .into_iter()
-            .map(|r| r.into_iter().map(|v| v.map(|inner| Value { inner })).collect())
+            .map(|r| {
+                r.into_iter()
+                    .map(|v| v.map(|inner| Value { inner }))
+                    .collect()
+            })
             .collect())
     }
 
@@ -398,7 +451,12 @@ impl TraceStore {
 
     fn __repr__(&self) -> String {
         let (a, b) = self.inner.time_range();
-        format!("TraceStore({} signals, t={}..{})", self.inner.n_signals(), a, b)
+        format!(
+            "TraceStore({} signals, t={}..{})",
+            self.inner.n_signals(),
+            a,
+            b
+        )
     }
 }
 
@@ -425,27 +483,37 @@ fn to_py_signal(s: &vt_trace::query::SignalMeta) -> Signal {
 
 /// Convert a waveform to a `.vtx` store. Dispatches on file extension.
 #[pyfunction]
-fn convert(src: &str, out: &str) -> PyResult<u64> {
-    let path = std::path::Path::new(src);
+fn convert(py: Python<'_>, src: &str, out: &str) -> PyResult<u64> {
+    let path = std::path::PathBuf::from(src);
+    let output = std::path::PathBuf::from(out);
     let is_fst = path
         .extension()
         .map(|e| e.eq_ignore_ascii_case("fst"))
         .unwrap_or(false);
-    let trace = if is_fst {
-        #[cfg(feature = "fst")]
-        {
-            vt_trace::fst::convert(path, out).map_err(map_err)?
-        }
-        #[cfg(not(feature = "fst"))]
-        {
-            return Err(PyValueError::new_err(
-                "FST support is not compiled in; rebuild with the `fst` feature \
-                 (needs zlib and libclang) or convert the dump to VCD first",
-            ));
-        }
-    } else {
-        vt_trace::store::convert_vcd(path, out).map_err(map_err)?
-    };
+    #[cfg(not(all(feature = "fst", not(windows))))]
+    if is_fst {
+        return Err(PyValueError::new_err(
+            "FST support is unavailable in this build. Linux/macOS builds need the \
+             `fst` feature plus zlib and libclang; the current Windows libfst binding \
+             cannot read FST hierarchy data. Convert the dump to VCD first",
+        ));
+    }
+    let trace = py
+        .detach(|| {
+            if is_fst {
+                #[cfg(all(feature = "fst", not(windows)))]
+                {
+                    vt_trace::fst::convert(&path, &output)
+                }
+                #[cfg(not(all(feature = "fst", not(windows))))]
+                {
+                    unreachable!("unsupported FST returned before detaching")
+                }
+            } else {
+                vt_trace::store::convert_vcd(&path, &output)
+            }
+        })
+        .map_err(map_err)?;
     Ok(trace.total_events() as u64)
 }
 
@@ -456,7 +524,10 @@ fn convert(src: &str, out: &str) -> PyResult<u64> {
 /// first non-null element, so a pack's own field names and metrics decide the
 /// schema (§6.3: the file is the export, not just a cache).
 #[pyfunction]
-fn write_txn_table(path: &str, columns: Vec<(String, Vec<Option<Bound<'_, PyAny>>>)>) -> PyResult<()> {
+fn write_txn_table(
+    path: &str,
+    columns: Vec<(String, Vec<Option<Bound<'_, PyAny>>>)>,
+) -> PyResult<()> {
     let mut cols: Vec<(String, RsColumn)> = Vec::with_capacity(columns.len());
     for (name, values) in columns {
         // Textual if *any* value is, not if the first one is. A read that came
@@ -478,7 +549,17 @@ fn write_txn_table(path: &str, columns: Vec<(String, Vec<Option<Bound<'_, PyAny>
                     .map(|v| match v {
                         None => Ok(None),
                         Some(v) => v.extract::<String>().map(Some).or_else(|_| {
-                            v.extract::<i64>().map(|i| Some(i.to_string()))
+                            if v.is_instance_of::<pyo3::types::PyInt>() {
+                                // HDL payloads routinely exceed i64 (AXI
+                                // data, 64-bit addresses, wide strobes).
+                                // Keep their exact decimal spelling in a
+                                // text column, never truncate or overflow.
+                                Ok(Some(v.str()?.to_str()?.to_owned()))
+                            } else {
+                                Err(PyValueError::new_err(format!(
+                                    "column `{name}` accepts only integers, strings or null"
+                                )))
+                            }
                         }),
                     })
                     .collect::<PyResult<Vec<_>>>()?,
@@ -519,7 +600,7 @@ fn read_txn_table<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDic
 /// True when this build can read FST files.
 #[pyfunction]
 fn has_fst_support() -> bool {
-    cfg!(feature = "fst")
+    cfg!(all(feature = "fst", not(windows)))
 }
 
 #[pyfunction]

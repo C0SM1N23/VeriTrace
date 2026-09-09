@@ -37,7 +37,15 @@ struct Lexer<R: Read> {
 
 impl<R: Read> Lexer<R> {
     fn new(r: R) -> Lexer<R> {
-        Lexer { r, buf: vec![0; 1 << 20], pos: 0, filled: 0, tok: Vec::with_capacity(64), line: 1, eof: false }
+        Lexer {
+            r,
+            buf: vec![0; 1 << 20],
+            pos: 0,
+            filled: 0,
+            tok: Vec::with_capacity(64),
+            line: 1,
+            eof: false,
+        }
     }
 
     fn fill(&mut self) -> io::Result<()> {
@@ -138,7 +146,10 @@ impl CodeTable {
 }
 
 fn err(line: usize, msg: impl Into<String>) -> Error {
-    Error::Vcd { line, msg: msg.into() }
+    Error::Vcd {
+        line,
+        msg: msg.into(),
+    }
 }
 
 /// Split a declared range suffix such as `[7:0]` or `[3]`.
@@ -216,15 +227,26 @@ pub fn parse_bytes(data: &[u8]) -> Result<Trace> {
     let mut codes = CodeTable::default();
     let mut stack: Vec<u32> = Vec::new();
     let mut stream_width: Vec<u32> = Vec::new();
-    read_declarations(&mut lx, &mut trace, &mut codes, &mut stack, &mut stream_width)?;
-
+    let mut stream_kind: Vec<Kind> = Vec::new();
+    let mut signals_by_path: HashMap<String, usize> = HashMap::new();
+    let complete = read_declarations(
+        &mut lx,
+        &mut trace,
+        &mut codes,
+        &mut stack,
+        &mut stream_width,
+        &mut stream_kind,
+        &mut signals_by_path,
+    )?;
+    if !complete {
+        return Err(err(lx.line, "missing $enddefinitions $end"));
+    }
     let n = rayon::current_num_threads().clamp(1, 64);
     let bounds = split_at_timestamps(data, split, n);
     if bounds.len() < 2 {
         return parse_reader(io::Cursor::new(data));
     }
 
-    let kinds: Vec<Kind> = trace.signals.iter().map(|s| s.kind).collect();
     let mut per_chunk: Vec<Result<(Vec<EventStream>, ChangeState)>> = Vec::new();
     bounds
         .par_windows(2)
@@ -232,7 +254,9 @@ pub fn parse_bytes(data: &[u8]) -> Result<Trace> {
             let mut streams: Vec<EventStream> = stream_width
                 .iter()
                 .enumerate()
-                .map(|(i, &wd)| EventStream::new(wd, kinds.get(i).copied().unwrap_or(Kind::Wire)))
+                .map(|(i, &wd)| {
+                    EventStream::new(wd, stream_kind.get(i).copied().unwrap_or(Kind::Wire))
+                })
                 .collect();
             let mut st = ChangeState::default();
             let mut lx = Lexer::new(io::Cursor::new(&data[w[0]..w[1]]));
@@ -263,7 +287,11 @@ pub fn parse_bytes(data: &[u8]) -> Result<Trace> {
 /// Byte offset just past `$enddefinitions ... $end`, if the file has one.
 fn header_end(data: &[u8]) -> Option<usize> {
     let at = find(data, b"$enddefinitions")?;
-    let end = find(&data[at..], b"$end")? + at;
+    // `$enddefinitions` itself starts with `$end`; search only after the
+    // keyword or a large file is split four bytes into that token and the
+    // parallel parser sees a truncated header.
+    let after = at + b"$enddefinitions".len();
+    let end = find(&data[after..], b"$end")? + after;
     Some(end + 4)
 }
 
@@ -288,7 +316,10 @@ fn split_at_timestamps(data: &[u8], start: usize, n: usize) -> Vec<usize> {
         // Forward to the next line that opens a timestamp. A `#` anywhere else
         // is part of a value or an identifier, so the newline is what makes the
         // boundary unambiguous.
-        match data[at..].windows(2).position(|w| w[0] == b'\n' && w[1] == b'#') {
+        match data[at..]
+            .windows(2)
+            .position(|w| w[0] == b'\n' && w[1] == b'#')
+        {
             Some(off) => {
                 let cut = at + off + 1;
                 if cut > *out.last().unwrap() {
@@ -311,12 +342,24 @@ pub fn parse_reader<R: Read>(r: R) -> Result<Trace> {
     // reopens them to declare array words), so entries are found-or-created.
     let mut stack: Vec<u32> = Vec::new();
     let mut stream_width: Vec<u32> = Vec::new();
-    if read_declarations(&mut lx, &mut trace, &mut codes, &mut stack, &mut stream_width)? {
-        let mut st = ChangeState::default();
-        parse_changes(&mut lx, &mut trace.streams, &codes, &stream_width, &mut st)?;
-        trace.t_min = st.first.unwrap_or(0);
-        trace.t_max = if st.saw_time { st.t_max } else { trace.t_min };
+    let mut stream_kind: Vec<Kind> = Vec::new();
+    let mut signals_by_path: HashMap<String, usize> = HashMap::new();
+    let complete = read_declarations(
+        &mut lx,
+        &mut trace,
+        &mut codes,
+        &mut stack,
+        &mut stream_width,
+        &mut stream_kind,
+        &mut signals_by_path,
+    )?;
+    if !complete {
+        return Err(err(lx.line, "missing $enddefinitions $end"));
     }
+    let mut st = ChangeState::default();
+    parse_changes(&mut lx, &mut trace.streams, &codes, &stream_width, &mut st)?;
+    trace.t_min = st.first.unwrap_or(0);
+    trace.t_max = if st.saw_time { st.t_max } else { trace.t_min };
     Ok(trace)
 }
 
@@ -328,107 +371,146 @@ fn read_declarations<R: Read>(
     codes: &mut CodeTable,
     stack: &mut Vec<u32>,
     stream_width: &mut Vec<u32>,
+    stream_kind: &mut Vec<Kind>,
+    signals_by_path: &mut HashMap<String, usize>,
 ) -> Result<bool> {
     while lx.next()? {
         let line = lx.line;
         if lx.tok.is_empty() {
             continue;
         }
-        match lx.tok[0] {
-            b'$' => {
-                let kw = String::from_utf8_lossy(&lx.tok[1..]).to_string();
-                match kw.as_str() {
-                    "date" => trace.date = Some(read_text(lx, line)?),
-                    "version" => trace.version = Some(read_text(lx, line)?),
-                    "comment" => {
-                        read_text(lx, line)?;
-                    }
-                    "timescale" => {
-                        let text = read_text(lx, line)?;
-                        trace.timescale = parse_timescale(&text)
-                            .ok_or_else(|| err(line, format!("bad timescale {text:?}")))?;
-                    }
-                    "scope" => {
-                        let parts = read_tokens(lx, line)?;
-                        let kind = parts.first().cloned().unwrap_or_else(|| "module".into());
-                        let name = parts.get(1).cloned().unwrap_or_default();
-                        let parent = stack.last().copied();
-                        let existing = trace
-                            .scopes
-                            .iter()
-                            .position(|s| s.parent == parent && s.name == name);
-                        let idx = match existing {
-                            Some(i) => i as u32,
-                            None => {
-                                trace.scopes.push(Scope { name, kind, parent });
-                                (trace.scopes.len() - 1) as u32
-                            }
-                        };
-                        stack.push(idx);
-                    }
-                    "upscope" => {
-                        read_tokens(lx, line)?;
-                        stack.pop();
-                    }
-                    "var" => {
-                        let parts = read_tokens(lx, line)?;
-                        if parts.len() < 4 {
-                            return Err(err(line, "$var needs type, width, code and name"));
+        if lx.tok[0] == b'$' {
+            let kw = String::from_utf8_lossy(&lx.tok[1..]).to_string();
+            match kw.as_str() {
+                "date" => trace.date = Some(read_text(lx, line)?),
+                "version" => trace.version = Some(read_text(lx, line)?),
+                "comment" => {
+                    read_text(lx, line)?;
+                }
+                "timescale" => {
+                    let text = read_text(lx, line)?;
+                    trace.timescale = parse_timescale(&text)
+                        .ok_or_else(|| err(line, format!("bad timescale {text:?}")))?;
+                }
+                "scope" => {
+                    let parts = read_tokens(lx, line)?;
+                    let kind = parts.first().cloned().unwrap_or_else(|| "module".into());
+                    let name = parts.get(1).cloned().unwrap_or_default();
+                    let parent = stack.last().copied();
+                    let existing = trace
+                        .scopes
+                        .iter()
+                        .position(|s| s.parent == parent && s.name == name);
+                    let idx = match existing {
+                        Some(i) => i as u32,
+                        None => {
+                            trace.scopes.push(Scope { name, kind, parent });
+                            (trace.scopes.len() - 1) as u32
                         }
-                        let kind = Kind::from_vcd(&parts[0]);
-                        let width: u32 = parts[1]
-                            .parse()
-                            .map_err(|_| err(line, format!("bad width {:?}", parts[1])))?;
-                        let code = parts[2].clone();
-                        let raw_name = unescape_name(&parts[3]);
-                        let suffix = parts.get(4).cloned().unwrap_or_default();
-                        let (msb, lsb) = parse_range(&suffix);
+                    };
+                    stack.push(idx);
+                }
+                "upscope" => {
+                    read_tokens(lx, line)?;
+                    stack.pop();
+                }
+                "var" => {
+                    let parts = read_tokens(lx, line)?;
+                    if parts.len() < 4 {
+                        return Err(err(line, "$var needs type, width, code and name"));
+                    }
+                    let kind = Kind::from_vcd(&parts[0]);
+                    let width: u32 = parts[1]
+                        .parse()
+                        .map_err(|_| err(line, format!("bad width {:?}", parts[1])))?;
+                    let code = parts[2].clone();
+                    let raw_name = unescape_name(&parts[3]);
+                    let suffix = parts.get(4).cloned().unwrap_or_default();
+                    let (msb, lsb) = parse_range(&suffix);
+                    // ModelSim commonly emits a packed input one bit at a time:
+                    // `$var wire 1 ! data [31] $end`.  `[31]` is part of that
+                    // scalar signal's identity, not merely range metadata. If
+                    // it is dropped, all 32 declarations collapse to the same
+                    // `scope.data` path and the resulting store is unusable.
+                    // A full vector range (`[31:0]`) and an already-subscripted
+                    // unpacked-array name keep their existing representation.
+                    let name = if width == 1
+                        && !suffix.contains(':')
+                        && msb.is_some()
+                        && array_index_of(&raw_name).is_none()
+                    {
+                        format!("{raw_name}{suffix}")
+                    } else {
+                        raw_name
+                    };
 
-                        let stream = match codes.get(code.as_bytes()) {
-                            Some(id) => id,
-                            None => {
-                                let id = trace.streams.len() as u32;
-                                trace.streams.push(EventStream::new(width.max(1), kind));
-                                stream_width.push(width.max(1));
-                                codes.insert(code.as_bytes(), id);
-                                id
-                            }
-                        };
+                    let stream = match codes.get(code.as_bytes()) {
+                        Some(id) => id,
+                        None => {
+                            let id = trace.streams.len() as u32;
+                            trace.streams.push(EventStream::new(width.max(1), kind));
+                            stream_width.push(width.max(1));
+                            stream_kind.push(kind);
+                            codes.insert(code.as_bytes(), id);
+                            id
+                        }
+                    };
 
-                        let hier: Vec<String> =
-                            stack.iter().map(|i| trace.scopes[*i as usize].name.clone()).collect();
-                        trace.signals.push(Signal {
-                            id: SignalId { hier, name: raw_name.clone() },
-                            width: width.max(1),
-                            kind,
-                            stream,
-                            msb,
-                            lsb,
-                            array_index: array_index_of(&raw_name),
-                            code,
-                        });
+                    let hier: Vec<String> = stack
+                        .iter()
+                        .map(|i| trace.scopes[*i as usize].name.clone())
+                        .collect();
+                    let signal = Signal {
+                        id: SignalId { hier, name },
+                        width: width.max(1),
+                        kind,
+                        stream,
+                        msb,
+                        lsb,
+                        array_index: None,
+                        code,
+                    };
+                    let mut signal = signal;
+                    signal.array_index = array_index_of(&signal.id.name);
+                    let path = signal.path();
+                    if let Some(&old_idx) = signals_by_path.get(&path) {
+                        let old = &trace.signals[old_idx];
+                        if old.stream == signal.stream
+                            && old.width == signal.width
+                            && old.kind == signal.kind
+                            && old.msb == signal.msb
+                            && old.lsb == signal.lsb
+                        {
+                            // Some simulators reopen a scope and repeat the
+                            // exact declarations when both `$dumpvars` and a
+                            // viewer-side recursive VCD selection are active.
+                            // It is one signal, not an alias with a second name.
+                            continue;
+                        }
+                        return Err(err(line, format!("conflicting declarations for {path}")));
                     }
-                    "enddefinitions" => {
-                        read_tokens(lx, line)?;
-                        // Declarations are over. What follows is value changes,
-                        // and one implementation of those serves both the serial
-                        // reader and the parallel one (`parse_bytes`).
-                        return Ok(true);
-                    }
-                    // Value-carrying sections. Their contents are ordinary value
-                    // changes, handled by the main loop; the closing $end is a
-                    // no-op below.
-                    "dumpall" | "dumpvars" | "dumpon" | "dumpoff" | "end" => {}
-                    _ => {
-                        // Unknown section: skip to its $end if it has one.
-                        read_text(lx, line)?;
-                    }
+                    signals_by_path.insert(path, trace.signals.len());
+                    trace.signals.push(signal);
+                }
+                "enddefinitions" => {
+                    read_tokens(lx, line)?;
+                    // Declarations are over. What follows is value changes,
+                    // and one implementation of those serves both the serial
+                    // reader and the parallel one (`parse_bytes`).
+                    return Ok(true);
+                }
+                // Value-carrying sections. Their contents are ordinary value
+                // changes, handled by the main loop; the closing $end is a
+                // no-op below.
+                "dumpall" | "dumpvars" | "dumpon" | "dumpoff" | "end" => {}
+                _ => {
+                    // Unknown section: skip to its $end if it has one.
+                    read_text(lx, line)?;
                 }
             }
-            // A value change before `$enddefinitions` is not legal VCD; nothing
-            // reaches here in a well-formed file, and skipping beats guessing.
-            _ => {}
         }
+        // A value change before `$enddefinitions` is not legal VCD; nothing
+        // reaches here in a well-formed file, and skipping beats guessing.
     }
 
     Ok(false)
@@ -466,13 +548,18 @@ fn parse_changes<R: Read>(
                 // changes and their `$end` is a no-op; anything else is skipped
                 // to its own `$end`.
                 let kw = String::from_utf8_lossy(&lx.tok[1..]).to_string();
-                if !matches!(kw.as_str(), "dumpall" | "dumpvars" | "dumpon" | "dumpoff" | "end") {
+                if !matches!(
+                    kw.as_str(),
+                    "dumpall" | "dumpvars" | "dumpon" | "dumpoff" | "end"
+                ) {
                     read_text(lx, line)?;
                 }
             }
             b'#' => {
                 let s = std::str::from_utf8(&lx.tok[1..]).map_err(|_| err(line, "bad time"))?;
-                st.t = s.parse().map_err(|_| err(line, format!("bad time {s:?}")))?;
+                st.t = s
+                    .parse()
+                    .map_err(|_| err(line, format!("bad time {s:?}")))?;
                 st.saw_time = true;
                 if st.first.is_none() {
                     st.first = Some(st.t);
@@ -496,11 +583,18 @@ fn parse_changes<R: Read>(
                 };
                 let width = stream_width[stream];
                 let v = match lead {
-                    b'b' | b'B' => parse_vcd_vector(&digits, width)
-                        .ok_or_else(|| err(line, format!("bad vector b{}", String::from_utf8_lossy(&digits))))?,
+                    b'b' | b'B' => parse_vcd_vector(&digits, width).ok_or_else(|| {
+                        err(
+                            line,
+                            format!("bad vector b{}", String::from_utf8_lossy(&digits)),
+                        )
+                    })?,
                     b'r' | b'R' => {
                         let s = String::from_utf8_lossy(&digits);
-                        Value::Real(s.parse().map_err(|_| err(line, format!("bad real {s:?}")))?)
+                        Value::Real(
+                            s.parse()
+                                .map_err(|_| err(line, format!("bad real {s:?}")))?,
+                        )
                     }
                     _ => Value::Str(String::from_utf8_lossy(&digits).to_string()),
                 };
@@ -537,8 +631,7 @@ fn read_tokens<R: Read>(lx: &mut Lexer<R>, line: usize) -> Result<Vec<String>> {
     let mut out = Vec::new();
     loop {
         if !lx.next()? {
-            // Tolerate a missing final $end rather than discarding the parse.
-            return Ok(out);
+            return Err(err(line, "unterminated section (missing $end)"));
         }
         if lx.tok == b"$end" {
             return Ok(out);
@@ -555,7 +648,10 @@ fn parse_timescale(s: &str) -> Option<Timescale> {
     let split = s.find(|c: char| c.is_ascii_alphabetic())?;
     let (num, unit) = s.split_at(split);
     let num: u32 = if num.is_empty() { 1 } else { num.parse().ok()? };
-    Some(Timescale { num, unit_exp: Timescale::parse_unit(unit)? })
+    Some(Timescale {
+        num,
+        unit_exp: Timescale::parse_unit(unit)?,
+    })
 }
 
 #[cfg(test)]
@@ -694,6 +790,49 @@ $enddefinitions $end
     }
 
     #[test]
+    fn modelsim_scalarised_bus_bits_have_distinct_paths_and_repeated_scopes_deduplicate() {
+        let src = "\
+$timescale 1ns $end
+$scope module top $end
+$scope module dut $end
+$var wire 1 ! data [1] $end
+$var wire 1 \" data [0] $end
+$upscope $end
+$scope module dut $end
+$var wire 1 ! data [1] $end
+$var wire 1 \" data [0] $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+#0
+0!
+1\"
+";
+        let trace = parse_str(src).unwrap();
+        let paths: Vec<_> = trace.signals.iter().map(Signal::path).collect();
+        assert_eq!(paths, ["top.dut.data[1]", "top.dut.data[0]"]);
+        assert_eq!(trace.streams.len(), 2);
+        assert_eq!(trace.signals[0].array_index, Some(1));
+        assert_eq!(trace.signals[1].array_index, Some(0));
+    }
+
+    #[test]
+    fn conflicting_duplicate_signal_paths_are_rejected() {
+        let src = "\
+$scope module top $end
+$var wire 1 ! data $end
+$var wire 1 \" data $end
+$upscope $end
+$enddefinitions $end
+";
+        let error = parse_str(src).unwrap_err().to_string();
+        assert!(
+            error.contains("conflicting declarations for top.data"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn real_and_string_values() {
         let src = "\
 $timescale 1ns $end
@@ -734,5 +873,38 @@ $enddefinitions $end
         assert_eq!(parse_timescale("1ps").unwrap().to_string(), "1ps");
         assert_eq!(parse_timescale("10 ns").unwrap().to_string(), "10ns");
         assert_eq!(parse_timescale("100us").unwrap().to_string(), "100us");
+    }
+
+    #[test]
+    fn arbitrary_text_is_not_a_successful_empty_waveform() {
+        let error = parse_str("this is not a waveform").unwrap_err().to_string();
+        assert!(error.contains("missing $enddefinitions"), "{error}");
+    }
+
+    #[test]
+    fn a_valid_empty_top_is_still_a_waveform() {
+        let trace = parse_str("$timescale 1ns $end\n$enddefinitions $end\n").unwrap();
+        assert!(trace.signals.is_empty());
+        assert_eq!(trace.timescale.to_string(), "1ns");
+    }
+
+    #[test]
+    fn parallel_header_split_skips_the_end_prefix_in_enddefinitions() {
+        let data = b"$enddefinitions $end\n#0\n";
+        assert_eq!(header_end(data), Some("$enddefinitions $end".len()));
+    }
+
+    #[test]
+    fn truncated_enddefinitions_is_rejected() {
+        let src = "$scope module top $end\n$var wire 1 ! a $end\n$upscope $end\n\
+$enddefinitions";
+        let error = parse_str(src).unwrap_err().to_string();
+        assert!(error.contains("unterminated section"), "{error}");
+    }
+
+    #[test]
+    fn truncated_header_section_is_rejected() {
+        let error = parse_str("$date unfinished").unwrap_err().to_string();
+        assert!(error.contains("unterminated section"), "{error}");
     }
 }

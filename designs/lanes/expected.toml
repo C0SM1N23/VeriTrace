@@ -19,3 +19,6 @@ not_reason = "out_of_range"
 # around.
 reaches = "tb_lanes.dut.g_lane[2].u_fifo.mem[8]"
 detail_contains = "not in the trace"
+
+[checks]
+forbidden_groups = ["x_sources", "protocol", "integrity"]

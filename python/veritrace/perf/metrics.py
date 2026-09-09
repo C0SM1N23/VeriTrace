@@ -21,7 +21,8 @@ ambiguous is a metric people argue about instead of using:
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Sequence
+from dataclasses import replace
+from typing import Any, Sequence
 
 from veritrace.perf.model import (
     AgentShare,
@@ -38,6 +39,35 @@ from veritrace.protocol.model import Extraction, Transaction
 #: draw; the window width follows from the run length rather than being fixed,
 #: so a 500-cycle trace and a 5-million-cycle one both come back readable.
 SERIES_POINTS = 120
+
+
+def in_window(ex: Extraction, t0: int, t1: int) -> Extraction:
+    """Metric view of [t0, t1], without mutating the stored extraction.
+
+    Transfers are counted inside the window. Latency measures transactions
+    completing there, retaining their actual issue-to-completion durations.
+    """
+    perf = ex.perf
+    if perf is not None:
+        lo, hi = perf.window(t0, t1)
+        perf = replace(perf, **{
+            name: getattr(perf, name)[lo:hi]
+            for name in ("edges", "labels", "requesting", "transferring", "outstanding", "blocked_on")
+        })
+    transactions = [
+        replace(
+            txn,
+            end_time=txn.end_time if txn.end_time is not None and txn.end_time <= t1 else None,
+            events=[event for event in txn.events if t0 <= event.time <= t1],
+        )
+        for txn in ex.transactions
+        if txn.start_time <= t1 and (txn.end_time is None or txn.end_time >= t0)
+    ]
+    return replace(
+        ex, perf=perf, transactions=transactions,
+        sampled_cycles=len(perf) if perf is not None else 0,
+        beats=[beat for beat in ex.beats if t0 <= beat.time <= t1],
+    )
 
 
 def _windows(n_cycles: int, points: int = SERIES_POINTS) -> int:

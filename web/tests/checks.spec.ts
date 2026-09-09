@@ -10,6 +10,7 @@
  */
 
 import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
+import { waitForReady } from "./session";
 
 const BACKEND = process.env.VERITRACE_BACKEND ?? "http://127.0.0.1:8765";
 
@@ -44,6 +45,7 @@ test.beforeAll(async ({ request }) => {
   });
   expect(r.ok(), `could not open designs/checks: ${await r.text()}`).toBeTruthy();
   sessionId = (await r.json()).session_id;
+  await waitForReady(request, BACKEND, sessionId);
 });
 
 /** Clear any suppression a previous run left behind (P5 keeps them on disk). */
@@ -63,7 +65,7 @@ test("the session opens on Checks with the findings already there", async ({ pag
   // §11.4b + §13.4: no click, no query — the first thing on screen is what the
   // tool already knows.
   await open(page);
-  await expect(page.locator('[data-testid="tab-5"]')).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator('[data-testid="tab-6"]')).toHaveAttribute("aria-selected", "true");
   await expect(page.locator('[data-testid="checks-badge"]')).toBeVisible();
   await expect(page.locator('[data-testid="check-row"]').first()).toBeVisible();
 });
@@ -154,6 +156,20 @@ test("the filter narrows the list without hiding the section structure", async (
   for (const text of await rows.allInnerTexts()) {
     expect(text).toContain("lock_r");
   }
+});
+
+test("findings can be filtered by severity and type", async ({ page }) => {
+  await open(page);
+  await page.locator('[data-testid="checks-severity"]').selectOption("error");
+  const errors = page.locator('[data-testid="check-row"]');
+  await expect(errors.first()).toBeVisible();
+  for (const text of await errors.locator(".sev").allInnerTexts()) expect(text).toBe("ERROR");
+
+  await page.locator('[data-testid="checks-severity"]').selectOption("");
+  await page.locator('[data-testid="checks-group"]').selectOption("x_sources");
+  const typed = page.locator('[data-testid="check-row"]');
+  await expect(typed.first()).toBeVisible();
+  for (const row of await typed.all()) await expect(row).toHaveAttribute("data-check", /x_/);
 });
 
 test("the stuck window can be narrowed without restarting the server", async ({ page }) => {

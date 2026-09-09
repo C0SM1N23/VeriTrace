@@ -91,6 +91,10 @@ designs/*/.veritrace.toml
 # The simulation command `run` records for `export` to quote (§13.4b). Absolute
 # paths from one machine; regenerated on every run.
 designs/*/sim.command
+# Records which simulator artifact the reference Makefile just produced.  This
+# prevents an old dump.fst from silently winning over a fresh dump.vcd (or the
+# reverse) without making machine-local build state part of the repository.
+designs/*/.veritrace-trace
 
 # §13.6's regression database. A real project commits its own on purpose; the
 # one written while testing the reference designs is not history worth keeping.

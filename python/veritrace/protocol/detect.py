@@ -77,6 +77,35 @@ def _find_named(
     return None
 
 
+def configured_signal(store: Any, path: str | None) -> str | None:
+    """Resolve a configured clock/reset path against this design.
+
+    Configuration normally carries the full hierarchy, but ``init`` can only
+    infer the declaration name before a trace is available.  A unique suffix
+    therefore remains useful; an ambiguous suffix is deliberately refused
+    rather than attaching the wrong reset to every protocol interface (P1).
+    """
+    if not path:
+        return None
+    handle = store.find(path)
+    if handle is not None:
+        try:
+            # Trace stores return an integer handle; the RTL adapter returns the
+            # path itself and its ``signal`` is an identity-class view without a
+            # path.  Preserve the configured spelling in that case.
+            signal = store.signal(handle)
+            resolved = getattr(signal, "path", None)
+            if resolved:
+                return str(resolved)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            pass
+        return path
+
+    suffix = "." + path
+    matches = [s.path for s in store.signals() if s.path == path or s.path.endswith(suffix)]
+    return matches[0] if len(matches) == 1 else None
+
+
 #: `prefix_strip = ["*"]` — infer the prefix from the design instead of listing
 #: it. A generic pack cannot enumerate what people call their buses, and without
 #: this `handshake.vtp` would only ever match a signal literally named `valid`.
@@ -202,6 +231,7 @@ def detect(
     packs = list(packs)
     index = _scope_index(store)
     ignored = list(getattr(config, "protocol_ignore", ()) or ())
+    configured_reset = configured_signal(store, getattr(config, "reset_signal", None))
 
     candidates: list[tuple[int, Interface]] = []
     for scope, names in index.items():
@@ -222,7 +252,12 @@ def detect(
                             pack=pack,
                             signals=resolved,
                             clock=_find_named(index, scope, pack.detect.clock, prefix),
-                            reset=_find_named(index, scope, pack.detect.reset, prefix),
+                            # §4.3 names this once for the project.  Previously
+                            # the field was parsed and then never read, so a
+                            # non-conventional reset name made transfers during
+                            # reset appear as real protocol traffic.
+                            reset=configured_reset
+                            or _find_named(index, scope, pack.detect.reset, prefix),
                         ),
                     )
                 )

@@ -17,9 +17,10 @@
  */
 
 import { useEffect, useState } from "react";
+import { fetchValues } from "../api/client";
+import { format } from "../lib/radix";
 import { formatTime } from "../lib/time";
-import { useWave } from "../state/store";
-import { valueAt } from "../state/values";
+import { enumLabelsFor, useWave } from "../state/store";
 
 export function Inspector() {
   const open = useWave((s) => s.inspectorOpen);
@@ -35,12 +36,18 @@ function Selection() {
   const tab = useWave((s) => s.activeTab);
   const txnSelected = useWave((s) => s.txnSelected);
   const covHole = useWave((s) => s.covHole);
+  const coverage = useWave((s) => s.coverage);
+  const sourceLoc = useWave((s) => s.sourceLoc);
 
   // The tab decides what "the selection" means, because that is what the user
   // just clicked. Falling back to the signal keeps the column useful rather
   // than empty when a tab has nothing of its own selected.
   if (tab === 8 && txnSelected) return <TxnDetail />;
   if (tab === 7 && covHole) return <HoleDetail />;
+  if (tab === 3 && covHole && coverage?.holes.some((h) =>
+    `${h.file}:${h.line}:${h.label}` === covHole &&
+    h.file === sourceLoc?.file && h.line === sourceLoc?.line,
+  )) return <HoleDetail />;
   return <SignalDetail />;
 }
 
@@ -63,17 +70,30 @@ function SignalDetail() {
   const origin = useWave((s) => s.clockOrigin);
   const runWhy = useWave((s) => s.runWhy);
   const runCone = useWave((s) => s.runCone);
+  const session = useWave((s) => s.session);
+  const radix = useWave((s) => s.radix);
+  const machines = useWave((s) => s.machines);
   const sig = handle !== null ? byHandle.get(handle) : undefined;
 
-  // The canvas refetches as the view moves, so the value under the cursor is
-  // read on a tick rather than memoised against data that changes underneath.
+  // Inspector values are facts, not pixels.  Ask the store for the exact
+  // settled value instead of reading a downsampled canvas bucket.
   const [value, setValue] = useState<string | null>(null);
   useEffect(() => {
-    const read = () => setValue(handle === null || cursor === null ? null : valueAt(handle, cursor));
-    read();
-    const id = window.setInterval(read, 250);
-    return () => window.clearInterval(id);
-  }, [handle, cursor]);
+    let live = true;
+    setValue(null);
+    if (handle === null || cursor === null || !session) return () => { live = false; };
+    void fetchValues(
+      session,
+      [handle],
+      cursor,
+      sig?.derived ? { [handle]: sig.path } : {},
+    )
+      .then((values) => live && setValue(values.get(handle) ?? null))
+      .catch(() => live && setValue(null));
+    return () => {
+      live = false;
+    };
+  }, [handle, cursor, session, sig?.derived, sig?.path]);
 
   if (!sig) {
     return (
@@ -96,7 +116,15 @@ function SignalDetail() {
       </header>
 
       <section>
-        <Field label="value" value={value ?? "—"} title="At the cursor" />
+        <Field
+          label="value"
+          value={
+            value === null
+              ? "—"
+              : format(value, sig.width, radix[sig.path] ?? "hex", enumLabelsFor(machines, sig.path))
+          }
+          title="Exact settled value at the cursor"
+        />
         <Field
           label="at"
           value={cursor === null ? "—" : formatTime(cursor, timescale)}

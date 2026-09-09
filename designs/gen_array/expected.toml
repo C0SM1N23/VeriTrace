@@ -1,0 +1,11 @@
+design = "gen_array"
+top = "tb_gen_array"
+bug = "none"
+correlation_min = 99
+
+[[why]]
+question = "why(tb_gen_array.dut.g_lane[2].u_lane.dout)"
+reaches = "tb_gen_array.dut.g_lane[2].u_lane.din"
+
+[checks]
+forbidden_groups = ["x_sources", "protocol", "integrity"]

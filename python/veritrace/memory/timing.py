@@ -16,8 +16,11 @@ editing the tool.
 from __future__ import annotations
 
 import tomllib
+import math
 from dataclasses import dataclass, fields
+from fractions import Fraction
 from pathlib import Path
+import re
 from typing import Any
 
 from veritrace.protocol.pack import builtin_dir as _packs_dir
@@ -74,18 +77,36 @@ def loads(text: str, path: Path | None = None) -> ChipTiming:
         raise TimingError(f"{path or '<timing>'}: {e}") from e
 
     name = str(data.get("name") or (path.stem if path else "chip"))
+    unknown = set(data) - {"name", *NS_FIELDS, *CYCLE_FIELDS}
+    if unknown:
+        raise TimingError(f"{name}: unknown timing parameter(s): {', '.join(sorted(unknown))}")
     missing = [k for k in (*NS_FIELDS, *CYCLE_FIELDS) if k not in data]
     if missing:
         raise TimingError(f"{name}: missing timing parameter(s): {', '.join(missing)}")
     try:
         kwargs: dict[str, Any] = {k: float(data[k]) for k in NS_FIELDS}
         kwargs.update({k: int(data[k]) for k in CYCLE_FIELDS})
-    except (TypeError, ValueError) as e:
+    except (TypeError, ValueError, OverflowError) as e:
         raise TimingError(f"{name}: timing parameters must be numbers") from e
     for k, v in kwargs.items():
+        if isinstance(data[k], bool) or not math.isfinite(v):
+            raise TimingError(f"{name}: {k} must be a finite number")
+        if k in CYCLE_FIELDS and float(data[k]) != v:
+            raise TimingError(f"{name}: {k} must be a whole number of cycles")
         if v < 0:
             raise TimingError(f"{name}: {k} cannot be negative")
     return ChipTiming(name=name, path=path, **kwargs)
+
+
+def to_ticks(ns: float, timescale: str, *, maximum: bool = False) -> int | None:
+    """Round a minimum up and a maximum down, without weakening either bound."""
+    from veritrace.clocks import UNIT_FS
+
+    match = re.fullmatch(r"\s*(\d+)\s*(s|ms|us|ns|ps|fs)\s*", timescale.lower())
+    if match is None or int(match[1]) == 0 or not math.isfinite(ns) or ns < 0:
+        return None
+    exact = Fraction(str(ns)) * UNIT_FS["ns"] / (int(match[1]) * UNIT_FS[match[2]])
+    return exact.numerator // exact.denominator if maximum else -(-exact.numerator // exact.denominator)
 
 
 def load(path: Path | str) -> ChipTiming:
@@ -111,14 +132,33 @@ def search_path(project_root: Path | str | None = None) -> list[Path]:
     return out
 
 
-def discover(project_root: Path | str | None = None) -> list[ChipTiming]:
+def discover(project_root: Path | str | None = None, errors: list[str] | None = None) -> list[ChipTiming]:
     """Every chip timing file on the search path, project ones shadowing
     built-ins — for a `chip=` dropdown that needs to list what is available."""
-    seen: dict[str, ChipTiming] = {}
+    seen: set[str] = set()
+    out: list[ChipTiming] = []
     for d in search_path(project_root):
         for f in sorted(d.glob(f"*{SUFFIX}")):
-            seen.setdefault(f.stem, load(f))
-    return list(seen.values())
+            if f.stem in seen:
+                continue
+            seen.add(f.stem)
+            try:
+                out.append(load(f))
+            except TimingError as exc:
+                if errors is None:
+                    raise
+                errors.append(str(exc))
+    return out
+
+
+def resolve_choice(choice: Any, project_root: Path | str | None = None) -> ChipTiming:
+    """Validate a persisted/UI choice without writing arbitrary project files."""
+    if not isinstance(choice, dict) or set(choice) not in ({"chip"}, {"toml"}):
+        raise TimingError("choose exactly one chip name or custom TOML document")
+    key = next(iter(choice))
+    if not isinstance(choice[key], str) or not choice[key].strip():
+        raise TimingError(f"{key} must be non-empty text")
+    return loads(choice["toml"]) if key == "toml" else find(choice["chip"], project_root)
 
 
 def find(chip: str, project_root: Path | str | None = None) -> ChipTiming:

@@ -336,6 +336,25 @@ def test_an_explicit_config_overrides_both(axi_lite):
     assert channels.reset_polarity(i, [False, True], cfg) is False
 
 
+def test_the_configured_reset_signal_reaches_detected_interfaces(axi_lite):
+    """§4.3's reset path used to be parsed and then never read."""
+    store, clock, _analysis, out = axi_lite
+    cfg = Config.empty()
+    # Deliberately not reset-looking: only the explicit setting can select it.
+    cfg.reset_signal = "tb_axi_lite.s_axi_awvalid"
+    got = engine.extract(store, out, clock, cfg, use_cache=False)
+    assert got.interfaces
+    assert {i.reset for i in got.interfaces} == {cfg.reset_signal}
+
+
+def test_a_missing_configured_reset_is_reported_not_silently_ignored(axi_lite):
+    store, clock, _analysis, out = axi_lite
+    cfg = Config.empty()
+    cfg.reset_signal = "tb_axi_lite.no_such_reset"
+    got = engine.extract(store, out, clock, cfg, use_cache=False)
+    assert any("configured reset signal" in e and "not found" in e for e in got.errors)
+
+
 def test_nothing_is_extracted_while_reset_is_asserted(axi_lite):
     """Every protocol here forbids transfers during reset; a bus idling at X
     would otherwise produce a burst of phantom beats at time zero."""
@@ -437,7 +456,7 @@ def test_rules_are_not_judged_on_an_unfinished_transaction():
     """`count(W) == awlen + 1` is false for every burst still in flight when the
     dump stops. That is where the trace ends, not a protocol error."""
     from veritrace.protocol.assemble import check_transaction_rules
-    from veritrace.protocol.model import Interface, Transaction
+    from veritrace.protocol.model import Transaction
 
     p = pack.resolve(["axi4"])[0]
     open_txn = Transaction(iface="i", kind="WRITE", index=0, start_time=0)
@@ -567,18 +586,26 @@ def test_a_cached_table_is_reused_only_when_the_inputs_are_identical(
     axi_lite, tmp_path_factory
 ):
     store, clock, _analysis, out = axi_lite
-    iface = detect.detect(store, pack.resolve(["axi4lite"]), Config.empty())[0]
+    cfg = Config.empty()
+    iface = detect.detect(store, pack.resolve(["axi4lite"]), cfg)[0]
+    iface_clock = clocks.clock_at(store, iface.clock) or clock
 
-    first = engine.extract(store, out, clock, Config.empty(), use_cache=False)
-    assert persist.is_fresh(out, store, iface)
-    again = engine.extract(store, out, clock, Config.empty(), use_cache=True)
+    first = engine.extract(store, out, clock, cfg, use_cache=False)
+    assert persist.is_fresh(out, store, iface, iface_clock, cfg)
+    again = engine.extract(store, out, clock, cfg, use_cache=True)
     assert [t.ref for t in again.transactions] == [t.ref for t in first.transactions]
     assert again.get("cpu").correlation == first.get("cpu").correlation
 
     # A different pack must invalidate it: a stale table is a silent lie.
     other = detect.detect(store, pack.resolve(["handshake"]), Config.empty())
     if other:
-        assert not persist.is_fresh(out, store, other[0])
+        assert not persist.is_fresh(out, store, other[0], iface_clock, cfg)
+
+    # Reset polarity changes which sampled cycles are admitted. It is an input
+    # to extraction, even though it does not change the dump or the pack.
+    changed = Config.empty()
+    changed.reset_active = "high"
+    assert not persist.is_fresh(out, store, iface, iface_clock, changed)
 
 
 def test_a_restored_transaction_is_identical_to_a_freshly_extracted_one(axi_lite):
@@ -592,8 +619,57 @@ def test_a_restored_transaction_is_identical_to_a_freshly_extracted_one(axi_lite
     assert (a.ref, a.start_time, a.end_time, a.status) == (b.ref, b.start_time, b.end_time, b.status)
     assert a.fields == b.fields
     assert a.metrics == b.metrics and "latency" in b.metrics
+    assert a.events and a.events == b.events
+    assert persist.to_columns(fresh.get("cpu"), clock) == persist.to_columns(cached.get("cpu"), clock)
     assert [v.rule for v in a.violations] == [v.rule for v in b.violations]
     assert fresh.get("cpu").n_events == cached.get("cpu").n_events
+
+
+def test_damaged_event_cache_reextracts_the_real_transactions(axi_lite, monkeypatch):
+    store, clock, _analysis, out = axi_lite
+    fresh = engine.extract(store, out, clock, Config.empty(), use_cache=False)
+    event_file = persist.events_path(out, fresh.get("cpu").interface.name)
+    original = persist.read
+
+    def damaged(path):
+        if Path(path) == event_file:
+            return {"txn": []}
+        return original(path)
+
+    monkeypatch.setattr(persist, "read", damaged)
+    rebuilt = engine.extract(store, out, clock, Config.empty())
+    assert not rebuilt.errors
+    assert rebuilt.get("cpu").transactions[0].events == fresh.get("cpu").transactions[0].events
+
+
+def test_cached_payload_preserves_types_presence_and_colliding_names(axi_lite):
+    store, clock, _analysis, out = axi_lite
+    cfg = Config.empty()
+    fresh = engine.extract(store, out, clock, cfg, use_cache=False).get("cpu")
+    fresh.transactions[0].fields.update({"metric_custom": 7, "field_custom": None,
+                                         "status": 9, "payload": 2**100})
+    fresh.transactions[1].fields["payload"] = "1x01"
+    fresh.transactions[0].metrics.update({"metric_custom": 11, "latency": None})
+    fresh.beats[0].data = 2**100
+    fresh.beats[0].strobe = 2**70 - 1
+    fresh.beats[1].data = "10x1"
+    own_clock = clocks.clock_at(store, fresh.interface.clock) or clock
+    persist.write(out, store, fresh, own_clock, cfg)
+    restored = persist.restore(out, store, fresh.interface, own_clock, cfg)
+    assert restored is not None
+    assert restored.beats == fresh.beats
+    for original, cached in zip(fresh.transactions, restored.transactions, strict=True):
+        assert cached.fields == original.fields
+        assert cached.metrics == original.metrics
+        assert cached.events == original.events
+    # A missing lossless sidecar must trigger re-extraction, not a successful
+    # fallback to the lossy, human-readable table.
+    payload = persist.payload_path(out, fresh.interface.name)
+    payload.write_bytes(b"truncated parquet")
+    assert persist.restore(out, store, fresh.interface, own_clock, cfg) is None
+    repaired = engine.extract(store, out, clock, cfg)
+    assert not repaired.errors
+    assert repaired.get("cpu").transactions[0].events == fresh.transactions[0].events
 
 
 def test_a_write_that_fails_does_not_lose_the_analysis(axi_lite, monkeypatch):
@@ -696,6 +772,19 @@ def test_a_query_reports_what_it_scanned_not_just_what_matched(axi_lite):
     _store, _clock, analysis, _ = axi_lite
     r = txn_query.run(analysis, vtq.parse_pipeline("txn(cpu, type=WRITE)"))
     assert r.n == 12 and r.scanned == 24 and r.ifaces == ["cpu"]
+
+
+def test_protocol_query_reports_the_rules_that_really_ran(axi_lite):
+    """A clean result must not look like a pack with no checks.
+
+    This goes through the extracted interface because the old implementation
+    read a stale ``Extraction.interface_pack`` attribute and consequently
+    returned an empty rule list for every real analysis.
+    """
+    _store, _clock, analysis, _ = axi_lite
+    body = txn_query.protocol(analysis, vtq.parse_pipeline("protocol(cpu)"))
+    assert "AXI_AWSTABLE" in body["rules"]
+    assert set(body["rules"]) == {r.id for r in analysis.get("cpu").interface.pack.rules}
 
 
 def test_an_unknown_field_is_an_error_rather_than_an_empty_result(axi_lite):

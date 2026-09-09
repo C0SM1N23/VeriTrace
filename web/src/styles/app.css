@@ -876,6 +876,16 @@ select:focus-visible {
   border-color: var(--text-dim);
 }
 
+.checks-select {
+  padding: 3px 6px;
+  background: var(--bg-deep);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-family: var(--font-chrome);
+  font-size: 11px;
+}
+
 .checks-section-head {
   display: block;
   width: 100%;
@@ -1154,6 +1164,19 @@ select:focus-visible {
   color: var(--warn);
 }
 
+.txn-group-control {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-dim);
+}
+
+.txn-actions {
+  display: flex;
+  gap: 5px;
+  margin-left: auto;
+}
+
 /* The Gantt is positioned against Wave's own time axis, so a band and the
  * handshake below it stay aligned at every zoom level (§11.4b). */
 .txn-gantt {
@@ -1394,6 +1417,17 @@ select:focus-visible {
   stroke-width: 1;
 }
 
+/* A one-pixel SVG stroke is needlessly hard to click.  This path follows the
+ * exact route but only participates in hit testing; the visible line remains
+ * the one below it in the DOM. */
+.fsm-edge.untaken .fsm-edge-hit {
+  stroke: transparent;
+  stroke-width: 14;
+  stroke-dasharray: none;
+  marker-end: none;
+  pointer-events: stroke;
+}
+
 #fsm-arrow path {
   fill: var(--text-dim);
 }
@@ -1548,6 +1582,16 @@ select:focus-visible {
 .diff-vb {
   color: var(--diff);
 }
+
+.diff-wave-svg {
+  width: 100%;
+  min-height: 112px;
+  background: var(--bg-panel);
+  font: 11px var(--font-mono);
+}
+
+.diff-wave-svg text { fill: var(--text-dim); }
+.diff-wave-svg g[data-different] { cursor: pointer; }
 
 .diff-section {
   margin-top: 20px;
@@ -3089,6 +3133,111 @@ select:focus-visible {
   flex-direction: column;
   gap: 12px;
   min-height: 0;
+}
+
+.txn-group-head {
+  display: flex;
+  justify-content: space-between;
+  width: 100%;
+  height: 22px;
+  padding: 2px 8px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-panel);
+  color: var(--text-dim);
+  font: 11px var(--font-chrome);
+  text-align: left;
+  cursor: pointer;
+}
+
+.txn-filter {
+  position: sticky;
+  left: 0;
+  width: min(420px, calc(100% - 16px));
+  margin: 6px 8px;
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-deep);
+  color: var(--text-bright);
+  font: 11px var(--font-data);
+}
+
+.fsm-node,
+.fsm-edge.untaken {
+  cursor: pointer;
+}
+
+.fsm-node:focus,
+.fsm-edge.untaken:focus {
+  outline: none;
+}
+
+.fsm-node:focus rect,
+.fsm-edge.untaken:focus .fsm-edge-line {
+  stroke: var(--causal);
+  stroke-width: 2.5;
+}
+
+.perf-ceiling {
+  stroke: var(--text-dim);
+  stroke-width: 1;
+  stroke-dasharray: 5 4;
+  vector-effect: non-scaling-stroke;
+}
+
+.perf-history-head {
+  display: flex;
+  align-items: center;
+  gap: var(--gutter);
+}
+
+.perf-history-head select {
+  margin-left: auto;
+}
+
+.perf-history-summary {
+  margin-bottom: var(--gutter);
+  color: var(--text);
+}
+
+.perf-history-chart {
+  height: 180px;
+  cursor: default;
+}
+
+.perf-history-point,
+.perf-history-regression {
+  fill: var(--text);
+  stroke: var(--bg-deep);
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+
+/* Performance already uses --warn for throughput loss; the marked commit is
+ * another performance regression, not membership in the causal tree. */
+.perf-history-regression {
+  fill: var(--warn);
+}
+
+.perf-history-labels {
+  display: flex;
+  justify-content: space-between;
+  gap: 4px;
+  margin-top: 5px;
+  overflow: hidden;
+}
+
+.perf-history-labels span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sig-row.derived .sig-name {
+  color: var(--causal);
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
 }
 .insp-head {
   border-bottom: 1px solid var(--line);

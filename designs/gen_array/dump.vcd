@@ -1,0 +1,140 @@
+$date
+	Mon Aug 31 18:56:24 2026
+$end
+$version
+	Icarus Verilog
+$end
+$timescale
+	1ps
+$end
+$scope module tb_gen_array $end
+$var wire 32 ! lane_out [31:0] $end
+$var reg 1 " clk $end
+$var reg 32 # lane_in [31:0] $end
+$var reg 1 $ rst_n $end
+$scope module dut $end
+$var wire 1 " clk $end
+$var wire 32 % lane_in [31:0] $end
+$var wire 1 $ rst_n $end
+$var wire 32 & lane_out [31:0] $end
+$scope begin g_lane[0] $end
+$var parameter 2 ' i $end
+$scope module u_lane $end
+$var wire 1 " clk $end
+$var wire 8 ( din [7:0] $end
+$var wire 1 $ rst_n $end
+$var reg 8 ) dout [7:0] $end
+$upscope $end
+$upscope $end
+$scope begin g_lane[1] $end
+$var parameter 2 * i $end
+$scope module u_lane $end
+$var wire 1 " clk $end
+$var wire 8 + din [7:0] $end
+$var wire 1 $ rst_n $end
+$var reg 8 , dout [7:0] $end
+$upscope $end
+$upscope $end
+$scope begin g_lane[2] $end
+$var parameter 3 - i $end
+$scope module u_lane $end
+$var wire 1 " clk $end
+$var wire 8 . din [7:0] $end
+$var wire 1 $ rst_n $end
+$var reg 8 / dout [7:0] $end
+$upscope $end
+$upscope $end
+$scope begin g_lane[3] $end
+$var parameter 3 0 i $end
+$scope module u_lane $end
+$var wire 1 " clk $end
+$var wire 8 1 din [7:0] $end
+$var wire 1 $ rst_n $end
+$var reg 8 2 dout [7:0] $end
+$upscope $end
+$upscope $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+$comment Show the parameter values. $end
+$dumpall
+b11 0
+b10 -
+b1 *
+b0 '
+$end
+#0
+$dumpvars
+bx 2
+b0 1
+bx /
+b0 .
+bx ,
+b0 +
+bx )
+b0 (
+bx &
+b0 %
+0$
+b0 #
+0"
+bx !
+$end
+#5000
+b0 )
+b0 ,
+b0 /
+b0 !
+b0 &
+b0 2
+1"
+#10000
+0"
+#12000
+b10001 (
+b100010 +
+b110011 .
+b1000100 1
+b1000100001100110010001000010001 #
+b1000100001100110010001000010001 %
+1$
+#15000
+b1000100 2
+b110011 /
+b100010 ,
+b1000100001100110010001000010001 !
+b1000100001100110010001000010001 &
+b10001 )
+1"
+#20000
+0"
+#25000
+1"
+#30000
+0"
+#35000
+b1010101 (
+b1100110 +
+b1110111 .
+b10001000 1
+b10001000011101110110011001010101 #
+b10001000011101110110011001010101 %
+1"
+#40000
+0"
+#45000
+b1010101 )
+b1100110 ,
+b1110111 /
+b10001000011101110110011001010101 !
+b10001000011101110110011001010101 &
+b10001000 2
+1"
+#50000
+0"
+#55000
+1"
+#60000
+0"
+#65000
+1"

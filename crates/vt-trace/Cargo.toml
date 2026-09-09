@@ -14,11 +14,23 @@ serde_json = "1"
 thiserror = "2"
 sha2 = "0.10"
 
-# FST support is optional: the `fstapi` crate builds libfst from C sources and
-# needs zlib + libclang. Trivial on Linux (zlib1g-dev, libclang-dev), but on
-# Windows it additionally requires a vcpkg install of zlib/pthreads/mman. VCD
-# is the spec's primary target (§4.0), so it stays dependency-free.
+# FST support uses GTKWave's reference libfst through `fstapi`.  That crate's
+# hierarchy reader is not usable with the Windows CRT (see `src/fst.rs`), so a
+# Windows wheel exposes an explicit unsupported-capability error instead of
+# compiling a reader which can only produce an empty hierarchy.  Keeping the
+# dependency target-specific also lets the same `fst` feature be enabled in
+# every wheel build: Linux/macOS get the real reader while Windows remains a
+# working, honest VCD-only build and does not require a user's vcpkg install.
+
+[target.'cfg(not(windows))'.dependencies]
 fstapi = { version = "0.0.3", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# std::fs exposes creation time as `ctime` on Windows, not NTFS ChangeTime.
+# The latter is the O(1) identity field that changes when a same-size dump is
+# rewritten and its mtime is restored, so cache freshness needs this one small
+# platform API.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [features]
 default = []

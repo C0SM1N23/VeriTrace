@@ -31,9 +31,11 @@ class CmdEvent:
     name: str
     #: `args`, evaluated — e.g. `{"bank": 2, "row": 420}` for an ACTIVATE.
     fields: dict[str, FieldValue] = field(default_factory=dict)
+    #: Actual edge ordinal of the interface clock, including gated/multi-clock traces.
+    cycle: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"time": self.time, "name": self.name, "fields": dict(self.fields)}
+        return {"time": self.time, "name": self.name, "fields": dict(self.fields), "cycle": self.cycle}
 
 
 @dataclass(slots=True)
@@ -67,8 +69,10 @@ class TimingViolation:
     bank: int | None
     #: Trace time of the second (violating) command — where a click lands.
     at: int
-    measured_cycles: int
-    limit_cycles: int
+    measured_cycles: int | None
+    limit_cycles: int | None
+    measured_ticks: int
+    limit_ticks: int
     #: True only for tREFI: a violation there means the interval grew past the
     #: limit, not that it fell short of one.
     is_maximum: bool = False
@@ -82,6 +86,8 @@ class TimingViolation:
             "at": self.at,
             "measured_cycles": self.measured_cycles,
             "limit_cycles": self.limit_cycles,
+            "measured_ticks": self.measured_ticks,
+            "limit_ticks": self.limit_ticks,
             "is_maximum": self.is_maximum,
             "first": self.first.to_dict() if self.first else None,
             "second": self.second.to_dict() if self.second else None,
@@ -192,6 +198,10 @@ class MemoryReport:
     segments: list[BankSegment] = field(default_factory=list)
     violations: list[TimingViolation] = field(default_factory=list)
     efficiency: Efficiency = field(default_factory=Efficiency)
+    #: Observed consecutive REFRESH intervals and tREFI, all in trace ticks.
+    refresh_intervals: list[tuple[int, int]] = field(default_factory=list)
+    refresh_limit: int | None = None
+    clock_path: str | None = None
     #: `constraint -> count`, including zero for a constraint never violated —
     #: so "conforme" is a stated fact, not an absence.
     checked: dict[str, int] = field(default_factory=dict)
@@ -203,6 +213,7 @@ class MemoryReport:
         out: dict[str, Any] = {
             "iface": self.iface,
             "chip": self.chip,
+            "clock_path": self.clock_path,
             "n_banks": self.n_banks,
             "signals": dict(self.signals),
             "address_map": {k: list(v) for k, v in self.address_map.items()},
@@ -210,6 +221,9 @@ class MemoryReport:
             "segments": [s.to_dict() for s in self.segments],
             "violations": [v.to_dict() for v in self.violations],
             "efficiency": self.efficiency.to_dict(),
+            "refresh_limit": self.refresh_limit,
+            "refresh_intervals": [{"t0": a, "t1": b, "elapsed": b - a}
+                                  for a, b in self.refresh_intervals],
             "checked": dict(self.checked),
             "skipped": dict(self.skipped),
             "ms": round(self.elapsed_ms, 2),

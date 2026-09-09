@@ -1,0 +1,115 @@
+$date
+	Mon Aug 31 18:55:29 2026
+$end
+$version
+	Icarus Verilog
+$end
+$timescale
+	1ps
+$end
+$scope module tb_axi_lite_bug $end
+$var reg 1 ! aclk $end
+$var reg 32 " araddr [31:0] $end
+$var reg 1 # aresetn $end
+$var reg 3 $ arprot [2:0] $end
+$var reg 1 % arready $end
+$var reg 1 & arvalid $end
+$var reg 32 ' awaddr [31:0] $end
+$var reg 3 ( awprot [2:0] $end
+$var reg 1 ) awready $end
+$var reg 1 * awvalid $end
+$var reg 1 + bready $end
+$var reg 2 , bresp [1:0] $end
+$var reg 1 - bvalid $end
+$var reg 32 . rdata [31:0] $end
+$var reg 1 / rready $end
+$var reg 2 0 rresp [1:0] $end
+$var reg 1 1 rvalid $end
+$var reg 4 2 step [3:0] $end
+$var reg 32 3 wdata [31:0] $end
+$var reg 1 4 wready $end
+$var reg 4 5 wstrb [3:0] $end
+$var reg 1 6 wvalid $end
+$upscope $end
+$enddefinitions $end
+$comment Show the parameter values. $end
+$dumpall
+$end
+#0
+$dumpvars
+06
+b1111 5
+04
+b11001010111111101011101010111110 3
+b0 2
+01
+b0 0
+1/
+b0 .
+0-
+b0 ,
+1+
+0*
+0)
+b0 (
+b1000000000000 '
+0&
+0%
+b0 $
+0#
+b0 "
+0!
+$end
+#5000
+1!
+#10000
+0!
+#12000
+1#
+#15000
+1!
+#20000
+0!
+1*
+#25000
+b1 2
+1!
+#30000
+0!
+#35000
+b1000000000100 '
+b10 2
+1!
+#40000
+0!
+#45000
+b1000000001000 '
+b11 2
+1!
+#50000
+0!
+#55000
+b1000000001100 '
+b100 2
+1!
+#60000
+0!
+#65000
+b1000000010000 '
+b101 2
+1)
+1!
+#70000
+0!
+#75000
+0)
+0*
+1!
+#80000
+0!
+#85000
+1!
+#90000
+0!
+#95000
+1!

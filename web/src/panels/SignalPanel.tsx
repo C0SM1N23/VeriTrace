@@ -129,6 +129,9 @@ export function SignalPanel() {
             radix={row.kind === "signal" ? (radix[row.path] ?? "hex") : "hex"}
             label={row.kind === "signal" ? (labels.get(row.path) ?? row.path) : row.name}
             width={row.kind === "signal" ? (signalsByHandle.get(row.handle)?.width ?? 1) : 0}
+            derived={
+              row.kind === "signal" && (signalsByHandle.get(row.handle)?.derived ?? false)
+            }
             dragging={dragFrom === i}
             dropTarget={dragOver === i}
             menuOpen={menuFor === i}
@@ -168,6 +171,7 @@ interface RowProps {
   selected: boolean;
   radix: Radix;
   width: number;
+  derived: boolean;
   dragging: boolean;
   dropTarget: boolean;
   menuOpen: boolean;
@@ -211,7 +215,7 @@ function SignalRow(p: RowProps) {
 
   return (
     <div
-      className={`sig-row${p.selected ? " selected" : ""}${p.dragging ? " dragging" : ""}${
+      className={`sig-row${p.selected ? " selected" : ""}${p.derived ? " derived" : ""}${p.dragging ? " dragging" : ""}${
         p.dropTarget ? " drop" : ""
       }`}
       style={{ height: p.height }}
@@ -226,12 +230,13 @@ function SignalRow(p: RowProps) {
       onClick={p.onSelect}
       data-testid="signal-row"
       data-path={row.path}
+      data-derived={p.derived ? "reconstructed" : undefined}
     >
       <span className="grip" aria-hidden>
         ⠿
       </span>
       <span className="sig-name" title={row.path}>
-        {p.label}
+        {p.label}{p.derived ? " · derived" : ""}
       </span>
       {p.width > 1 && (
         <button

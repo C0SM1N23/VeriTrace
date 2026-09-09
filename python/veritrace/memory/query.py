@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from veritrace.analysis.vtq import Call, Pipeline, QueryError
+from veritrace.clocks import clock_at
 from veritrace.memory import banks as banks_mod
 from veritrace.memory.model import MemoryReport
 from veritrace.memory.timing import TimingError, find as find_chip
@@ -103,7 +104,8 @@ def _timing(
     except TimingError as e:
         raise QueryError(str(e)) from e
     violations, checked, skipped = banks_mod.check_timing(
-        r.commands, r.n_banks, chip_timing, store.timescale, clock
+        r.commands, r.n_banks, chip_timing, store.timescale,
+        clock_at(store, r.clock_path) if r.clock_path else clock
     )
     return {
         "iface": r.iface,

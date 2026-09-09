@@ -1,0 +1,213 @@
+$date
+	Mon Aug 31 18:57:45 2026
+$end
+$version
+	Icarus Verilog
+$end
+$timescale
+	1ps
+$end
+$scope module tb_fifo_async $end
+$var wire 4 ! wr_gray_seen [3:0] $end
+$var wire 1 " empty $end
+$var reg 1 # rd_clk $end
+$var reg 1 $ rst_n $end
+$var reg 1 % wr_clk $end
+$var reg 1 & wr_en $end
+$scope module dut $end
+$var wire 1 # rd_clk $end
+$var wire 1 $ rst_n $end
+$var wire 1 % wr_clk $end
+$var wire 1 & wr_en $end
+$var wire 4 ' wr_gray [3:0] $end
+$var wire 1 " empty $end
+$var reg 4 ( rd_gray [3:0] $end
+$var reg 4 ) wr_bin [3:0] $end
+$var reg 4 * wr_gray_seen [3:0] $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+$comment Show the parameter values. $end
+$dumpall
+$end
+#0
+$dumpvars
+bx *
+bx )
+bx (
+bx '
+0&
+0%
+0$
+0#
+x"
+bx !
+$end
+#4000
+b0 '
+b0 )
+1%
+#5000
+1"
+b0 !
+b0 *
+b0 (
+1#
+#8000
+0%
+#10000
+0#
+#12000
+1%
+#13000
+1$
+#15000
+1#
+#16000
+1&
+0%
+#20000
+b1 '
+b1 )
+1%
+0#
+#24000
+0%
+#25000
+0"
+b1 !
+b1 *
+1#
+#28000
+b11 '
+b10 )
+1%
+#30000
+0#
+#32000
+0%
+#35000
+b11 !
+b11 *
+1#
+#36000
+b10 '
+b11 )
+1%
+#40000
+0%
+0#
+#44000
+b110 '
+b100 )
+1%
+#45000
+b110 !
+b110 *
+1#
+#48000
+0%
+#50000
+0#
+#52000
+b111 '
+b101 )
+1%
+#55000
+b111 !
+b111 *
+1#
+#56000
+0%
+#60000
+b101 '
+b110 )
+1%
+0#
+#64000
+0%
+#65000
+b101 !
+b101 *
+1#
+#68000
+b100 '
+b111 )
+1%
+#70000
+0#
+#72000
+0%
+#75000
+b100 !
+b100 *
+1#
+#76000
+0&
+1%
+#80000
+0%
+0#
+#84000
+1%
+#85000
+1#
+#88000
+0%
+#90000
+0#
+#92000
+1%
+#95000
+1#
+#96000
+0%
+#100000
+1%
+0#
+#104000
+0%
+#105000
+1#
+#108000
+1%
+#110000
+0#
+#112000
+0%
+#115000
+1#
+#116000
+1%
+#120000
+0%
+0#
+#124000
+1%
+#125000
+1#
+#128000
+0%
+#130000
+0#
+#132000
+1%
+#135000
+1#
+#136000
+0%
+#140000
+1%
+0#
+#144000
+0%
+#145000
+1#
+#148000
+1%
+#150000
+0#
+#152000
+0%
+#155000
+1#

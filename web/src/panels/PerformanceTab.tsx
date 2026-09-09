@@ -27,8 +27,16 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
+import { fetchPerformanceHistory } from "../api/client";
 import { cycleAt, formatTime } from "../lib/time";
-import type { Deadlock, InterfacePerf, StallProfile, PerfSeries, WaitEdge } from "../lib/types";
+import type {
+  Deadlock,
+  InterfacePerf,
+  PerfHistory,
+  PerfSeries,
+  StallProfile,
+  WaitEdge,
+} from "../lib/types";
 import { useWave } from "../state/store";
 
 /** §11.1: colour is reserved for meaning. */
@@ -39,6 +47,20 @@ const BUCKET_CLASS: Record<string, string> = {
   other: "gap",
 };
 
+const HISTORY_METRICS: [string, string][] = [
+  ["p50_latency", "p50 latency"],
+  ["p95_latency", "p95 latency"],
+  ["p99_latency", "p99 latency"],
+  ["max_latency", "maximum latency"],
+  ["throughput", "throughput"],
+  ["max_outstanding", "maximum outstanding"],
+  ["violations", "violations"],
+];
+
+function metricValue(value: number): string {
+  return Number(value.toPrecision(5)).toString();
+}
+
 export function PerformanceTab() {
   const report = useWave((s) => s.perf);
   const busy = useWave((s) => s.perfBusy);
@@ -46,13 +68,46 @@ export function PerformanceTab() {
   const load = useWave((s) => s.loadPerformance);
   const iface = useWave((s) => s.perfIface);
   const select = useWave((s) => s.selectPerfIface);
+  const session = useWave((s) => s.session);
+  const [showHistory, setShowHistory] = useState(false);
+  const [historyMetric, setHistoryMetric] = useState("p99_latency");
+  const [history, setHistory] = useState<PerfHistory | null>(null);
+  const [historyBusy, setHistoryBusy] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+
+  const historyIface = report?.interfaces.find((i) => i.iface === iface)?.iface
+    ?? report?.interfaces[0]?.iface
+    ?? null;
 
   useEffect(() => {
-    if (!report && !busy) void load();
-  }, [report, busy, load]);
+    if (!report && !busy && !error) void load();
+  }, [report, busy, error, load]);
+
+  useEffect(() => {
+    if (!showHistory || !session || !historyIface) return;
+    let live = true;
+    setHistoryBusy(true);
+    setHistoryError("");
+    void fetchPerformanceHistory(session, historyIface, historyMetric)
+      .then((result) => {
+        if (live) setHistory(result);
+      })
+      .catch((error) => {
+        if (live) {
+          setHistory(null);
+          setHistoryError(error instanceof Error ? error.message : String(error));
+        }
+      })
+      .finally(() => {
+        if (live) setHistoryBusy(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [showHistory, session, historyIface, historyMetric]);
 
   if (busy && !report) return <div className="pane-note">Measuring…</div>;
-  if (error && !report) return <div className="pane-note">{error}</div>;
+  if (error && !report) return <div className="pane-note" role="alert">{error} <button onClick={() => void load()}>Retry</button></div>;
   if (!report) return <div className="pane-note">No performance data yet.</div>;
 
   if (!report.interfaces.length) {
@@ -90,16 +145,147 @@ export function PerformanceTab() {
             </option>
           ))}
         </select>
+        <button
+          className={`chip${showHistory ? " on" : ""}`}
+          onClick={() => setShowHistory(!showHistory)}
+          data-testid="perf-history-toggle"
+        >
+          history
+        </button>
         <WindowChip />
+        {busy && <span role="status">Updating selected window…</span>}
+        {error && <span role="alert">{error}</span>}
       </div>
 
-      <Liveness />
-      <Stalls per={current} />
-      <div className="perf-row">
-        <Latency per={current} />
-        <Outstanding per={current} />
+      {showHistory ? (
+        <HistoryView
+          report={history}
+          busy={historyBusy}
+          error={historyError}
+          metric={historyMetric}
+          setMetric={setHistoryMetric}
+        />
+      ) : (
+        <>
+          <div className="pane-hint">Liveness findings below refer to the whole run.</div>
+          <Liveness />
+          <Stalls per={current} />
+          <div className="perf-row">
+            <Latency per={current} />
+            <Outstanding per={current} />
+          </div>
+          <Bandwidth per={current} />
+          <FairnessBars />
+        </>
+      )}
+    </div>
+  );
+}
+
+/** §13.6's DuckDB rows, read through the same production database as the CLI. */
+function HistoryView({
+  report,
+  busy,
+  error,
+  metric,
+  setMetric,
+}: {
+  report: PerfHistory | null;
+  busy: boolean;
+  error: string;
+  metric: string;
+  setMetric: (metric: string) => void;
+}) {
+  const points = report?.points ?? [];
+  const values = points.map((p) => p.value);
+  const lo = values.length ? Math.min(...values) : 0;
+  const hi = values.length ? Math.max(...values) : 1;
+  const span = Math.max(hi - lo, Math.abs(hi) * 0.05, 1e-9);
+  const w = 1000;
+  const h = 180;
+  const x = (i: number) => (points.length > 1 ? (i / (points.length - 1)) * w : w / 2);
+  const y = (v: number) => h - ((v - lo) / span) * (h - 24) - 12;
+  const path = points.map((p, i) => `${i ? "L" : "M"}${x(i)},${y(p.value)}`).join(" ");
+  const latest = points.at(-1);
+  const prior = points.at(-2);
+  const bad =
+    report && report.delta !== null
+      ? report.lower_is_better
+        ? report.delta > 0
+        : report.delta < 0
+      : false;
+
+  return (
+    <div className="perf-card perf-history" data-testid="perf-history">
+      <div className="perf-card-title perf-history-head">
+        <span>Regression history</span>
+        <select
+          className="txn-iface"
+          value={metric}
+          onChange={(e) => setMetric(e.target.value)}
+          data-testid="perf-history-metric"
+        >
+          {HISTORY_METRICS.map(([value, label]) => (
+            <option value={value} key={value}>{label}</option>
+          ))}
+        </select>
       </div>
-      <FairnessBars />
+      {busy && !report ? <div className="pane-note">Reading regression history…</div> : null}
+      {error ? <div className="pane-note">{error}</div> : null}
+      {report && (!report.available || points.length === 0) ? (
+        <div className="pane-note" data-testid="perf-history-empty">
+          {report.reason || `No recorded ${report.label} values for ${report.iface}.`}
+        </div>
+      ) : null}
+      {report?.available && points.length > 0 ? (
+        <>
+          <div className="perf-history-summary" data-testid="perf-history-summary">
+            <b>{report.iface}</b> · {report.label} · {points.length} recorded run
+            {points.length === 1 ? "" : "s"}
+            {latest && prior && report.delta !== null ? (
+              <span className={bad ? "warn" : "dim"}>
+                {" "}· latest {metricValue(latest.value)} vs {metricValue(prior.value)} ({report.delta >= 0 ? "+" : ""}
+                {metricValue(report.delta)} {report.unit}){bad ? " — slower" : ""}
+              </span>
+            ) : null}
+          </div>
+          <svg
+            className="perf-chart perf-history-chart"
+            viewBox={`0 0 ${w} ${h}`}
+            preserveAspectRatio="none"
+            data-testid="perf-history-chart"
+          >
+            <path d={path} className="perf-line" />
+            {points.map((point, i) => (
+              <circle
+                key={point.run_id}
+                cx={x(i)}
+                cy={y(point.value)}
+                r={point.regression ? 8 : 5}
+                className={point.regression ? "perf-history-regression" : "perf-history-point"}
+                data-testid={point.regression ? "perf-history-regression" : "perf-history-point"}
+              >
+                <title>{`${point.commit || point.tag || `run ${point.run_id}`}: ${point.value} ${report.unit}`}</title>
+              </circle>
+            ))}
+          </svg>
+          <div className="perf-history-labels mono">
+            {points.map((point) => (
+              <span key={point.run_id} className={point.regression ? "warn" : "dim"}>
+                {point.commit || point.tag || `#${point.run_id}`}
+              </span>
+            ))}
+          </div>
+          {report.regression_run_id !== null ? (
+            <div className="pane-hint" data-testid="perf-history-regression-note">
+              Largest recorded worsening begins at run {report.regression_run_id}; the highlighted
+              point is evidence from adjacent recorded runs, not a causal claim.
+            </div>
+          ) : (
+            <div className="pane-hint">No worsening between adjacent recorded runs.</div>
+          )}
+        </>
+      ) : null}
     </div>
   );
 }
@@ -277,7 +463,7 @@ function Stalls({ per }: { per: InterfacePerf }) {
         Stall attribution
         <span className="dim">
           {" "}
-          — {total} cycles, {prof.lost} lost
+          — {total} cycles, {total - (counts.transfer ?? 0) - (counts.reset ?? 0)} lost
         </span>
         {/* §8.17's claim, printed so it can be checked rather than trusted. */}
         <span className="perf-total" data-testid="perf-stall-total">
@@ -452,8 +638,49 @@ function Outstanding({ per }: { per: InterfacePerf }) {
   );
 }
 
-function Sparkline({ s }: { s: PerfSeries }) {
-  const max = Math.max(...s.points.map((p) => p.v), 1);
+/** Obtained bandwidth over time against one full beat per cycle (§8.17). */
+function Bandwidth({ per }: { per: InterfacePerf }) {
+  const throughput = per.throughput;
+  const average = per.stalls?.total
+    ? per.bytes_moved / per.stalls.total
+    : null;
+  const peak = per.peak_bytes_per_cycle;
+  return (
+    <div className="perf-card" data-testid="perf-bandwidth">
+      <div className="perf-card-title">
+        Bandwidth
+        {average !== null ? (
+          <span className="dim">
+            {" "}— {metricValue(average)} obtained
+            {peak !== null ? ` / ${metricValue(peak)} theoretical bytes/cycle` : ` ${throughput?.unit}`}
+          </span>
+        ) : null}
+      </div>
+      {throughput?.points.length ? (
+        <>
+          <Sparkline s={throughput} ceiling={peak} />
+          <div className="perf-percentiles">
+            <span>{per.bytes_moved} bytes moved</span>
+            {peak !== null && average !== null ? (
+              <span data-testid="perf-bandwidth-share">
+                {(100 * average / Math.max(peak, Number.EPSILON)).toFixed(1)}% of theoretical
+              </span>
+            ) : null}
+          </div>
+          <div className="pane-hint">
+            Events that reduce this line are attributed in the stall chart above; selecting a
+            window there narrows this series to the same interval.
+          </div>
+        </>
+      ) : (
+        <div className="pane-note">No transfer payload width was available for bandwidth.</div>
+      )}
+    </div>
+  );
+}
+
+function Sparkline({ s, ceiling = null }: { s: PerfSeries; ceiling?: number | null }) {
+  const max = Math.max(...s.points.map((p) => p.v), ceiling ?? 0, 1);
   const w = 1000;
   const h = 60;
   const dx = s.points.length > 1 ? w / (s.points.length - 1) : w;
@@ -462,6 +689,17 @@ function Sparkline({ s }: { s: PerfSeries }) {
     .join(" ");
   return (
     <svg className="perf-chart" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none">
+      {ceiling !== null && ceiling > 0 && (
+        <line
+          x1="0"
+          x2={w}
+          y1={h - (ceiling / max) * h}
+          y2={h - (ceiling / max) * h}
+          className="perf-ceiling"
+        >
+          <title>theoretical peak: {ceiling} bytes/cycle</title>
+        </line>
+      )}
       <path d={d} className="perf-line" />
     </svg>
   );

@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from veritrace._native import TraceStore
 
@@ -34,7 +37,7 @@ def session_id_for(trace_path: Path) -> str:
     after a reboot — yields the same id, so a client that remembers a session
     finds its layout again instead of starting blank.
     """
-    resolved = str(trace_path.resolve()).replace("\\", "/").lower()
+    resolved = os.path.normcase(str(trace_path.resolve())).replace("\\", "/")
     return hashlib.sha256(resolved.encode()).hexdigest()[:16]
 
 
@@ -51,6 +54,8 @@ def default_layout() -> dict[str, Any]:
         # query history as state that survives a reload, and because §13.8's
         # `.vtsession` is mostly this one string — the tree under it is derived.
         "query": "",
+        "queryHistory": [],
+        "savedQueries": {},
         # §11.4: a suppressed finding, and the mandatory reason for it. Without
         # the reason the list becomes a graveyard nobody dares to empty.
         "suppressions": {},
@@ -60,8 +65,18 @@ def default_layout() -> dict[str, Any]:
 class LayoutFile:
     """The JSON sidecar holding one session's user state."""
 
+    _locks_guard = threading.Lock()
+    _path_locks: dict[Path, Any] = {}
+
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.last_error = ""
+        self.backup_path: Path | None = None
+        # Browsers persist several slices of the store in quick succession and
+        # FastAPI serves those PUTs on different worker threads.  They must not
+        # race through the same write-then-rename temporary path.
+        with self._locks_guard:
+            self._lock = self._path_locks.setdefault(path.resolve(), threading.RLock())
 
     @classmethod
     def for_trace(cls, trace_path: Path) -> LayoutFile:
@@ -69,37 +84,53 @@ class LayoutFile:
         return cls(trace_path.with_name(trace_path.name + ".session.json"))
 
     def load(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return default_layout()
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            # A corrupt sidecar must not make the trace unopenable (P7).
-            return default_layout()
-        if not isinstance(data, dict):
-            return default_layout()
-        merged = default_layout()
-        merged.update(data)
-        merged["version"] = LAYOUT_VERSION
-        return merged
+        with self._lock:
+            self.last_error = ""
+            if not self.path.exists():
+                return default_layout()
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as e:
+                # A corrupt sidecar must not make the trace unopenable (P7).
+                self.last_error = f"could not read saved layout {self.path.name}: {e}"
+                return default_layout()
+            if not isinstance(data, dict):
+                self.last_error = f"saved layout {self.path.name} must contain a JSON object"
+                return default_layout()
+            merged = default_layout()
+            merged.update(data)
+            merged["version"] = LAYOUT_VERSION
+            return merged
 
     def save(self, layout: dict[str, Any]) -> dict[str, Any]:
-        merged = default_layout()
-        # Keys the UI does not own must survive a layout PUT: provenance is the
-        # RTL hash §5.7's check depends on, and suppressions are set through
-        # their own endpoint. A wave-layout save must not wipe either.
-        existing = self.load() if self.path.exists() else {}
-        for key in ("provenance", "suppressions"):
-            if key in existing:
-                merged[key] = existing[key]
-        merged.update(layout)
-        merged["version"] = LAYOUT_VERSION
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        # Write-then-rename so an interrupted save cannot truncate the file.
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(merged, indent=2, sort_keys=True), encoding="utf-8")
-        tmp.replace(self.path)
-        return merged
+        with self._lock:
+            merged = default_layout()
+            # Keys the UI does not own must survive a layout PUT: provenance is the
+            # RTL hash §5.7's check depends on, and suppressions are set through
+            # their own endpoint. A wave-layout save must not wipe either.
+            existing = self.load() if self.path.exists() else {}
+            if self.last_error and self.path.exists():
+                # An explicit save may recover from a malformed sidecar, but the
+                # bytes that failed to parse remain available for manual repair.
+                backup = self.path.with_name(self.path.name + ".corrupt")
+                n = 1
+                while backup.exists():
+                    backup = self.path.with_name(self.path.name + f".corrupt.{n}")
+                    n += 1
+                shutil.copy2(self.path, backup)
+                self.backup_path = backup
+            for key in ("provenance", "suppressions", "memoryTiming"):
+                if key in existing:
+                    merged[key] = existing[key]
+            merged.update(layout)
+            merged["version"] = LAYOUT_VERSION
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Write-then-rename so an interrupted save cannot truncate the file.
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp.write_text(json.dumps(merged, indent=2, sort_keys=True), encoding="utf-8")
+            tmp.replace(self.path)
+            self.last_error = ""
+            return merged
 
 
 def sha256_files(paths: list[Path]) -> str:
@@ -177,9 +208,15 @@ class Session:
     #: on screen. Bounded, because a long session should not hold every tree it
     #: ever built.
     _why: dict[tuple[str, int], Any] = field(default_factory=dict, repr=False)
+    _why_not: dict[tuple[str, int, str], Any] = field(default_factory=dict, repr=False)
 
-    def why(self, signal: str, t: int) -> Any:
-        """`WhyResult` for this question, computed once (§8.1)."""
+    def why(self, signal: str, t: int, on_node: Any = None) -> Any:
+        """`WhyResult` for this question, computed once (§8.1).
+
+        ``on_node`` is the progressive WebSocket observer of §10.2.  A cached
+        answer is replayed in post-order (root last); an uncached one emits as
+        it is built by :class:`WhyTracer`.  REST and CLI callers pay nothing.
+        """
         from veritrace.analysis.whytrace import WhyTracer
 
         key = (signal, t)
@@ -193,9 +230,51 @@ class Session:
                 else None
             )
             got = WhyTracer(
-                self.graph, self.store, txn_index=self.txn_index, capture_start=start
+                self.graph,
+                self.store,
+                txn_index=self.txn_index,
+                capture_start=start,
+                on_node=on_node,
             ).why(signal, t)
             self._why[key] = got
+        elif on_node is not None:
+            def replay(node: Any) -> None:
+                for child in node.children:
+                    replay(child)
+                on_node(node)
+
+            replay(got.root)
+        return got
+
+    def why_not(self, signal: str, t: int, desired: Any, on_node: Any = None) -> Any:
+        """Cached §11.4 counterfactual analysis over this production session."""
+        from veritrace.analysis.whytrace import WhyTracer
+
+        key = (signal, t, str(desired))
+        got = self._why_not.get(key)
+        if got is None:
+            if len(self._why_not) >= WHY_CACHE:
+                self._why_not.clear()
+            start = (
+                self.store.time_range[0]
+                if getattr(self.config, "capture", False)
+                else None
+            )
+            got = WhyTracer(
+                self.graph,
+                self.store,
+                txn_index=self.txn_index,
+                capture_start=start,
+                on_node=on_node,
+            ).why_not(signal, t, desired)
+            self._why_not[key] = got
+        elif on_node is not None:
+            def replay(node: Any) -> None:
+                for child in node.children:
+                    replay(child)
+                on_node(node)
+
+            replay(got.root)
         return got
 
     def rtl_files(self) -> list[Path]:
@@ -213,6 +292,7 @@ class Session:
         trace_path: str | Path,
         rtl_paths: list[str] | None = None,
         top: str | None = None,
+        progress: Callable[[str, float], None] | None = None,
     ) -> Session:
         from veritrace import config as cfg
 
@@ -221,32 +301,96 @@ class Session:
         path = Path(trace_path)
         if not path.exists():
             raise FileNotFoundError(f"no such trace: {path}")
+        # A replacement store can have an immutable generation filename, while
+        # the user's URL and saved layout still belong to the requested dump.
+        identity_path = store_mod.identity(path)
+        emit = progress or (lambda _phase, _pct: None)
+        emit("converting", 0.05)
         # §13: every entry point accepts a raw dump and converts it on the way
         # in. Without this the REST API was the one door that did not, and it
         # reported a real `.vcd` as a missing file.
         path = store_mod.ensure(path)
+        emit("indexing", 0.25)
         store = TraceStore(str(path))
+        rtl_root = Path(rtl_paths[0]) if rtl_paths else None
+        rtl_config = cfg.load(rtl_root if rtl_root.is_dir() else rtl_root.parent) if rtl_root else None
         session = cls(
-            session_id=session_id_for(path),
+            session_id=session_id_for(identity_path),
             trace_path=path,
             store=store,
-            layout_file=LayoutFile.for_trace(path),
-            rtl_paths=[str(p) for p in (rtl_paths or [])],
+            layout_file=LayoutFile.for_trace(identity_path),
+            rtl_paths=[str(Path(p).resolve()) for p in (rtl_paths or [])],
             top=top,
             # The project the server was started in decides its own settings;
             # the trace's directory is only the fallback for a dump kept outside
             # it. `cli._load` resolves it the same way, so the CLI and the
             # interface never disagree about which config is in force.
-            config=cfg.load() or cfg.load_or_empty(path.parent),
+            config=rtl_config or cfg.load() or cfg.load_or_empty(path.parent),
         )
-        if rtl_paths:
-            session._load_rtl([Path(p) for p in rtl_paths], top)
-        session.analyse()
+        # Capture identity travels beside the generated VCD/store. Without this
+        # durable marker, `import-capture` followed by `serve` quietly turns an
+        # ILA window back into a simulation and why-trace invents history before
+        # sample zero.
+        from veritrace.ingest import capture as capture_mod
+
+        if capture_mod.marker_path(path).is_file() or capture_mod.marker_path(identity_path).is_file():
+            session.config.capture = True
+        # Omission means use the project's configured build; an explicit []
+        # still requests waveform-only mode. Reading config without consuming
+        # its RTL list made a fresh REST/installed session lose all causality.
+        chosen_rtl = session.config.rtl_files() if rtl_paths is None else [Path(p) for p in rtl_paths]
+        session.rtl_paths = [str(p.resolve()) for p in chosen_rtl]
+        if chosen_rtl:
+            emit("elaborating", 0.35)
+            session._load_rtl(chosen_rtl, top)
+        session.analyse(progress=emit)
         return session
+
+    def _reset_analysis(self) -> None:
+        """Discard every value derived from RTL/session inputs before reload."""
+        self.graph = None
+        self.correlation = None
+        self.elaboration = None
+        self.rtl_sha256 = None
+        self.rtl_changed = False
+        self.rtl_error = ""
+        self.clock = None
+        self.report = None
+        self.protocol = None
+        self.txn_index = None
+        self.protocol_error = ""
+        self.performance = None
+        self.wait_for = []
+        self.performance_error = ""
+        self.memory = None
+        self.memory_error = ""
+        self.integrity = None
+        self.integrity_error = ""
+        self.coverage = None
+        self.coverage_error = ""
+        self.plan = None
+        self.plan_error = ""
+        self._why.clear()
+        self._why_not.clear()
+
+    def reconfigure(self, rtl_paths: list[str], top: str | None) -> None:
+        """Reload one path-backed session against a new RTL/top selection.
+
+        Session ids intentionally depend only on the dump path, so changing
+        the design inputs must replace all dependent state in-place rather
+        than return a session whose public fields describe one design and
+        whose cached why trees describe another.
+        """
+        self._reset_analysis()
+        self.rtl_paths = [str(Path(p).resolve()) for p in rtl_paths]
+        self.top = top
+        if self.rtl_paths:
+            self._load_rtl([Path(p) for p in self.rtl_paths], top)
+        self.analyse()
 
     # --- automatic analysis (§1.4, §13.4) --------------------------------
 
-    def analyse(self) -> Any:
+    def analyse(self, progress: Callable[[str, float], None] | None = None) -> Any:
         """Resolve the clock, extract transactions, and run every check.
 
         §1.4 makes this unconditional: the findings have to be there when the
@@ -259,15 +403,31 @@ class Session:
         how many interfaces there are before it can choose a default tab.
         """
         from veritrace import clocks
+
+        emit = progress or (lambda _phase, _pct: None)
+        emit("clock", 0.48)
+        self.clock = clocks.resolve(self.store, self.graph, self.config)
+        emit("transactions", 0.55)
+        self._extract()
+        emit("performance", 0.64)
+        self._measure()
+        emit("memory", 0.71)
+        self._memory()
+        emit("integrity", 0.78)
+        self._integrity()
+        emit("coverage", 0.84)
+        self._coverage()
+        emit("checks", 0.90)
+        self.report = self._checks(self.memory)
+        # After the checks, because §8.37 items cite them (`check:stuck`).
+        emit("verification-plan", 0.97)
+        self._plan()
+        return self.report
+
+    def _checks(self, memory: Any) -> Any:
         from veritrace.analysis import checks
 
-        self.clock = clocks.resolve(self.store, self.graph, self.config)
-        self._extract()
-        self._measure()
-        self._memory()
-        self._integrity()
-        self._coverage()
-        self.report = checks.run_all(
+        return checks.run_all(
             self.store,
             self.graph,
             self.elaboration,
@@ -275,15 +435,14 @@ class Session:
             self.config,
             self.protocol,
             self.performance.liveness if self.performance is not None else None,
-            self.memory,
+            memory,
             self.integrity,
             project_root=(
                 getattr(self.config, "root", None) or self.trace_path.parent
             ),
+            coverage_report=self.coverage,
+            performance_report=self.performance,
         )
-        # After the checks, because §8.37 items cite them (`check:stuck`).
-        self._plan()
-        return self.report
 
     def _extract(self) -> None:
         """§8.13-8.14, on session open. Failure degrades to "no transactions"."""
@@ -338,10 +497,36 @@ class Session:
                 self.clock,
                 self.config,
                 project_root=root,
+                choices=self.layout_file.load().get("memoryTiming"),
             )
         except Exception as e:  # noqa: BLE001 - memory analysis must not close the trace
             self.memory = None
             self.memory_error = str(e)
+
+    def set_memory_timing(self, iface_name: str, choice: dict[str, str]) -> None:
+        """Apply, verify and persist a timing choice; every consumer gets the same result."""
+        from veritrace.memory import report as mem_report, timing
+
+        root = getattr(self.config, "root", None) or self.trace_path.parent
+        chip = timing.resolve_choice(choice, root)
+        if self.protocol is None or not self.memory:
+            raise timing.TimingError("no memory interface is available")
+        iface = next((i for i in mem_report.detect_interfaces(
+            self.store, self.protocol.packs, self.config
+        ) if i.name == iface_name), None)
+        if iface is None:
+            raise timing.TimingError(f"no memory interface named {iface_name!r}")
+        # Same lock as layout PUTs; concurrent choices must not lose each other.
+        with self.layout_file._lock:
+            replacement = mem_report.build(self.store, iface, self.clock, chip, root, self.config)
+            reports = [replacement if r.iface == iface_name else r for r in self.memory]
+            findings = self._checks(reports)
+            layout = self.layout_file.load()
+            layout.setdefault("memoryTiming", {})[iface_name] = dict(choice)
+            self.layout_file.save(layout)  # Failure must not advertise a saved selection.
+            self.memory = reports
+            self.report = findings
+            self._plan()
 
     def _integrity(self) -> None:
         """§8.19, on session open. Degrades the same way everything else does."""
@@ -393,6 +578,7 @@ class Session:
                 self.graph,
                 coverage_path=getattr(self.config, "coverage_path", None),
                 project_root=root,
+                elaboration=self.elaboration,
             )
         except Exception as e:  # noqa: BLE001 - one scan must not close the trace
             self.coverage = None
@@ -410,16 +596,18 @@ class Session:
         reason = reason.strip()
         if not reason:
             raise ValueError("a suppression needs a reason")
-        layout = self.layout_file.load()
-        layout.setdefault("suppressions", {})[finding_id] = reason
-        self.layout_file.save(layout)
-        return layout["suppressions"]
+        with self.layout_file._lock:
+            layout = self.layout_file.load()
+            layout.setdefault("suppressions", {})[finding_id] = reason
+            self.layout_file.save(layout)
+            return layout["suppressions"]
 
     def unsuppress(self, finding_id: str) -> dict[str, str]:
-        layout = self.layout_file.load()
-        (layout.get("suppressions") or {}).pop(finding_id, None)
-        self.layout_file.save(layout)
-        return layout.get("suppressions") or {}
+        with self.layout_file._lock:
+            layout = self.layout_file.load()
+            (layout.get("suppressions") or {}).pop(finding_id, None)
+            self.layout_file.save(layout)
+            return layout.get("suppressions") or {}
 
     def findings(self) -> Any:
         """The report with suppressed findings removed."""
@@ -440,7 +628,21 @@ class Session:
         if not expanded:
             return
         try:
-            self.elaboration = elaborate(expanded, top=top)
+            # `serve` used to resolve these options and then drop them at the
+            # API boundary.  The browser therefore elaborated a different
+            # design from every CLI analysis whenever the project used an
+            # include directory or a define (§4.3).  Resolve relative include
+            # paths against the config that supplied them and pass the exact
+            # option set into the one elaborator.
+            config_root = Path(getattr(self.config, "root", self.trace_path.parent))
+            incdirs = [
+                str(Path(d) if Path(d).is_absolute() else config_root / d)
+                for d in (getattr(self.config, "incdirs", None) or [])
+            ]
+            defines = list(getattr(self.config, "defines", None) or [])
+            chosen_top = top or getattr(self.config, "top", None)
+            self.top = chosen_top
+            self.elaboration = elaborate(expanded, incdirs, defines, chosen_top)
             self.graph = self.elaboration.graph
             self.correlation = correlate(
                 self.graph,
@@ -463,6 +665,11 @@ class Session:
         re-run — that is the case worth a banner.
         """
         stored = self.layout_file.load().get("provenance") or {}
+        if self.layout_file.last_error:
+            # Opening a trace is read-only with respect to damaged user state.
+            # The warning is surfaced in status; an explicit layout PUT can
+            # replace it and first preserves the original as ``.corrupt``.
+            return
         same_trace = stored.get("trace_sha256") == self.store.source_sha256
         if stored and same_trace and stored.get("rtl_sha256") != self.rtl_sha256:
             self.rtl_changed = True
@@ -525,6 +732,10 @@ class Session:
             "t0": t0,
             "t1": t1,
             "timescale": self.store.timescale,
+            "capture": bool(getattr(self.config, "capture", False)),
+            "trace": str(self.trace_path),
+            "trace_name": self.trace_path.name.removesuffix(".vtx"),
+            "top": getattr(self.graph, "top", "") or self.top,
             "source_sha256": self.store.source_sha256,
             "has_rtl": self.graph is not None,
             "rtl_files": self.rtl_paths,
@@ -532,13 +743,72 @@ class Session:
             "rtl_changed": self.rtl_changed,
             "n_rtl_signals": len(self.graph) if self.graph else 0,
             "rtl_error": self.rtl_error,
+            "layout_error": self.layout_file.last_error,
+            "layout_backup": (
+                str(self.layout_file.backup_path)
+                if self.layout_file.backup_path is not None
+                else None
+            ),
+            # §4.3's UI options are real inputs, not parser-only fields.  The
+            # layout endpoint applies them as defaults; exposing them here also
+            # makes the active configuration inspectable by any client.
+            "ui": {
+                "row_height": getattr(self.config, "row_height", "compact"),
+                "radix": dict(getattr(self.config, "radix_globs", {}) or {}),
+            },
         }
 
     def load_layout(self) -> dict[str, Any]:
-        return self.layout_file.load()
+        layout = self.layout_file.load()
+        # Saved choices win; config globs fill only signals the user has never
+        # assigned a radix to.  This is the adoption feature §4.3 promises — a
+        # fresh session opens with addresses in hex and counters in decimal,
+        # while a hand-picked binary row survives every reload (P5).
+        valid_radices = {"hex", "dec", "bin", "ascii", "enum"}
+        configured = {
+            s.path: radix
+            for s in self.store.signals()
+            if (radix := getattr(self.config, "radix_for", lambda _p: None)(s.path))
+            in valid_radices
+        }
+        configured.update(
+            {
+                str(path): str(radix)
+                for path, radix in dict(layout.get("radix") or {}).items()
+                if radix in valid_radices
+            }
+        )
+        layout["radix"] = configured
+        if "rowH" not in layout:
+            layout["rowH"] = (
+                28
+                if getattr(self.config, "row_height", "compact") == "comfortable"
+                else 20
+            )
+        return layout
 
     def save_layout(self, layout: dict[str, Any]) -> dict[str, Any]:
         return self.layout_file.save(layout)
+
+
+@dataclass(slots=True)
+class SessionJob:
+    """Observable setup state for a session being opened in the background."""
+
+    session_id: str
+    trace_path: Path
+    phase: str = "queued"
+    progress: float = 0.0
+    error: str = ""
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "phase": self.phase,
+            "progress": self.progress,
+            "correlation_rate": None,
+            "trace": str(self.trace_path),
+            "error": self.error,
+        }
 
 
 class SessionRegistry:
@@ -546,6 +816,68 @@ class SessionRegistry:
 
     def __init__(self) -> None:
         self._sessions: dict[str, Session] = {}
+        self._jobs: dict[str, SessionJob] = {}
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _requested_id(trace_path: Path) -> str:
+        # Raw dumps have a deterministic canonical cache name even before the
+        # converter has run. That lets POST return a stable id immediately.
+        from veritrace.store import identity
+
+        return session_id_for(identity(trace_path))
+
+    def start(
+        self,
+        trace_path: str | Path,
+        rtl_paths: list[str] | None = None,
+        top: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Start an observable session setup and return without blocking."""
+        path = Path(trace_path)
+        if not path.exists():
+            raise FileNotFoundError(f"no such trace: {path}")
+        sid = self._requested_id(path)
+        with self._lock:
+            existing = self._sessions.get(sid)
+            pending = self._jobs.get(sid)
+            if pending is not None and pending.phase != "error":
+                return sid, pending.status()
+            job = SessionJob(sid, path.resolve())
+            self._jobs[sid] = job
+            initial = job.status()
+
+        def update(phase: str, pct: float) -> None:
+            with self._lock:
+                job.phase = phase
+                job.progress = max(job.progress, min(0.99, float(pct)))
+
+        def worker() -> None:
+            try:
+                # Every POST means reopen the requested inputs.  Returning an
+                # already-open object here bypassed rerun/top/RTL changes even
+                # though the synchronous registry path supported them.
+                chosen_rtl = existing.rtl_paths if existing is not None and rtl_paths is None else rtl_paths
+                chosen_top = existing.top if existing is not None and top is None else top
+                session = Session.open(path, chosen_rtl, chosen_top, progress=update)
+            except Exception as exc:  # noqa: BLE001 - surfaced through /status
+                with self._lock:
+                    job.phase = "error"
+                    job.error = f"{type(exc).__name__}: {exc}"
+                return
+            with self._lock:
+                # The public id belongs to the request, not to an immutable
+                # cache generation selected midway through conversion.
+                session.session_id = sid
+                self._sessions[sid] = session
+                self._jobs.pop(sid, None)
+
+        threading.Thread(
+            target=worker,
+            name=f"veritrace-session-{sid}",
+            daemon=True,
+        ).start()
+        return sid, initial
 
     def open(
         self,
@@ -558,30 +890,77 @@ class SessionRegistry:
         # Keyed on the store, not on what was typed: `dump.vcd` and the
         # `dump.vcd.vtx` it converts to are one session, or opening the same
         # trace by its two names would build the graph twice.
-        sid = session_id_for(store_mod.ensure(Path(trace_path)))
+        requested_path = Path(trace_path)
+        store_path = store_mod.ensure(requested_path)
+        sid = self._requested_id(requested_path)
         existing = self._sessions.get(sid)
         if existing is not None:
-            # Re-opening with RTL when the session was opened without it should
-            # upgrade the session rather than silently ignore the sources.
-            if rtl_paths and existing.graph is None:
-                existing.rtl_paths = [str(p) for p in rtl_paths]
-                existing._load_rtl([Path(p) for p in rtl_paths], top or existing.top)
-                # The graph unlocks the checks that need it, so re-run them.
-                existing.analyse()
+            # A simulator may atomically replace a store at the same path.
+            # Path-only identity is useful for persistent URLs, but it cannot
+            # make the old mmap authoritative after a rerun.
+            probe = TraceStore(str(store_path))
+
+            def fingerprint(store: TraceStore) -> tuple[Any, ...]:
+                return (
+                    store.source_sha256,
+                    getattr(store, "source_bytes", None),
+                    store.n_signals,
+                    store.n_events,
+                    store.time_range,
+                    store.timescale,
+                )
+
+            if fingerprint(probe) != fingerprint(existing.store):
+                chosen_rtl = existing.rtl_paths if rtl_paths is None else rtl_paths
+                chosen_top = existing.top if top is None else top
+                replacement = Session.open(requested_path, chosen_rtl, chosen_top)
+                self._sessions[sid] = replacement
+                return replacement
+
+            # ``None`` means the caller did not express an RTL preference;
+            # an explicit empty list means waveform-only mode.  Any changed
+            # design/top selection invalidates why trees and every automatic
+            # analysis that consumed the graph.
+            if rtl_paths is not None or top is not None:
+                requested = existing.rtl_paths if rtl_paths is None else [str(Path(p).resolve()) for p in rtl_paths]
+                top_changed = top is not None and top != existing.top
+                if requested != existing.rtl_paths or top_changed:
+                    existing.reconfigure(requested, top)
             return existing
         session = Session.open(trace_path, rtl_paths, top)
         self._sessions[session.session_id] = session
         return session
 
     def get(self, session_id: str) -> Session | None:
-        return self._sessions.get(session_id)
+        with self._lock:
+            if session_id in self._jobs:
+                return None
+            return self._sessions.get(session_id)
+
+    def status(self, session_id: str) -> dict[str, Any] | None:
+        """Ready session status or the live setup/error state for its job."""
+        with self._lock:
+            job = self._jobs.get(session_id)
+            if job is not None:
+                return job.status()
+            session = self._sessions.get(session_id)
+            if session is not None:
+                return session.status()
+            return None
+
+    def pending(self, session_id: str) -> bool:
+        with self._lock:
+            return session_id in self._jobs
 
     def all(self) -> list[Session]:
         """Every open session, in the order they were opened (§11.4's TAB 5)."""
-        return list(self._sessions.values())
+        with self._lock:
+            return list(self._sessions.values())
 
     def __contains__(self, session_id: object) -> bool:
-        return session_id in self._sessions
+        with self._lock:
+            return session_id in self._sessions or session_id in self._jobs
 
     def __len__(self) -> int:
-        return len(self._sessions)
+        with self._lock:
+            return len(self._sessions)

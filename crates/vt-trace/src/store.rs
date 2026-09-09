@@ -8,19 +8,22 @@
 //! stream*. When several hierarchical paths share one VCD identifier code they
 //! share a stream, and `signals.parquet` maps each path to its `stream_id`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryBuilder, Int64Builder, RecordBatch, StringBuilder, UInt32Builder, UInt64Builder,
-    UInt8Builder,
+    ArrayRef, BinaryBuilder, Int64Builder, RecordBatch, StringBuilder, UInt32Builder,
+    UInt64Builder, UInt8Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::{Compression, Encoding as ParquetEncoding, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
@@ -60,7 +63,7 @@ impl Encoding {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Encoding> {
+    pub fn parse(s: &str) -> Option<Encoding> {
         Some(match s {
             "u64_2s" => Encoding::U64_2S,
             "u64_4s" => Encoding::U64_4S,
@@ -120,10 +123,117 @@ pub struct Meta {
     /// an mtime comparison alone reads as fresh.
     #[serde(default)]
     pub source_bytes: Option<u64>,
+    /// Cheap, precise source identity recorded with the hash.
+    ///
+    /// Size + mtime is insufficient when a dump is rewritten and its mtime is
+    /// restored. `change_token` includes inode/ctime on Unix and the NTFS file
+    /// id/ChangeTime on Windows, so that case is detected without hashing a
+    /// gigabyte on every ordinary reopen. A changed token is still followed by
+    /// a hash comparison at the Python boundary: metadata-only touches do not
+    /// force a needless conversion.
+    #[serde(default)]
+    pub source_identity: Option<SourceIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceIdentity {
+    pub bytes: u64,
+    /// Opaque decimal nanoseconds since the Unix epoch. A string avoids JSON's
+    /// integer portability limit and also represents pre-epoch timestamps.
+    pub mtime_ns: String,
+    /// Platform-specific stable file id plus change time.
+    pub change_token: String,
+}
+
+fn system_time_token(t: std::time::SystemTime) -> String {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => format!("{}{:09}", d.as_secs(), d.subsec_nanos()),
+        Err(e) => {
+            let d = e.duration();
+            format!("-{}{:09}", d.as_secs(), d.subsec_nanos())
+        }
+    }
+}
+
+/// Identity for cache freshness, read from one open handle to avoid mixing
+/// metadata from two generations when a simulator replaces the dump.
+pub(crate) fn source_identity(path: &Path) -> Result<SourceIdentity> {
+    let file = fs::File::open(path)?;
+    let meta = file.metadata()?;
+    let mtime_ns = system_time_token(meta.modified()?);
+    let change_token = platform_change_token(&file, &meta)?;
+    Ok(SourceIdentity {
+        bytes: meta.len(),
+        mtime_ns,
+        change_token,
+    })
+}
+
+#[cfg(unix)]
+fn platform_change_token(_file: &fs::File, meta: &fs::Metadata) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(format!(
+        "unix:{}:{}:{}:{}",
+        meta.dev(),
+        meta.ino(),
+        meta.ctime(),
+        meta.ctime_nsec()
+    ))
+}
+
+#[cfg(windows)]
+fn platform_change_token(file: &fs::File, _meta: &fs::Metadata) -> Result<String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO, FILE_ID_INFO,
+    };
+
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let mut basic = FILE_BASIC_INFO::default();
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            (&mut basic as *mut FILE_BASIC_INFO).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut id = FILE_ID_INFO::default();
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&mut id as *mut FILE_ID_INFO).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let file_id: String = id
+        .FileId
+        .Identifier
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Ok(format!(
+        "windows:{}:{}:{}",
+        id.VolumeSerialNumber, file_id, basic.ChangeTime
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_change_token(_file: &fs::File, meta: &fs::Metadata) -> Result<String> {
+    // No stronger portable change marker exists. Keeping this equal to mtime
+    // makes callers treat an uncertain identity as a hash-required case.
+    Ok(format!("portable:{}", system_time_token(meta.modified()?)))
 }
 
 fn bytes_per_plane(width: u32) -> usize {
-    ((width as usize) + 7) / 8
+    (width as usize).div_ceil(8)
 }
 
 /// Serialise one row of a value column per the encoding table in §6.3.
@@ -187,6 +297,15 @@ fn events_schema() -> Arc<Schema> {
 fn writer_props() -> WriterProperties {
     WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
+        // §6.2 requires delta encoding for monotonically increasing times.
+        // Keeping the logical Arrow column as Int64 preserves the public
+        // Parquet schema while DELTA_BINARY_PACKED supplies the on-disk varint
+        // representation the compression section calls for.
+        .set_column_dictionary_enabled(ColumnPath::from("time"), false)
+        .set_column_encoding(
+            ColumnPath::from("time"),
+            ParquetEncoding::DELTA_BINARY_PACKED,
+        )
         .build()
 }
 
@@ -212,24 +331,169 @@ fn partition_streams(trace: &Trace, n_parts: usize) -> Vec<Vec<u32>> {
     parts
 }
 
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn temporary_sibling(path: &Path, role: &str) -> Result<PathBuf> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| crate::Error::Store(format!("invalid store path {}", path.display())))?
+        .to_string_lossy();
+    for _ in 0..100 {
+        let n = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{name}.{role}-{}-{n}", std::process::id()));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(crate::Error::Store(format!(
+        "could not allocate a temporary path beside {}",
+        path.display()
+    )))
+}
+
+fn remove_path(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+fn is_vtx_store(path: &Path) -> bool {
+    if !path.is_dir() || fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return false;
+    }
+    let Ok(mut index) = fs::File::open(path.join("index.bin")) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    index.read_exact(&mut magic).is_ok()
+        && &magic == index::MAGIC
+        && path.join("meta.json").is_file()
+        && path.join("signals.parquet").is_file()
+        && path.join("scopes.parquet").is_file()
+        && path.join("events").is_dir()
+}
+
+/// Persist refreshed provenance after a changed file identity was proven by
+/// hash to contain the same bytes. This avoids re-hashing a large, merely
+/// touched dump on every later reopen.
+pub(crate) fn write_meta(dir: &Path, meta: &Meta) -> Result<()> {
+    let path = dir.join("meta.json");
+    let stage = temporary_sibling(&path, "tmp")?;
+    let mut f = fs::File::create(&stage)?;
+    f.write_all(&serde_json::to_vec_pretty(meta)?)?;
+    f.sync_all()?;
+
+    #[cfg(not(windows))]
+    {
+        if let Err(e) = fs::rename(&stage, &path) {
+            let _ = fs::remove_file(&stage);
+            return Err(e.into());
+        }
+    }
+    #[cfg(windows)]
+    {
+        // std::fs::rename does not replace an existing file on Windows.
+        // Readers close meta.json immediately after parsing it, so moving the
+        // old file aside is safe; a failed install is rolled back.
+        let backup = temporary_sibling(&path, "old")?;
+        if let Err(e) = fs::rename(&path, &backup) {
+            let _ = fs::remove_file(&stage);
+            return Err(e.into());
+        }
+        if let Err(e) = fs::rename(&stage, &path) {
+            let _ = fs::rename(&backup, &path);
+            let _ = fs::remove_file(&stage);
+            return Err(e.into());
+        }
+        fs::remove_file(backup)?;
+    }
+    Ok(())
+}
+
 /// Write `trace` as a `.vtx` directory at `out_dir`.
+///
+/// The new store is completed beside the destination and only then installed.
+/// A failed Parquet/index/hash write therefore cannot destroy a previously
+/// valid cache or leave a half-written directory that looks current.
 pub fn write_vtx(trace: &Trace, out_dir: impl AsRef<Path>, source: Option<&Path>) -> Result<()> {
     let out_dir = out_dir.as_ref();
-    if out_dir.exists() {
-        fs::remove_dir_all(out_dir)?;
+    // Validate the in-memory identity table before creating a staging
+    // directory. Parsers normally guarantee this, but other importers and
+    // callers can construct `Trace` directly. Publishing a store that only
+    // fails when it is reopened turns a failed conversion into a stale-looking
+    // success artifact.
+    let mut paths = HashSet::with_capacity(trace.signals.len());
+    for signal in &trace.signals {
+        let path = signal.path();
+        if !paths.insert(path.clone()) {
+            return Err(crate::Error::Store(format!(
+                "refusing to write duplicate signal path `{path}`"
+            )));
+        }
+        if signal.stream as usize >= trace.streams.len() {
+            return Err(crate::Error::Store(format!(
+                "signal `{path}` refers to missing stream {}",
+                signal.stream
+            )));
+        }
     }
+    if out_dir.exists() && !is_vtx_store(out_dir) {
+        return Err(crate::Error::Store(format!(
+            "refusing to replace `{}` because it is not a VeriTrace store",
+            out_dir.display()
+        )));
+    }
+    let stage = temporary_sibling(out_dir, "tmp")?;
+    let built = write_vtx_inner(trace, &stage, source);
+    if let Err(e) = built {
+        if stage.exists() {
+            let _ = remove_path(&stage);
+        }
+        return Err(e);
+    }
+
+    let backup = temporary_sibling(out_dir, "old")?;
+    let had_old = out_dir.exists();
+    if had_old {
+        if let Err(e) = fs::rename(out_dir, &backup) {
+            let _ = remove_path(&stage);
+            return Err(e.into());
+        }
+    }
+    if let Err(e) = fs::rename(&stage, out_dir) {
+        if had_old {
+            let _ = fs::rename(&backup, out_dir);
+        }
+        let _ = remove_path(&stage);
+        return Err(e.into());
+    }
+    if had_old {
+        remove_path(&backup)?;
+    }
+    Ok(())
+}
+
+fn write_vtx_inner(trace: &Trace, out_dir: &Path, source: Option<&Path>) -> Result<()> {
     fs::create_dir_all(out_dir.join("events"))?;
     fs::create_dir_all(out_dir.join("txn"))?;
 
-    let encodings: Vec<Encoding> =
-        trace.streams.iter().map(|s| Encoding::for_column(&s.values)).collect();
+    let encodings: Vec<Encoding> = trace
+        .streams
+        .iter()
+        .map(|s| Encoding::for_column(&s.values))
+        .collect();
 
-    let n_parts = rayon::current_num_threads().clamp(1, 32).min(trace.streams.len().max(1));
+    let n_parts = rayon::current_num_threads()
+        .clamp(1, 32)
+        .min(trace.streams.len().max(1));
     let parts = partition_streams(trace, n_parts);
 
     // Each part is an independent file, so encoding and writing run fully in
     // parallel across signal groups.
-    let per_part: Vec<Result<(Vec<ChunkEntry>, Vec<(u32, Vec<u8>)>)>> = parts
+    let per_part: Vec<Result<PartWrite>> = parts
         .par_iter()
         .enumerate()
         .map(|(part_id, streams)| write_part(trace, &encodings, out_dir, part_id as u32, streams))
@@ -265,7 +529,21 @@ pub fn write_vtx(trace: &Trace, out_dir: impl AsRef<Path>, source: Option<&Path>
     write_signals(trace, &encodings, out_dir)?;
     write_scopes(trace, out_dir)?;
 
-    let source_sha256 = source.and_then(|p| sha256_file(p).ok());
+    let (source_sha256, source_bytes, recorded_identity) = match source {
+        Some(path) => {
+            let before = source_identity(path)?;
+            let hash = sha256_file(path)?;
+            let after = source_identity(path)?;
+            if before != after {
+                return Err(crate::Error::Store(format!(
+                    "source dump `{}` changed while it was being converted",
+                    path.display()
+                )));
+            }
+            (Some(hash), Some(after.bytes), Some(after))
+        }
+        None => (None, None, None),
+    };
     let meta = Meta {
         version: index::VERSION,
         timescale_num: trace.timescale.num,
@@ -280,11 +558,14 @@ pub fn write_vtx(trace: &Trace, out_dir: impl AsRef<Path>, source: Option<&Path>
         writer: trace.version.clone(),
         source_file: source.map(|p| p.display().to_string()),
         source_sha256,
-        source_bytes: source.and_then(|p| fs::metadata(p).ok()).map(|m| m.len()),
+        source_bytes,
+        source_identity: recorded_identity,
     };
     fs::write(out_dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
     Ok(())
 }
+
+type PartWrite = (Vec<ChunkEntry>, Vec<(u32, Vec<u8>)>);
 
 fn write_part(
     trace: &Trace,
@@ -292,8 +573,10 @@ fn write_part(
     out_dir: &Path,
     part_id: u32,
     streams: &[u32],
-) -> Result<(Vec<ChunkEntry>, Vec<(u32, Vec<u8>)>)> {
-    let path = out_dir.join("events").join(format!("part-{part_id:03}.parquet"));
+) -> Result<PartWrite> {
+    let path = out_dir
+        .join("events")
+        .join(format!("part-{part_id:03}.parquet"));
     let schema = events_schema();
     let file = fs::File::create(&path)?;
     let mut w = ArrowWriter::try_new(file, schema.clone(), Some(writer_props()))?;
@@ -488,7 +771,7 @@ fn write_single(path: PathBuf, schema: Arc<Schema>, batch: RecordBatch) -> Resul
     Ok(())
 }
 
-fn sha256_file(path: &Path) -> std::io::Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut f = fs::File::open(path)?;
     let mut h = Sha256::new();
     std::io::copy(&mut f, &mut h)?;
@@ -539,7 +822,12 @@ mod tests {
         let mut buf = Vec::new();
         encode_row(&s.values, 0, enc, &mut buf);
         let (a, b) = decode_row(&buf, width, enc);
-        assert_eq!(crate::value::Value::Bits { width, a, b }, v, "{:?} @{width}", String::from_utf8_lossy(digits));
+        assert_eq!(
+            crate::value::Value::Bits { width, a, b },
+            v,
+            "{:?} @{width}",
+            String::from_utf8_lossy(digits)
+        );
     }
 
     #[test]
@@ -570,7 +858,11 @@ mod tests {
             let mut seen: Vec<u32> = parts.iter().flatten().copied().collect();
             seen.sort();
             assert_eq!(seen, (0..10).collect::<Vec<u32>>(), "n_parts={n}");
-            assert!(parts.len() <= n.max(1), "n_parts={n} produced {}", parts.len());
+            assert!(
+                parts.len() <= n.max(1),
+                "n_parts={n} produced {}",
+                parts.len()
+            );
         }
     }
 }

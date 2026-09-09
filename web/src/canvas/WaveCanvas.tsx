@@ -15,7 +15,7 @@ import jetbrainsMonoUrl from "@fontsource/jetbrains-mono/files/jetbrains-mono-la
 import { WaveSocket, type WaveRequest } from "../api/client";
 import type { ExactPoint, MinMaxPoint, RenderRow, WaveChunk } from "../lib/types";
 import { xToTime } from "../lib/time";
-import { useWave, visibleRows, type WaveState } from "../state/store";
+import { enumLabelsFor, useWave, visibleRows, type WaveState } from "../state/store";
 import { setChunks } from "../state/values";
 
 /** Fetch this many viewports either side of the visible window. */
@@ -38,10 +38,21 @@ function readColors(): Record<string, string> {
     sigX: v("--sig-x"),
     sigZ: v("--sig-z"),
     sigBus: v("--sig-bus"),
+    causal: v("--causal"),
+    causalDim: v("--causal-dim"),
   };
 }
 
 function renderRows(s: WaveState): RenderRow[] {
+  const ranks = new Map<string, "primary" | "secondary">();
+  const visit = (node: import("../lib/types").CausalNode, onSpine: boolean): void => {
+    const primary = onSpine && node.is_primary_path;
+    const prior = ranks.get(node.signal);
+    if (!prior || primary) ranks.set(node.signal, primary ? "primary" : "secondary");
+    for (const child of node.children) visit(child, primary);
+  };
+  if (s.causal) visit(s.causal.root, true);
+
   return visibleRows(s.rows).map((r) => {
     if (r.kind === "group") {
       return { kind: "group", handle: -1, label: r.name, width: 0, radix: "hex" } as RenderRow;
@@ -53,6 +64,12 @@ function renderRows(s: WaveState): RenderRow[] {
       label: sig?.name ?? r.path,
       width: sig?.width ?? 1,
       radix: s.radix[r.path] ?? "hex",
+      enumLabels: enumLabelsFor(s.machines, r.path),
+      derived: sig?.derived ?? false,
+      causal:
+        s.hoveredCausal === r.path
+          ? "hover"
+          : ranks.get(r.path),
     } as RenderRow;
   });
 }
@@ -138,6 +155,8 @@ export function WaveCanvas() {
       scrollY: s.scrollY,
       rowH: s.rowH,
       rows: renderRows(s),
+      causalKey: s.causal?.query ?? "",
+      reducedMotion: window.matchMedia("(prefers-reduced-motion: reduce)").matches,
       cursor: s.cursor,
       markers: s.markers,
       rulerMode: s.rulerMode,
@@ -151,17 +170,23 @@ export function WaveCanvas() {
     const s = useWave.getState();
     const { w } = sizeRef.current;
     if (!s.ready || w <= 0) return null;
-    const handles = visibleRows(s.rows)
+    const visible = visibleRows(s.rows)
       .filter((r) => r.kind === "signal")
-      .map((r) => (r as { handle: number }).handle);
+      .map((r) => r as { kind: "signal"; handle: number; path: string });
+    const handles = visible.map((r) => r.handle);
     if (handles.length === 0) return null;
+    const derived = Object.fromEntries(
+      visible
+        .filter((row) => row.handle < 0 && s.signalsByHandle.get(row.handle)?.derived)
+        .map((row) => [row.handle, row.path]),
+    );
 
     const span = s.view.t1 - s.view.t0;
     const t0 = Math.max(s.bounds.t0, s.view.t0 - span * MARGIN);
     const t1 = Math.min(s.bounds.t1 + 1, s.view.t1 + span * MARGIN);
     // Resolution matched to the widened window so panning stays sharp.
     const px = Math.min(Math.round(w * (1 + 2 * MARGIN)), 8192);
-    return { signals: handles, t0, t1, pxWidth: px };
+    return { signals: handles, t0, t1, pxWidth: px, derived };
   }
 
   function needsRefetch(req: WaveRequest): boolean {

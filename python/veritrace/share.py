@@ -111,6 +111,24 @@ def apply(bundle: dict[str, Any], trace: Path, root: Path, force: bool = False) 
     from veritrace.api.sessions import LayoutFile
 
     out = Applied(layout_path=Path())
+    # A .vtsession is an exchanged, therefore untrusted, JSON document.  Note
+    # paths are relative project paths; accepting ``../`` or an absolute path
+    # would let restoring a screen overwrite arbitrary files.  Validate every
+    # destination before writing the layout too, so a rejected bundle has no
+    # partial side effects.
+    project = root.resolve()
+    note_entries: list[tuple[Path, str]] = []
+    for entry in bundle.get("notes") or []:
+        if not isinstance(entry, dict) or "path" not in entry or "text" not in entry:
+            raise ValueError("session note entries need path and text")
+        relative = Path(str(entry["path"]))
+        if relative.is_absolute():
+            raise ValueError(f"session note path must be relative: {relative}")
+        dest = (project / relative).resolve()
+        if dest != project and project not in dest.parents:
+            raise ValueError(f"session note path escapes project root: {relative}")
+        note_entries.append((dest, str(entry["text"])))
+
     want = (bundle.get("trace") or {}).get("sha256")
     got = TraceStore(str(trace)).source_sha256
     if want and got and want != got:
@@ -126,9 +144,7 @@ def apply(bundle: dict[str, Any], trace: Path, root: Path, force: bool = False) 
     out.layout_path = layout_file.path
     out.query = str(bundle.get("query") or "")
 
-    for entry in bundle.get("notes") or []:
-        dest = root / str(entry["path"])
-        text = str(entry["text"])
+    for dest, text in note_entries:
         if dest.exists() and dest.read_text(encoding="utf-8") != text and not force:
             # Someone else's annotations must never overwrite yours silently;
             # git is the merge tool here, as it is for everything else in §13.8.

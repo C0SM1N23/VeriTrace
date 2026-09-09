@@ -11,7 +11,7 @@ import time as _time
 from typing import Any
 
 from veritrace import clocks as clocks_mod
-from veritrace.clocks import Clock, to_trace_units
+from veritrace.clocks import Clock
 from veritrace.memory import banks, decode, metrics, timing
 from veritrace.memory.model import MemoryReport
 from veritrace.memory.timing import TimingError
@@ -74,7 +74,7 @@ def build(
     store: Any,
     iface: Interface,
     session_clock: Clock | None = None,
-    chip: str = "mt48lc16m16a2",
+    chip: str | timing.ChipTiming = "mt48lc16m16a2",
     project_root: Any = None,
     config: Any = None,
 ) -> MemoryReport:
@@ -87,21 +87,22 @@ def build(
     started = _time.perf_counter()
     out = MemoryReport(
         iface=iface.name,
-        chip=chip,
+        chip=chip.slug if isinstance(chip, timing.ChipTiming) else chip,
         n_banks=0,
         signals=dict(iface.signals),
         address_map=address_map_ranges(iface.pack),
     )
 
-    clock = clocks_mod.clock_at(store, iface.clock) if iface.clock else None
-    clock = clock or session_clock
+    clock = clocks_mod.clock_at(store, iface.clock) if iface.clock else session_clock
     if clock is None or not clock.edges:
         out.skipped["decode"] = "no usable clock for this interface"
         out.elapsed_ms = (_time.perf_counter() - started) * 1000.0
         return out
 
+    out.clock_path = clock.path
+
     try:
-        chip_timing = timing.find(chip, project_root)
+        chip_timing = chip if isinstance(chip, timing.ChipTiming) else timing.find(chip, project_root)
     except TimingError as e:
         out.skipped["timing"] = str(e)
         chip_timing = None
@@ -109,6 +110,10 @@ def build(
     sampler = Sampler(store, clock.edges)
     commands, decode_notes = decode.decode(iface, sampler, config)
     out.commands = commands
+    refreshes = sorted(c.time for c in commands if c.name == "REFRESH")
+    out.refresh_intervals = list(zip(refreshes, refreshes[1:]))
+    if chip_timing is not None:
+        out.refresh_limit = timing.to_ticks(chip_timing.tREFI, store.timescale, maximum=True)
     out.skipped.update({f"command {k}": v for k, v in decode_notes.items()})
     out.n_banks = _n_banks(commands)
 
@@ -123,6 +128,9 @@ def build(
         rp = _units(chip_timing.tRP, store.timescale) or 0
         out.segments = banks.segments(commands, out.n_banks, rcd, rp, run_start, run_end)
 
+    # REFRESH is device-wide and carries no bank. A trace containing only
+    # refresh commands must still check tRFC/tREFI even with zero known banks.
+    if chip_timing is not None:
         violations, checked, skipped = banks.check_timing(
             commands, out.n_banks, chip_timing, store.timescale, clock
         )
@@ -140,7 +148,7 @@ def build(
 
 
 def _units(ns: float, timescale: str) -> int | None:
-    return to_trace_units(ns, "ns", timescale)
+    return timing.to_ticks(ns, timescale)
 
 
 def build_all(
@@ -150,6 +158,7 @@ def build_all(
     config: Any = None,
     project_root: Any = None,
     chip: str | None = None,
+    choices: dict[str, Any] | None = None,
 ) -> list[MemoryReport]:
     """Every memory interface, extracted independently — one bad interface
     must not lose the others (P7), the same rule §8.14's `engine.extract`
@@ -159,9 +168,12 @@ def build_all(
     for iface in interfaces:
         picked_chip = chip or getattr(config, "memory_chip", None) or "mt48lc16m16a2"
         try:
+            if choices and iface.name in choices:
+                picked_chip = timing.resolve_choice(choices[iface.name], project_root)
             out.append(build(store, iface, session_clock, picked_chip, project_root, config))
         except Exception as e:  # noqa: BLE001 - one interface must not lose the rest
-            r = MemoryReport(iface=iface.name, chip=picked_chip, n_banks=0, signals=dict(iface.signals))
+            label = picked_chip.slug if isinstance(picked_chip, timing.ChipTiming) else picked_chip
+            r = MemoryReport(iface=iface.name, chip=label, n_banks=0, signals=dict(iface.signals))
             r.skipped["extraction"] = str(e)
             out.append(r)
     out.sort(key=lambda r: r.iface)

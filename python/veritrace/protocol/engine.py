@@ -142,6 +142,12 @@ def extract(
     for p in out.packs:
         out.errors += [f"{p.slug}: {w}" for w in p.warnings]
 
+    configured_reset = getattr(config, "reset_signal", None)
+    if configured_reset and detect.configured_signal(store, configured_reset) is None:
+        out.errors.append(
+            f"configured reset signal {configured_reset!r} was not found uniquely in the design"
+        )
+
     # Step 1. Memory packs (§8.20) decode a command bus, not valid/ready
     # channels — `veritrace.memory` extracts those separately, on the same
     # detected-interfaces list, so this pipeline is not asked to assemble
@@ -219,14 +225,14 @@ def _extract_one(
 ) -> Extraction:
     started = _time.perf_counter()
 
+    clock = clocks.clock_at(store, iface.clock) if iface.clock else session_clock
+
     if use_cache and trace_path is not None:
-        cached = persist.restore(trace_path, store, iface)
+        cached = persist.restore(trace_path, store, iface, clock, config)
         if cached is not None:
             cached.elapsed_ms = (_time.perf_counter() - started) * 1000.0
             return cached
 
-    clock = clocks.clock_at(store, iface.clock) if iface.clock else None
-    clock = clock or session_clock
     if clock is None or not clock.edges:
         return Extraction(
             interface=iface,
@@ -240,13 +246,11 @@ def _extract_one(
     in_reset = channels.reset_mask(iface, sampler, config)
     ex = Extraction(interface=iface, sampled_cycles=len(clock.edges))
     if all(in_reset):
-        # Either the design is held in reset for the whole run, or the polarity
-        # was read backwards. Both would silently extract nothing, so say what
-        # happened and scan anyway rather than report an idle bus.
+        # A reset is an input, not a heuristic to discard when it prevents work.
+        # Keep the mask and say why there are no transactions.
         ex.skipped["reset"] = (
-            f"`{iface.reset}` looks asserted for the whole run; ignoring it"
+            f"`{iface.reset}` is asserted or unknown for the whole run; no transactions sampled"
         )
-        in_reset = [False] * len(clock.edges)
 
     scans = channels.scan(iface, sampler, in_reset)
     for name, scan in scans.items():
@@ -284,7 +288,7 @@ def _extract_one(
     # Step 6.
     if trace_path is not None:
         try:
-            ex.parquet = str(persist.write(Path(trace_path), store, ex, clock))
+            ex.parquet = str(persist.write(Path(trace_path), store, ex, clock, config))
         except Exception as e:  # noqa: BLE001 - a read-only tree must not fail analysis
             ex.skipped["persist"] = str(e)
 

@@ -18,8 +18,10 @@ import type {
   Machine,
   MemoryReport,
   OpenSession,
+  PerfHistory,
   PerfReport,
   Repro,
+  SessionProgress,
   SessionStatus,
   SignalMeta,
   SourceFile,
@@ -74,7 +76,10 @@ const WS_ORIGIN: string = import.meta.env.DEV
  */
 async function getJson<T>(url: string): Promise<T> {
   const r = await fetch(url, { headers: { Accept: "application/json" } });
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText} for ${url}`);
+  if (!r.ok) {
+    const detail = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(detail.detail ?? `${r.status} ${r.statusText} for ${url}`);
+  }
   return (await r.json()) as T;
 }
 
@@ -110,6 +115,20 @@ export async function fetchStatus(session: string): Promise<SessionStatus> {
   return getJson<SessionStatus>(`${API}/session/${session}/status`);
 }
 
+/** A session URL is usable while conversion/elaboration is still in progress. */
+export async function waitForSession(
+  session: string,
+  onProgress: (status: SessionProgress) => void,
+): Promise<SessionStatus> {
+  for (;;) {
+    const status = await fetchStatus(session);
+    if (status.phase === "error") throw new Error(status.error || "Opening the trace failed");
+    onProgress(status);
+    if (status.phase === "ready") return status;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+}
+
 export async function fetchSignals(session: string, q = "", limit = 5000): Promise<SignalMeta[]> {
   const body = await getJson<{ signals: SignalMeta[] }>(
     `${API}/session/${session}/signals?q=${encodeURIComponent(q)}&limit=${limit}`,
@@ -133,12 +152,25 @@ export async function fetchHierarchy(session: string, path = ""): Promise<Hierar
 export async function fetchSubtreeSignals(
   session: string,
   path = "",
-  limit = 5000,
+  limit = 50_000,
 ): Promise<SignalMeta[]> {
   const body = await getJson<{ signals: SignalMeta[] }>(
     `${API}/session/${session}/hierarchy/signals?path=${encodeURIComponent(path)}&limit=${limit}`,
   );
   return body.signals;
+}
+
+/** Exact settled values at one instant (Source/Inspector, never display buckets). */
+export async function fetchValues(
+  session: string,
+  handles: number[],
+  time: number,
+  derived: Record<number, string> = {},
+): Promise<Map<number, string | null>> {
+  const got = await postJson<{
+    values: { handle: number; value: string | null }[];
+  }>(`${API}/session/${session}/values`, { handles, time, derived });
+  return new Map(got.values.map((row) => [row.handle, row.value]));
 }
 
 export async function fetchLayout(session: string): Promise<Layout> {
@@ -159,6 +191,8 @@ export interface WaveRequest {
   t0: number;
   t1: number;
   pxWidth: number;
+  /** Browser-local negative handle -> elaborated RTL path (§7.3). */
+  derived?: Record<number, string>;
 }
 
 type ChunkHandler = (chunks: WaveChunk[], req: WaveRequest) => void;
@@ -248,6 +282,7 @@ export class WaveSocket {
         t0: Math.floor(req.t0),
         t1: Math.ceil(req.t1),
         px_width: Math.max(1, Math.round(req.pxWidth)),
+        derived: req.derived ?? {},
       }),
     );
   }
@@ -258,8 +293,90 @@ export class WaveSocket {
   }
 }
 
-export async function runQuery(session: string, vtq: string): Promise<WhyResult> {
-  return postJson<WhyResult>(`${API}/session/${session}/query`, { vtq });
+export type QueryResult = WhyResult | Record<string, unknown>;
+
+export interface QueryPartial {
+  node?: WhyResult["root"];
+  result?: Record<string, unknown>;
+  progress?: { phase: string; pct: number | null; elapsed_ms: number; nodes?: number };
+}
+
+/**
+ * Execute VTQ through §10.2's progressive channel.
+ *
+ * A previous client implementation left the WebSocket query protocol entirely
+ * unused and sent every query to REST.  The backend could emit causal nodes as
+ * they were completed, but a real user still saw a mute spinner until the full
+ * tree arrived.  This one-shot socket keeps cancellation/error semantics
+ * simple while making every query-bar request use the production streaming
+ * path.  Wave data keeps its long-lived, independently coalesced socket.
+ */
+export function streamQuery(
+  session: string,
+  vtq: string,
+  onPartial?: (partial: QueryPartial) => void,
+): Promise<QueryResult> {
+  const url = `${WS_ORIGIN.replace(/^http/, "ws")}/session/${session}/ws`;
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+    let provisional: QueryResult | null = null;
+    let settled = false;
+
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      fn();
+      ws.close();
+    };
+
+    ws.onopen = () => ws.send(encode({ op: "query", vtq }));
+    ws.onerror = () => finish(() => reject(new Error("query websocket error")));
+    ws.onclose = () => {
+      if (!settled) finish(() => reject(new Error("query websocket closed before completion")));
+    };
+    ws.onmessage = (ev) => {
+      if (!(ev.data instanceof ArrayBuffer)) return;
+      const msg = decode(new Uint8Array(ev.data)) as Record<string, unknown>;
+      if (msg.op === "partial") {
+        const partial = {
+          node: msg.node as QueryPartial["node"],
+          result: msg.result as QueryPartial["result"],
+        };
+        if (partial.result) provisional = partial.result;
+        onPartial?.(partial);
+        return;
+      }
+      if (msg.op === "progress") {
+        onPartial?.({
+          progress: {
+            phase: String(msg.phase ?? "query"),
+            pct: typeof msg.pct === "number" ? msg.pct : null,
+            elapsed_ms: typeof msg.elapsed_ms === "number" ? msg.elapsed_ms : 0,
+            nodes: typeof msg.nodes === "number" ? msg.nodes : undefined,
+          },
+        });
+        return;
+      }
+      if (msg.op === "error") {
+        finish(() => reject(new Error(String(msg.message ?? "query failed"))));
+        return;
+      }
+      if (msg.op === "done") {
+        const result = (msg.result as QueryResult | undefined) ?? provisional;
+        if (result === null) {
+          finish(() => reject(new Error("query completed without a result")));
+        } else {
+          finish(() => resolve(result));
+        }
+      }
+    };
+  });
+}
+
+/** REST remains available to API consumers and tests; the browser uses `streamQuery`. */
+export async function runQuery(session: string, vtq: string): Promise<QueryResult> {
+  return postJson<QueryResult>(`${API}/session/${session}/query`, { vtq });
 }
 
 // --- §8.2, §8.3, §11.5, §12 — subtrace, repro, replay, report --------------
@@ -302,6 +419,29 @@ export async function downloadReport(session: string, vtq: string): Promise<stri
   return name;
 }
 
+/** Download TAB 8's interoperable transaction table (§6.3, §11.4b). */
+export async function downloadTransactions(
+  session: string,
+  iface: string,
+  kind: "csv" | "parquet",
+): Promise<string> {
+  const r = await post(`${API}/session/${session}/export`, {
+    kind,
+    target: `txn(${iface})`,
+  });
+  const blob = await r.blob();
+  const fallback = `${iface.replace(/[^A-Za-z0-9_.-]+/g, "_")}.${kind}`;
+  const name =
+    /filename="?([^";]+)"?/.exec(r.headers.get("content-disposition") ?? "")?.[1] ?? fallback;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(url);
+  return name;
+}
+
 // --- §8.8 — FSM mode -------------------------------------------------------
 
 export async function fetchMachines(session: string): Promise<Machine[]> {
@@ -325,12 +465,15 @@ export async function fetchSessions(): Promise<OpenSession[]> {
 export async function runDiff(
   session: string,
   trace: string,
-  opts: { strategy?: string; anchor?: string | null; ignore?: string[] } = {},
+  opts: { strategy?: string; anchor?: string | null; ignore?: string[]; times_a?: number[]; times_b?: number[]; focus?: string | null } = {},
 ): Promise<DiffReport> {
   return postJson<DiffReport>(`${API}/session/${session}/diff`, {
     trace,
     strategy: opts.strategy ?? "cycle",
     anchor: opts.anchor ?? null,
+    times_a: opts.times_a ?? [],
+    times_b: opts.times_b ?? [],
+    focus: opts.focus ?? null,
     ignore: opts.ignore ?? [],
   });
 }
@@ -385,14 +528,36 @@ export async function runTxnQuery(session: string, vtq: string): Promise<TxnQuer
 
 // --- TAB 9, Performance (§8.17-8.18) ---------------------------------------
 
-export async function fetchPerformance(session: string): Promise<PerfReport> {
-  return getJson<PerfReport>(`${API}/session/${session}/performance`);
+export async function fetchPerformance(
+  session: string, window: { t0: number; t1: number } | null = null,
+): Promise<PerfReport> {
+  const query = window ? `?t0=${window.t0}&t1=${window.t1}` : "";
+  return getJson<PerfReport>(`${API}/session/${session}/performance${query}`);
+}
+
+export async function fetchPerformanceHistory(
+  session: string,
+  iface: string,
+  metric: string,
+): Promise<PerfHistory> {
+  const params = new URLSearchParams({ iface, metric });
+  return getJson<PerfHistory>(`${API}/session/${session}/performance/history?${params}`);
 }
 
 // --- TAB 10, Memory (§8.20) ------------------------------------------------
 
 export async function fetchMemory(session: string): Promise<MemoryReport> {
   return getJson<MemoryReport>(`${API}/session/${session}/memory`);
+}
+
+export async function setMemoryTiming(session: string, iface: string, choice: { chip?: string; toml?: string }): Promise<MemoryReport> {
+  const response = await fetch(`${API}/session/${session}/memory/timing`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ iface, ...choice }),
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.detail ?? `timing update failed: ${response.status}`);
+  return result as MemoryReport;
 }
 
 /**

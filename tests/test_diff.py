@@ -201,6 +201,103 @@ def test_matching_by_content_survives_a_missing_anchor():
     assert [x[1] for x in pairs] == [0, 1, 2, 3]
 
 
+def test_lcs_is_exact_even_when_greedy_matching_blocks_are_shorter():
+    from itertools import product
+    from veritrace.diff.align import Anchor, _pair
+
+    def reference(a, b):
+        row = [0] * (len(b) + 1)
+        for key in a:
+            previous = row
+            row = [0]
+            for j, other in enumerate(b):
+                row.append(previous[j] + 1 if key == other else max(row[-1], previous[j + 1]))
+        return row[-1]
+
+    words = ["".join(w) for n in range(5) for w in product("ab", repeat=n)]
+    for a in words:
+        for b in words:
+            pairs, _ = _pair([Anchor(i, k) for i, k in enumerate(a)],
+                             [Anchor(i, k) for i, k in enumerate(b)])
+            assert len(pairs) == reference(a, b), (a, b, pairs)
+            assert all(a[i] == b[j] for i, j in pairs)
+            assert all(i < k and j < l for (i, j), (k, l) in zip(pairs, pairs[1:]))
+
+
+def test_long_anchor_sequences_never_fall_back_to_wrong_positional_matches():
+    from veritrace.diff.align import Anchor, _pair
+
+    a = [Anchor(i, str(i % 3)) for i in range(20002)]
+    b = a[:10000] + a[10001:]
+    pairs, note = _pair(a, b)
+    assert len(pairs) == len(b)
+    assert all(a[i].key == b[j].key for i, j in pairs)
+    assert "paired by position" not in note
+
+
+def test_subcycle_glitches_and_the_tail_after_the_last_anchor_are_compared(tmp_path):
+    from click.testing import CliRunner
+    from fastapi.testclient import TestClient
+    from veritrace.api import create_app
+    from veritrace.cli import main
+    import json
+
+    header = ('$timescale 1ns $end\n$scope module tb $end\n'
+              '$var wire 1 ! clk $end\n$var wire 1 " state $end\n'
+              '$upscope $end\n$enddefinitions $end\n#0\n0!\n0"\n')
+    a, b = tmp_path / "a.vcd", tmp_path / "b.vcd"
+    a.write_text(header + '#5\n1!\n#7\n1"\n#8\n0"\n#10\n0!\n#15\n1!\n#20\n0!\n')
+    b.write_text(header + '#5\n1!\n#10\n0!\n#15\n1!\n#20\n0!\n')
+    for glitch in (7, 18):
+        if glitch == 18:
+            a.write_text(header + '#5\n1!\n#10\n0!\n#15\n1!\n#18\n1"\n#19\n0"\n#20\n0!\n')
+        cli = CliRunner().invoke(main, ["diff", str(a), str(b), "--json"])
+        assert cli.exit_code == 0, cli.output
+        d = json.loads(cli.stdout)["divergences"][0]
+        assert (d["time_a"], d["time_b"], d["value_a"], d["value_b"]) == (glitch, glitch, "1", "0")
+        wave = json.loads(cli.stdout)["wave"]
+        assert wave["signal"] == "state"
+        different = [s for s in wave["segments"] if s["different"]]
+        assert len(different) == 1
+        assert (different[0]["time_a"], different[0]["time_b"], different[0]["a"], different[0]["b"]) == (glitch, glitch, "1", "0")
+        assert different[0]["end"] - different[0]["start"] == pytest.approx(0.1)
+        with TestClient(create_app(default_trace=a)) as c:
+            sid = c.get("/").json()["default_session"]
+            actual = c.post(f"/session/{sid}/diff", json={"trace": str(b)}).json()["divergences"][0]
+            assert actual == d
+
+
+def test_manual_anchors_reach_the_actual_comparator_through_cli_api_and_vtq(tmp_path):
+    from click.testing import CliRunner
+    from fastapi.testclient import TestClient
+    from veritrace.api import create_app
+    from veritrace.cli import main
+    import json
+
+    a = write_vcd(tmp_path / "a.vcd", "ns", 5, flip_cycle=8)
+    b = write_vcd(tmp_path / "b.vcd", "ps", 5000, flip_cycle=9)
+    cli = CliRunner().invoke(main, ["diff", str(a), str(b), "--align", "manual",
+        "--mark", "0", "0", "--mark", "200", "200000", "--json"])
+    assert cli.exit_code == 0, cli.output
+    expected = json.loads(cli.stdout)
+    assert expected["alignment"]["matched"] == 2
+    assert expected["divergences"][0]["time_a"] == 85
+    with TestClient(create_app(default_trace=a)) as c:
+        sid = c.get("/").json()["default_session"]
+        body = {"trace": str(b), "strategy": "manual", "times_a": [0, 200], "times_b": [0, 200000]}
+        direct = c.post(f"/session/{sid}/diff", json=body)
+        assert direct.status_code == 200, direct.text
+        assert direct.json()["divergences"] == expected["divergences"]
+        vtq = f'diff("{b.as_posix()}", align=manual, marks="0:0,200:200000")'
+        queried = c.post(f"/session/{sid}/query", json={"vtq": vtq})
+        assert queried.status_code == 200, queried.text
+        assert queried.json()["divergences"] == expected["divergences"]
+        for invalid in ([0, 0], [200, 0], [0, 201], [0]):
+            response = c.post(f"/session/{sid}/diff", json={**body, "times_a": invalid})
+            assert response.status_code == 409, response.text
+        assert c.post(f"/session/{sid}/diff", json={**body, "times_a": [False, 200]}).status_code == 422
+
+
 def test_anchors_matching_nothing_are_reported():
     from veritrace.diff.align import Anchor, _pair
 
@@ -254,7 +351,12 @@ def test_it_finds_the_injected_difference_between_a_clean_and_a_buggy_run(inject
     # slave stops accepting once the injected hold is in.
     behaviour = [d for d in report.divergences if not d.detail]
     assert behaviour, "nothing but build differences — the runs did not diverge"
-    assert behaviour[0].at > first.at
+    # Initialization itself can differ at t=0 (the buggy node starts at X).
+    # Do not discard those genuine events just to place every effect in a later cycle.
+    assert behaviour[0].at >= first.at
+    assert any(d.at > first.at for d in behaviour)
+    for d in behaviour:
+        assert d.value_a != d.value_b
     assert any("s_allowed" in d.signal for d in behaviour[:4])
     assert [d.at for d in report.divergences] == sorted(d.at for d in report.divergences)
 
@@ -288,6 +390,30 @@ def test_ignoring_a_signal_takes_it_out_of_the_comparison(injected):
     assert "HOLD" not in {d.signal for d in after.divergences}
     assert after.compared < before.compared
     assert "HOLD" in after.ignored
+
+
+def test_an_empty_comparison_cannot_be_reported_as_agreement(injected):
+    _el, clean, buggy = injected
+    alignment = diff_mod.align(clean, buggy, "cycle")
+    with pytest.raises(diff_mod.AlignError, match="no common signals"):
+        diff_mod.compare(alignment, ignore=["*"])
+    with pytest.raises(diff_mod.AlignError, match="missing from"):
+        diff_mod.compare(alignment, only=["port_that_was_not_dumped"])
+    for limit in [0, -1]:
+        with pytest.raises(diff_mod.AlignError, match="limit must"):
+            diff_mod.compare(alignment, limit=limit)
+
+
+def test_explicit_synthesis_ports_override_default_counter_ignore(tmp_path):
+    a = write_vcd(tmp_path / "a.vcd", "ns", 5, flip_cycle=3)
+    b = write_vcd(tmp_path / "b.vcd", "ns", 5, flip_cycle=7)
+    for path in (a, b):
+        path.write_text(path.read_text().replace('" state $end', '" byte_cnt $end'))
+    sides = [open_side(p.stem, p, tmp_path / (p.stem + ".vtx")) for p in (a, b)]
+    alignment = diff_mod.align(*sides, "cycle")
+    report = diff_mod.compare(alignment, only=["byte_cnt"])
+    assert report.compared == 1
+    assert report.first is not None and report.first.signal == "byte_cnt"
 
 
 def test_why_runs_on_both_sides_and_says_where_they_part(injected):
@@ -347,6 +473,58 @@ def test_diff_route_opens_the_second_trace_as_its_own_session():
     assert names == {"dump_ok.vcd.vtx", "dump.vcd.vtx"}
 
 
+def test_diff_vtq_uses_the_same_production_comparison():
+    from fastapi.testclient import TestClient
+
+    from veritrace.api import create_app
+
+    client = TestClient(
+        create_app(str(design_store("deadlock", "dump_ok.vcd")), [str(DEADLOCK)])
+    )
+    sid = client.get("/", headers={"Accept": "application/json"}).json()[
+        "default_session"
+    ]
+    other = str(design_store("deadlock")).replace("\\", "/")
+    got = client.post(
+        f"/session/{sid}/query", json={"vtq": f"diff('{other}', align=cycle)"}
+    )
+    assert got.status_code == 200, got.text
+    assert got.json()["kind"] == "diff"
+    assert got.json()["divergences"]
+    assert got.json()["alignment"]["strategy"] == "cycle"
+
+
+def test_focusing_a_divergence_updates_real_waves_and_both_causal_chains():
+    import json
+    from click.testing import CliRunner
+    from fastapi.testclient import TestClient
+    from veritrace.api import create_app
+    from veritrace.cli import main
+
+    a, b = design_store("deadlock", "dump_ok.vcd"), design_store("deadlock")
+    with TestClient(create_app(str(a), [str(DEADLOCK)])) as client:
+        sid = client.get("/").json()["default_session"]
+        initial = client.post(f"/session/{sid}/diff", json={"trace": str(b)}).json()
+        chosen = next(d for d in initial["divergences"] if not d["detail"] and d["time_a"] > 0)
+        got = client.post(f"/session/{sid}/diff", json={"trace": str(b), "focus": chosen["signal"]})
+        assert got.status_code == 200, got.text
+        focused = got.json()
+        assert focused["focus"] == focused["wave"]["signal"] == chosen["signal"]
+        for side in ("a", "b"):
+            assert focused[f"why_{side}"]["signal"].endswith("." + chosen["signal"])
+            assert focused[f"why_{side}"]["time"] == chosen[f"time_{side}"]
+        at = next(s for s in focused["wave"]["segments"] if s["time_a"] == chosen["time_a"])
+        assert at["different"] and (at["a"], at["b"]) == (chosen["value_a"], chosen["value_b"])
+        invalid = client.post(f"/session/{sid}/diff", json={"trace": str(b), "focus": "nonexistent"})
+        assert invalid.status_code == 409
+    cli = CliRunner().invoke(main, ["diff", str(a), str(b), "--rtl", str(DEADLOCK),
+        "--focus", chosen["signal"], "--json"])
+    assert cli.exit_code == 0, cli.output
+    result = json.loads(cli.stdout)
+    assert result["wave"] == focused["wave"]
+    assert result["why_a"]["signal"] == focused["why_a"]["signal"]
+
+
 def test_diffing_a_trace_against_itself_is_refused():
     from fastapi.testclient import TestClient
 
@@ -359,3 +537,25 @@ def test_diffing_a_trace_against_itself_is_refused():
     )
     assert got.status_code == 400
     assert "same trace" in got.json()["detail"]
+
+
+def test_empty_diff_and_cli_limits_propagate_through_production_entrypoints():
+    from click.testing import CliRunner
+    from fastapi.testclient import TestClient
+    from veritrace.api import create_app
+    from veritrace.cli import main
+    import json
+
+    a, b = design_store("deadlock", "dump_ok.vcd"), design_store("deadlock")
+    with TestClient(create_app(str(a), [str(DEADLOCK)])) as client:
+        sid = client.get("/").json()["default_session"]
+        got = client.post(f"/session/{sid}/diff", json={"trace": str(b), "ignore": ["*"]})
+        assert got.status_code == 409, got.text
+        assert "no common signals" in got.json()["detail"]
+    run = CliRunner().invoke(main, ["diff", str(a), str(b), "--ignore", "*"])
+    assert run.exit_code != 0 and "no common signals" in run.output
+    run = CliRunner().invoke(main, ["diff", str(a), str(b), "--limit", "1", "--json"])
+    assert run.exit_code == 0, run.output
+    assert len(json.loads(run.output)["divergences"]) == 1
+    invalid = CliRunner().invoke(main, ["diff", str(a), str(b), "--limit", "0"])
+    assert invalid.exit_code != 0

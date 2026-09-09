@@ -26,10 +26,11 @@ from __future__ import annotations
 
 import fnmatch
 from dataclasses import dataclass, field
+from fractions import Fraction
 from typing import Any, Iterable
 
 from veritrace.analysis.whytrace import CausalNode, WhyTracer
-from veritrace.diff.align import Alignment
+from veritrace.diff.align import AlignError, Alignment
 
 #: Signals whose disagreement is expected and would bury the real answer:
 #: performance counters, timestamps, and the simulator's own bookkeeping. §11.4
@@ -45,7 +46,7 @@ MAX_DIVERGENCES = 200
 class Divergence:
     signal: str
     #: Position on the shared axis — the cycle number under the default strategy.
-    at: int
+    at: float
     time_a: int
     time_b: int
     value_a: str
@@ -87,6 +88,8 @@ class DiffReport:
     #: no RTL to build them from.
     first_differing: int | None = None
     why_error: str = ""
+    focus: str | None = None
+    wave: dict[str, Any] | None = None
 
     @property
     def first(self) -> Divergence | None:
@@ -109,6 +112,8 @@ class DiffReport:
             "why_b": self.why_b.to_dict() if self.why_b else None,
             "first_differing": self.first_differing,
             "why_error": self.why_error,
+            "focus": self.focus,
+            "wave": self.wave,
         }
 
 
@@ -139,19 +144,18 @@ def _ignored(path: str, patterns: Iterable[str]) -> bool:
 # --- steps 3 and 4: the merge sort ------------------------------------------
 
 
-def _steps(store: Any, handle: int, alignment: Alignment, side: str) -> list[tuple[int, str]]:
+def _steps(store: Any, handle: int, alignment: Alignment, side: str) -> list[tuple[Fraction, str]]:
     """A signal as `(position, value)` on the shared axis, one entry per change.
 
-    The transition list, projected onto the common axis and collapsed: two
-    transitions inside one position are one value — the settled one — which is
-    what a comparison per cycle means and what keeps sub-cycle skew between two
-    runs from reading as a divergence.
+    Only events at the exact same timestamp collapse to their settled value.
+    Collapsing an entire cycle hides glitches and reports values from before
+    the event that actually diverged.
     """
     lo, hi = store.time_range
     start = store.value_at(handle, lo)
-    out: list[tuple[int, str]] = [(-(1 << 62), start.bits if start is not None else "x")]
+    out = [(alignment.ordinal_exact(lo, side), start.bits if start is not None else "?")]
     for t, value in store.transitions(handle, lo, hi + 1):
-        pos = int(alignment.ordinal(t, side))
+        pos = alignment.ordinal_exact(t, side)
         if out and out[-1][0] == pos:
             out[-1] = (pos, value.bits)
         else:
@@ -159,10 +163,19 @@ def _steps(store: Any, handle: int, alignment: Alignment, side: str) -> list[tup
     return out
 
 
-def _first_difference(a: list[tuple[int, str]], b: list[tuple[int, str]], limit: int) -> int | None:
+def _first_difference(a: list[tuple[Fraction, str]], b: list[tuple[Fraction, str]],
+                      start: Fraction, limit: Fraction) -> Fraction | None:
     """The first position at which two step functions disagree — §8.7 step 4."""
     i = j = 0
     va, vb = a[0][1], b[0][1]
+    while i + 1 < len(a) and a[i + 1][0] <= start:
+        i += 1
+        va = a[i][1]
+    while j + 1 < len(b) and b[j + 1][0] <= start:
+        j += 1
+        vb = b[j][1]
+    if not _same(va, vb):
+        return start
     while True:
         # Next position either side changes at.
         na = a[i + 1][0] if i + 1 < len(a) else None
@@ -221,8 +234,13 @@ def compare(
     rename, merge or delete everything inside, so comparing internals would
     report a synthesiser doing its job as a mismatch.
     """
+    if limit < 1:
+        raise AlignError("diff limit must be at least 1; zero would hide every divergence")
     a, b = alignment.a, alignment.b
-    patterns = tuple(ignore) + DEFAULT_IGNORE
+    only = tuple(only)
+    # Explicitly requested DUT ports are never silently treated as simulator
+    # bookkeeping just because a real output happens to be called *_cnt.
+    patterns = tuple(ignore) + (() if only else DEFAULT_IGNORE)
     top_a, top_b = _top_of(a.store), _top_of(b.store)
 
     by_a = {normalise(s.path, top_a): s for s in a.store.signals()}
@@ -230,6 +248,9 @@ def compare(
     common = sorted(set(by_a) & set(by_b))
     if only:
         keep = set(only)
+        missing = sorted(keep - (set(by_a) & set(by_b)))
+        if missing:
+            raise AlignError("requested signals missing from one or both traces: " + ", ".join(missing))
         common = [n for n in common if n in keep]
 
     report = DiffReport(
@@ -238,17 +259,25 @@ def compare(
         only_b=sorted(set(by_b) - set(by_a)),
     )
 
-    horizon = alignment.span
+    start = max(alignment.ordinal_exact(a.store.time_range[0], "a"),
+                alignment.ordinal_exact(b.store.time_range[0], "b"))
+    horizon = min(alignment.ordinal_exact(a.store.time_range[1], "a"),
+                  alignment.ordinal_exact(b.store.time_range[1], "b"))
+    if horizon < start:
+        raise AlignError("the aligned traces have no overlapping observed time range")
     found: list[Divergence] = []
     for name in common:
         if _ignored(name, patterns):
             report.ignored.append(name)
             continue
         sa, sb = by_a[name], by_b[name]
+        if not sa.n_events or not sb.n_events:
+            raise AlignError(f"{name} has no observed values in one of the traces; cannot compare it")
         report.compared += 1
         at = _first_difference(
             _steps(a.store, sa.handle, alignment, "a"),
             _steps(b.store, sb.handle, alignment, "b"),
+            start,
             horizon,
         )
         if at is None:
@@ -259,7 +288,7 @@ def compare(
         found.append(
             Divergence(
                 signal=name,
-                at=at,
+                at=float(at),
                 time_a=ta,
                 time_b=tb,
                 value_a=va.bits if va is not None else "?",
@@ -269,8 +298,50 @@ def compare(
         )
 
     found.sort(key=lambda d: (d.at, d.signal))
+    if not report.compared:
+        raise AlignError("no common signals remain to compare after applying the filters")
     report.divergences = found[:limit]
+    select_focus(report)
     return report
+
+
+def select_focus(report: DiffReport, signal: str | None = None) -> None:
+    """Real aligned wave segments for the divergence currently inspected."""
+    chosen = (next((d for d in report.divergences if d.signal == signal), None)
+              if signal is not None else report.first)
+    if signal is not None and chosen is None:
+        raise AlignError(f"no reported divergence for {signal!r}")
+    report.focus = chosen.signal if chosen else None
+    report.why_a = report.why_b = None
+    report.first_differing = None
+    report.why_error = ""
+    if chosen is None:
+        report.wave = None
+        return
+    al = report.alignment
+    sides = (al.a, al.b)
+    handles = [next(s.handle for s in side.store.signals()
+                    if normalise(s.path, _top_of(side.store)) == chosen.signal) for side in sides]
+    a, b = [_steps(side.store, h, al, name) for side, h, name in zip(sides, handles, ("a", "b"))]
+    center = al.ordinal_exact(chosen.time_a, "a")
+    lo = max(center - 4, al.ordinal_exact(al.a.store.time_range[0], "a"),
+             al.ordinal_exact(al.b.store.time_range[0], "b"))
+    hi = min(center + 4, al.ordinal_exact(al.a.store.time_range[1], "a"),
+             al.ordinal_exact(al.b.store.time_range[1], "b"))
+    points = sorted({lo, hi} | {p for p, _ in a + b if lo < p < hi})
+    segments = []
+    i = j = 0
+    for left, right in zip(points, points[1:]):
+        while i + 1 < len(a) and a[i + 1][0] <= left:
+            i += 1
+        while j + 1 < len(b) and b[j + 1][0] <= left:
+            j += 1
+        va, vb = a[i][1], b[j][1]
+        segments.append({"start": float(left), "end": float(right), "a": va, "b": vb,
+                         "different": not _same(va, vb), "time_a": al.time_at(left, "a"),
+                         "time_b": al.time_at(left, "b")})
+    report.wave = {"signal": chosen.signal, "start": float(lo), "end": float(hi),
+                   "segments": segments}
 
 
 # --- transaction level ------------------------------------------------------
@@ -358,7 +429,7 @@ def explain(report: DiffReport, graph_a: Any, graph_b: Any) -> DiffReport:
     everything above it is the two runs agreeing about why, and it is the first
     line where they stop.
     """
-    first = report.first
+    first = next((d for d in report.divergences if d.signal == report.focus), report.first)
     if first is None:
         return report
     a, b = report.alignment.a, report.alignment.b

@@ -52,16 +52,23 @@ def _conjuncts(e: Expr | None) -> Iterator[Expr]:
 def _drivers_at(graph: Any, file: str, line: int) -> list[Driver]:
     """Drivers whose assignment is on that source line.
 
-    Matched on the file's *base name*: a coverage database records the path the
-    simulator saw and VeriTrace records the path pyslang was given, and the two
-    disagree whenever the run happened in a different directory. The line number
-    is what carries the identity.
+    A relocated database may name a suffix of the elaborated path. Accept that
+    only when it identifies a single file; a line number does not disambiguate
+    two modules both called ``part.sv``.
     """
-    stem = Path(file).name
+    requested = file.replace("\\", "/").removeprefix("./")
+    files = {d.loc.file.replace("\\", "/") for sig in graph.signals.values()
+             for d in sig.drivers if d.loc}
+    matches = {f for f in files if f == requested or f.endswith("/" + requested)
+               or requested.endswith("/" + f)}
+    if not matches:
+        matches = {f for f in files if Path(f).name == Path(requested).name}
+    if len(matches) != 1:
+        return []
     out: list[Driver] = []
     for sig in graph.signals.values():
         for d in sig.drivers:
-            if d.loc and d.loc.line == line and Path(d.loc.file).name == stem:
+            if d.loc and d.loc.line == line and d.loc.file.replace("\\", "/") in matches:
                 out.append(d)
     return out
 
@@ -69,9 +76,10 @@ def _drivers_at(graph: Any, file: str, line: int) -> list[Driver]:
 class _Sampler:
     """Evaluates a conjunct at every clock edge, once per distinct conjunct."""
 
-    def __init__(self, view: TraceView, edges: list[int]) -> None:
+    def __init__(self, view: TraceView, edges: list[int], before: bool = False) -> None:
         self.view = view
         self.edges = edges
+        self.before = before
         self._cache: dict[str, tuple[int | None, int]] = {}
 
     def held(self, e: Expr) -> tuple[int | None, int]:
@@ -85,7 +93,7 @@ class _Sampler:
             hits = 0
             decided = 0
             for t in self.edges:
-                value = evaluate(e, lambda s: self.view.value(s, t)).truthy()
+                value = evaluate(e, lambda s: self.view.value(s, t, before=self.before)).truthy()
                 if value.x:
                     continue
                 decided += 1
@@ -103,6 +111,49 @@ def _needed_value(e: Expr) -> tuple[Ref, Const] | None:
         case Binary(op="==", lhs=Const() as c, rhs=Ref() as r):
             return r, c
     return None
+
+
+def fsm_holes(graph: Any, store: Any, clock: Any = None, elaboration: Any = None) -> list[Hole]:
+    """Observed missing FSM transitions and their measured enabling conditions.
+
+    This is shared by CLI coverage/uncovered, the API and the diagram. An
+    untaken transition alone does not prove its residual guard was always
+    false: the machine may simply never have entered the source state.
+    """
+    from veritrace import clocks
+    from veritrace.analysis import fsm
+
+    if graph is None or store is None:
+        return []
+    out = []
+    for machine in fsm.extract(graph, elaboration, store):
+        signal = graph.get(machine.signal)
+        clock_path = next((driver.clock.path() for driver in signal.drivers if driver.clock), None)
+        own_clock = (clocks.clock_at(store, clock_path) if clock_path else None) or clock
+        fsm.overlay(machine, store, graph, own_clock)
+        if not machine.visits:
+            continue  # No observation is not evidence of zero executions.
+        sampler = _Sampler(TraceView(graph, store), list(getattr(own_clock, "edges", []) or []), before=True)
+        for transition in machine.transitions:
+            if transition.is_reset or transition.src is None or transition.loc is None:
+                continue
+            if machine.taken.get((transition.src, transition.dst), 0):
+                continue
+            conditions = []
+            for expression in _conjuncts(transition.full_guard):
+                held, sampled = sampler.held(expression)
+                conditions.append(Condition(
+                    text=to_text(expression), held=held, sampled=sampled,
+                    produced_by=_produced_by(graph, expression) if held == 0 else (),
+                ))
+            out.append(Hole(
+                file=transition.loc.file, line=transition.loc.line,
+                kind="fsm-transition",
+                label=f"{machine.signal}: {machine.name_of(transition.src)} -> {machine.name_of(transition.dst)}",
+                text=transition.guard, signal=machine.signal, conditions=conditions,
+                note="This transition was taken 0 times in the loaded run. Conditions are sampled before its clock edge.",
+            ))
+    return out
 
 
 def _produced_by(graph: Any, e: Expr) -> tuple[str, ...]:

@@ -22,8 +22,9 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { cycleAt, formatTime } from "../lib/time";
-import type { MemoryInterface, TimingViolation } from "../lib/types";
+import { formatTime } from "../lib/time";
+import { addressPattern, decodeAddress } from "../lib/address";
+import type { CmdEvent, MemoryInterface, MemoryReport, TimingViolation } from "../lib/types";
 import { useWave } from "../state/store";
 
 /** Height of one bank row in the timeline. */
@@ -38,11 +39,11 @@ export function MemoryTab() {
   const select = useWave((s) => s.selectMemIface);
 
   useEffect(() => {
-    if (!report && !busy) void load();
-  }, [report, busy, load]);
+    if (!report && !busy && !error) void load();
+  }, [report, busy, error, load]);
 
   if (busy && !report) return <div className="pane-note">Decoding the command bus…</div>;
-  if (error && !report) return <div className="pane-note">{error}</div>;
+  if (error && !report) return <div className="pane-note" role="alert">{error} <button onClick={() => void load()}>Retry</button></div>;
   if (!report) return <div className="pane-note">No memory analysis yet.</div>;
 
   if (!report.interfaces.length) {
@@ -68,6 +69,8 @@ export function MemoryTab() {
 
   return (
     <div className="mem" data-testid="memory-tab">
+      {error && <div className="pane-note" role="alert">{error} <button onClick={() => void load()}>Retry</button></div>}
+      {report.errors.concat(report.timing_errors).map((e) => <div className="pane-note" role="alert" key={e}>{e}</div>)}
       <div className="mem-head">
         <select
           className="txn-iface"
@@ -83,6 +86,7 @@ export function MemoryTab() {
         </select>
         <span className="txn-summary" data-testid="mem-summary">
           <span data-testid="mem-count">{i18nCommands(current.n_commands)}</span>
+          {current.clock_path && <span title="Cycle labels count the edges of this interface clock"> · {current.clock_path}</span>}
           <Dot />
           <span className={current.violations.length ? "warn" : "ok"} data-testid="mem-violation-count">
             {current.violations.length === 0
@@ -94,12 +98,14 @@ export function MemoryTab() {
         </span>
       </div>
 
+      <ChipSelector key={current.iface} per={current} report={report} />
       <Violations per={current} />
       <BankTimeline per={current} />
       <div className="mem-row">
         <CommandStream per={current} />
         <div className="mem-col">
           <RowHits per={current} />
+          <RefreshCompliance per={current} />
           <AddressMap per={current} />
         </div>
       </div>
@@ -108,6 +114,89 @@ export function MemoryTab() {
 }
 
 const Dot = () => <span className="dot">·</span>;
+
+function ChipSelector({ per, report }: { per: MemoryInterface; report: MemoryReport }) {
+  const apply = useWave((s) => s.applyMemoryTiming);
+  const busy = useWave((s) => s.memoryBusy);
+  const saved = report.selection[per.iface];
+  const [custom, setCustom] = useState(saved?.toml !== undefined);
+  const [text, setText] = useState(saved?.toml ?? "");
+  const [readError, setReadError] = useState<string | null>(null);
+  const template = () => {
+    const chip = report.chips.find((c) => c.slug === per.chip) ?? report.chips[0];
+    return chip ? Object.entries(chip).filter(([k]) => k !== "slug")
+      .map(([k, v]) => `${k} = ${JSON.stringify(v)}`).join("\n") : "";
+  };
+  return <div className="mem-card" data-testid="mem-chip-settings">
+    <label>Timing chip {" "}<select aria-label="Timing chip" disabled={busy}
+      value={custom ? "__custom__" : per.chip}
+      onChange={(e) => {
+        const chip = e.target.value;
+        setCustom(chip === "__custom__");
+        if (chip === "__custom__") { if (!text) setText(template()); }
+        else void apply(per.iface, { chip });
+      }}>
+      {!report.chips.some((c) => c.slug === per.chip) && <option value={per.chip}>{per.chip} (saved)</option>}
+      {report.chips.map((c) => <option key={c.slug} value={c.slug}>{c.name}</option>)}
+      <option value="__custom__">Custom timing…</option>
+    </select></label>
+    {busy && <span role="status"> Rechecking timing…</span>}
+    {custom && <div>
+      <div className="pane-hint">Nanoseconds for t*; whole clock cycles for CL/CWL. Saved with this session, without modifying chip files.</div>
+      <textarea aria-label="Custom timing TOML" rows={8} style={{ width: "100%" }} value={text}
+        onChange={(e) => setText(e.target.value)} />
+      <label>Load timing file <input type="file" accept=".toml" aria-label="Load timing file"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) void file.text().then((body) => { setText(body); setReadError(null); })
+            .catch((err: unknown) => setReadError(String(err)));
+        }} /></label>{" "}
+      <button disabled={busy || !text.trim()} onClick={() => void apply(per.iface, { toml: text })}>Apply timing</button>
+      {readError && <div role="alert">{readError}</div>}
+    </div>}
+  </div>;
+}
+
+function RefreshCompliance({ per }: { per: MemoryInterface }) {
+  const timescale = useWave((s) => s.status?.timescale ?? "1ns");
+  const jump = useWave((s) => s.jumpTo);
+  const intervals = per.refresh_intervals;
+  const limit = per.refresh_limit;
+  const max = intervals.reduce((bound, i) => Math.max(bound, i.elapsed), Math.max(1, limit ?? 0));
+  const first = intervals[0]?.t0 ?? 0;
+  const span = Math.max(1, (intervals[intervals.length - 1]?.t1 ?? first) - first);
+  const x = (t: number) => 10 + ((t - first) / span) * 580;
+  const y = (duration: number) => 100 - (duration / max) * 80;
+  return (
+    <div className="mem-card" data-testid="mem-refresh">
+      <div className="perf-card-title">Refresh compliance</div>
+      <div className="dim">
+        {limit === null ? "No usable tREFI limit." : `tREFI maximum: ${formatTime(limit, timescale)}`}
+      </div>
+      {intervals.length ? (
+        <svg viewBox="0 0 600 120" style={{ width: "100%" }} data-testid="mem-refresh-chart"
+             aria-label="Consecutive refresh intervals against the tREFI maximum">
+          {intervals.map((interval) => {
+            const violated = limit !== null && interval.elapsed > limit;
+            const show = () => jump(interval.t1, Object.values(per.signals), "REFRESH interval");
+            return <rect key={interval.t1} x={x(interval.t0)} y={y(interval.elapsed)}
+                         width={Math.max(1, x(interval.t1) - x(interval.t0) - 1)}
+                         height={100 - y(interval.elapsed)} fill="currentColor"
+                         className={violated ? "warn" : "dim"} opacity={0.6}
+                         role="button" tabIndex={0} data-testid="mem-refresh-interval"
+                         aria-label={`${formatTime(interval.elapsed, timescale)}${violated ? ", exceeds tREFI" : ""}`}
+                         onClick={show} onKeyDown={(e) => { if (e.key === "Enter") show(); }}>
+              <title>{formatTime(interval.t0, timescale)}–{formatTime(interval.t1, timescale)}: {formatTime(interval.elapsed, timescale)}</title>
+            </rect>;
+          })}
+          {limit !== null && <line x1={10} x2={590} y1={y(limit)} y2={y(limit)}
+                                  stroke="currentColor" strokeDasharray="5 3" data-testid="mem-refresh-limit" />}
+        </svg>
+      ) : <div className="pane-hint">No consecutive refresh pair observed; compliance was not measured.</div>}
+      <div className="pane-hint">Observed intervals only; the trace boundaries do not establish a preceding or following refresh.</div>
+    </div>
+  );
+}
 
 function i18nCommands(n: number): string {
   return `${n} command${n === 1 ? "" : "s"}`;
@@ -122,12 +211,9 @@ function i18nCommands(n: number): string {
  */
 function Violations({ per }: { per: MemoryInterface }) {
   const jumpTo = useWave((s) => s.jumpTo);
-  const period = useWave((s) => s.clockPeriod);
-  const origin = useWave((s) => s.clockOrigin);
   const timescale = useWave((s) => s.status?.timescale ?? "1ns");
 
-  const at = (t: number) =>
-    period ? `c${cycleAt(t, period, origin)}` : formatTime(t, timescale);
+  const at = (c: CmdEvent) => c.cycle !== null ? `c${c.cycle}` : formatTime(c.time, timescale);
 
   const byConstraint = useMemo(() => {
     const out = new Map<string, TimingViolation[]>();
@@ -154,7 +240,9 @@ function Violations({ per }: { per: MemoryInterface }) {
 
       {byConstraint.length === 0 && (
         <div className="mem-clear" data-testid="mem-no-violations">
-          <span aria-hidden>✓</span> Every constraint checked was met.
+          {Object.keys(per.checked).length
+            ? <><span aria-hidden>✓</span> Every constraint checked was met.</>
+            : "No timing constraint could be checked in this trace."}
         </div>
       )}
 
@@ -169,16 +257,16 @@ function Violations({ per }: { per: MemoryInterface }) {
             <tbody>
               {group.map((v) => (
                 <tr key={`${v.constraint}-${v.at}`} data-testid="mem-violation-row">
-                  <td className="perf-agent">{at(v.at)}</td>
+                  <td className="perf-agent">{v.second ? at(v.second) : formatTime(v.at, timescale)}</td>
                   <td className="dim">{v.bank === null ? "device" : `bank ${v.bank}`}</td>
                   <td>
-                    {v.first?.name}@{v.first ? at(v.first.time) : "?"}
+                    {v.first?.name}@{v.first ? at(v.first) : "?"}
                     <span className="dim"> → </span>
-                    {v.second?.name}@{v.second ? at(v.second.time) : "?"}
+                    {v.second?.name}@{v.second ? at(v.second) : "?"}
                   </td>
                   <td className="warn">
-                    {v.measured_cycles} cycles, {v.is_maximum ? "max" : "min"}{" "}
-                    {v.limit_cycles}
+                    {v.limit_cycles !== null ? `${v.measured_cycles} cycles` : formatTime(v.measured_ticks, timescale)}, {v.is_maximum ? "max" : "min"}{" "}
+                    {v.limit_cycles !== null ? v.limit_cycles : formatTime(v.limit_ticks, timescale)}
                   </td>
                   <td>
                     {/* §8.20: click a violation -> Wave at that cycle, with the
@@ -321,13 +409,10 @@ function CommandStream({ per }: { per: MemoryInterface }) {
   const filter = useWave((s) => s.memFilter);
   const setFilter = useWave((s) => s.setMemFilter);
   const jumpTo = useWave((s) => s.jumpTo);
-  const period = useWave((s) => s.clockPeriod);
-  const origin = useWave((s) => s.clockOrigin);
   const timescale = useWave((s) => s.status?.timescale ?? "1ns");
   const wires = Object.values(per.signals);
 
-  const at = (t: number) =>
-    period ? `c${cycleAt(t, period, origin)}` : formatTime(t, timescale);
+  const at = (c: CmdEvent) => c.cycle !== null ? `c${c.cycle}` : formatTime(c.time, timescale);
 
   const q = filter.trim().toLowerCase();
   const shown = useMemo(
@@ -361,7 +446,7 @@ function CommandStream({ per }: { per: MemoryInterface }) {
             data-testid="mem-cmd"
             onClick={() => jumpTo(c.time, wires, c.name)}
           >
-            <span className="mem-cmd-t">{at(c.time)}</span>
+            <span className="mem-cmd-t">{at(c)}</span>
             <span className="mem-cmd-name">{c.name}</span>
             <span className="mem-cmd-args">
               {Object.entries(c.fields)
@@ -460,7 +545,13 @@ function RowHits({ per }: { per: MemoryInterface }) {
  */
 function AddressMap({ per }: { per: MemoryInterface }) {
   const [text, setText] = useState("");
-  const decoded = useMemo(() => decodeAddress(text, per), [text, per]);
+  const [pattern, setPattern] = useState("");
+  const decoded = useMemo(() => decodeAddress(text, per.address_map), [text, per.address_map]);
+  const simulated = useMemo(() => {
+    if (!pattern.trim()) return null;
+    try { return addressPattern(pattern, per.address_map); }
+    catch (error) { return error instanceof Error ? error.message : String(error); }
+  }, [pattern, per.address_map]);
 
   return (
     <div className="mem-card" data-testid="mem-addrmap">
@@ -474,7 +565,7 @@ function AddressMap({ per }: { per: MemoryInterface }) {
       />
       {decoded === null && text.trim() !== "" && (
         <div className="pane-hint" data-testid="mem-addr-error">
-          Not a number. Try decimal or <code>0x</code> hex.
+          Enter a whole non-negative decimal or <code>0x</code> hex address; the entire input must be valid.
         </div>
       )}
       {decoded && (
@@ -484,7 +575,7 @@ function AddressMap({ per }: { per: MemoryInterface }) {
               <tr key={name}>
                 <td>{name}</td>
                 <td className="num">
-                  {name === "bank" ? value : `0x${value.toString(16)}`}
+                  {name === "bank" ? value.toString() : `0x${value.toString(16)}`}
                 </td>
                 <td className="num dim">
                   [{hi}:{lo}]
@@ -505,36 +596,14 @@ function AddressMap({ per }: { per: MemoryInterface }) {
           commands observed — it answers what an address <em>would</em> map to.
         </div>
       )}
+      <label>Address sequence
+        <textarea aria-label="Address sequence" rows={3} style={{ width: "100%" }}
+          maxLength={64000} placeholder="0x0, 0x4, 0x1000, 0x0" value={pattern}
+          onChange={(e) => setPattern(e.target.value)} />
+      </label>
+      <div className="pane-hint">Hypothetical open-page policy, initially closed banks; comma or whitespace separated addresses. No simulated traffic is changed.</div>
+      {typeof simulated === "string" ? <div role="alert">{simulated}</div> : simulated &&
+        <div data-testid="mem-pattern-result">{simulated.hits} hits · {simulated.misses} misses · {simulated.conflicts} conflicts</div>}
     </div>
   );
-}
-
-function slice(value: number, hi: number, lo: number): number {
-  // Arithmetic rather than `>>`/`&`: a 32-bit address with bit 31 set would
-  // come back negative through JS's bitwise operators, which coerce to int32.
-  return Math.floor(value / 2 ** lo) % 2 ** (hi - lo + 1);
-}
-
-/**
- * Decompose an address with the ranges the *server* resolved from the pack.
- * Hard-coding the shipped pack's bits here would silently ignore a project
- * that overrode `[address_map]` with its own memory map.
- */
-function decodeAddress(
-  text: string,
-  per: MemoryInterface,
-): [string, number, number, number][] | null {
-  const s = text.trim();
-  if (!s) return null;
-  const n = s.toLowerCase().startsWith("0x") ? parseInt(s.slice(2), 16) : Number(s);
-  if (!Number.isFinite(n) || Number.isNaN(n) || n < 0) return null;
-  const order = ["bank", "row", "col"];
-  const out: [string, number, number, number][] = [];
-  for (const name of order) {
-    const range = per.address_map[name];
-    if (!range) continue;
-    const [hi, lo] = range;
-    out.push([name, slice(n, hi, lo), hi, lo]);
-  }
-  return out.length ? out : null;
 }

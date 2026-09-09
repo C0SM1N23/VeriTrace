@@ -35,6 +35,8 @@ interface Colors {
   sigX: string;
   sigZ: string;
   sigBus: string;
+  causal: string;
+  causalDim: string;
 }
 
 let canvas: OffscreenCanvas | null = null;
@@ -57,6 +59,8 @@ let colors: Colors = {
   sigX: "#E5484D",
   sigZ: "#8B7AB8",
   sigBus: "#A8B4C2",
+  causal: "#E8A33D",
+  causalDim: "#7A5A22",
 };
 
 const data = new Map<number, WaveChunk>();
@@ -67,6 +71,8 @@ interface ViewState {
   scrollY: number;
   rowH: number;
   rows: RenderRow[];
+  causalKey: string;
+  reducedMotion: boolean;
   cursor: number | null;
   markers: number[];
   rulerMode: "time" | "cycle";
@@ -81,6 +87,8 @@ let view: ViewState = {
   scrollY: 0,
   rowH: 20,
   rows: [],
+  causalKey: "",
+  reducedMotion: false,
   cursor: null,
   markers: [],
   rulerMode: "time",
@@ -95,6 +103,8 @@ let statsOn = false;
 let frames = 0;
 let totalMs = 0;
 let maxMs = 0;
+/** When a new chain arrived, for §11.1's one deliberately brief animation. */
+let causalStarted = 0;
 
 function post(msg: FromWorker): void {
   (self as unknown as Worker).postMessage(msg);
@@ -152,6 +162,9 @@ self.onmessage = (ev: MessageEvent<ToWorker>) => {
       requestDraw();
       break;
     case "view":
+      if (msg.causalKey && msg.causalKey !== view.causalKey) {
+        causalStarted = performance.now();
+      }
       view = { ...msg };
       requestDraw();
       break;
@@ -273,12 +286,21 @@ function drawRows(c: OffscreenCanvasRenderingContext2D, v: { t0: number; t1: num
     c.fillRect(0, y, width, rowH);
   }
 
-  const pathHigh = new Path2D();
-  const pathLow = new Path2D();
-  const pathBus = new Path2D();
+  type Paths = { high: Path2D; low: Path2D; bus: Path2D };
+  const makePaths = (): Paths => ({ high: new Path2D(), low: new Path2D(), bus: new Path2D() });
+  const paths = {
+    normal: makePaths(),
+    derived: makePaths(),
+    primary: makePaths(),
+    primaryDerived: makePaths(),
+    secondary: makePaths(),
+    secondaryDerived: makePaths(),
+    hover: makePaths(),
+    hoverDerived: makePaths(),
+  };
   const xRects: [number, number, number, number][] = [];
   const zRects: [number, number, number, number][] = [];
-  const busText: [string, number, number, number][] = [];
+  const busText: [string, number, number, number, RenderRow["causal"]][] = [];
 
   for (let i = firstVisible; i <= lastVisible; i++) {
     const row = rows[i];
@@ -294,10 +316,36 @@ function drawRows(c: OffscreenCanvasRenderingContext2D, v: { t0: number; t1: num
     const chunk = data.get(row.handle);
     if (!chunk) continue;
 
+    const key = row.causal
+      ? (`${row.causal}${row.derived ? "Derived" : ""}` as keyof typeof paths)
+      : row.derived
+        ? "derived"
+        : "normal";
+    const rowPaths = paths[key];
+
     if (row.width === 1) {
-      drawScalarRow(chunk, y, rowH, v, pathHigh, pathLow, xRects, zRects);
+      drawScalarRow(
+        chunk,
+        y,
+        rowH,
+        v,
+        rowPaths.high,
+        rowPaths.low,
+        xRects,
+        zRects,
+      );
     } else {
-      drawBusRow(chunk, row, y, rowH, v, pathBus, xRects, zRects, busText);
+      drawBusRow(
+        chunk,
+        row,
+        y,
+        rowH,
+        v,
+        rowPaths.bus,
+        xRects,
+        zRects,
+        busText,
+      );
     }
   }
 
@@ -327,24 +375,73 @@ function drawRows(c: OffscreenCanvasRenderingContext2D, v: { t0: number; t1: num
     c.stroke();
   }
 
-  c.lineWidth = 1.25;
-  c.strokeStyle = colors.sig0;
-  c.stroke(pathLow);
-  c.strokeStyle = colors.sig1;
-  c.stroke(pathHigh);
-  c.lineWidth = 1;
-  c.strokeStyle = colors.sigBus;
-  c.stroke(pathBus);
+  const elapsed = performance.now() - causalStarted;
+  const baseAlpha = view.causalKey
+    ? !view.reducedMotion && elapsed < 400
+      ? 0.25 + 0.35 * (elapsed / 400)
+      : 0.6
+    : 1;
+  const stroke = (
+    p: Paths,
+    low: string,
+    high: string,
+    bus: string,
+    alpha: number,
+    dashed = false,
+    lineWidth = 1.25,
+  ) => {
+    c.save();
+    c.globalAlpha = alpha;
+    if (dashed) c.setLineDash([4, 3]);
+    c.lineWidth = lineWidth;
+    c.strokeStyle = low;
+    c.stroke(p.low);
+    c.strokeStyle = high;
+    c.stroke(p.high);
+    c.lineWidth = Math.max(1, lineWidth - 0.25);
+    c.strokeStyle = bus;
+    c.stroke(p.bus);
+    c.restore();
+  };
+
+  stroke(paths.normal, colors.sig0, colors.sig1, colors.sigBus, baseAlpha);
+  // Derived means dotted, not causal. Amber is reserved for actual causal
+  // membership; an unrelated reconstructed wire remains monochrome (§7.3/P4).
+  stroke(paths.derived, colors.sig0, colors.sig1, colors.sigBus, baseAlpha, true);
+  stroke(paths.secondary, colors.causalDim, colors.causalDim, colors.causalDim, 1);
+  stroke(
+    paths.secondaryDerived,
+    colors.causalDim,
+    colors.causalDim,
+    colors.causalDim,
+    1,
+    true,
+  );
+  stroke(paths.primary, colors.causal, colors.causal, colors.causal, 1);
+  stroke(paths.primaryDerived, colors.causal, colors.causal, colors.causal, 1, true);
+  const pulse = view.reducedMotion ? 1 : 0.72 + 0.28 * (0.5 + 0.5 * Math.sin(elapsed / 90));
+  stroke(paths.hover, colors.causal, colors.causal, colors.causal, pulse, false, 2);
+  stroke(paths.hoverDerived, colors.causal, colors.causal, colors.causal, pulse, true, 2);
 
   if (busText.length) {
     c.font = dataFont(11);
-    c.fillStyle = colors.textBright;
     c.textAlign = "center";
     c.textBaseline = "middle";
-    for (const [text, x, y, w] of busText) {
+    for (const [text, x, y, w, causal] of busText) {
       const fitted = elide(text, w - 8, CHAR_W);
-      if (fitted) c.fillText(fitted, x, y);
+      if (fitted) {
+        c.fillStyle = causal === "secondary" ? colors.causalDim : causal ? colors.causal : colors.textBright;
+        c.globalAlpha = causal ? 1 : baseAlpha;
+        c.fillText(fitted, x, y);
+      }
     }
+    c.globalAlpha = 1;
+  }
+
+  // Keep drawing only for the one focus transition and while a card is being
+  // hovered. Normal panning remains event-driven and consumes no idle frames.
+  if (!view.reducedMotion && ((view.causalKey && elapsed < 400) || rows.some((r) => r.causal === "hover"))) {
+    requestDraw();
   }
 }
 
@@ -455,7 +552,7 @@ function drawBusRow(
   pathBus: Path2D,
   xRects: [number, number, number, number][],
   zRects: [number, number, number, number][],
-  busText: [string, number, number, number][],
+  busText: [string, number, number, number, RenderRow["causal"]][],
 ): void {
   const yTop = Math.round(y + 3) + 0.5;
   const yBot = Math.round(y + rowH - 4) + 0.5;
@@ -495,8 +592,8 @@ function drawBusRow(
     pathBus.closePath();
 
     if (!busy && w >= MIN_TEXT_PX) {
-      const text = format(bits, row.width, row.radix);
-      busText.push([text, (xa + xb) / 2, yMid, w]);
+      const text = format(bits, row.width, row.radix, row.enumLabels);
+      busText.push([text, (xa + xb) / 2, yMid, w, row.causal]);
     }
   }
 }

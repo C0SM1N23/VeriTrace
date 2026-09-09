@@ -1,0 +1,13 @@
+design = "axi_lite_slave"
+top = "tb_axi_lite_bug"
+bug = "awaddr changes while awvalid is asserted and awready is low"
+correlation_min = 99
+
+[[why]]
+question = "why(tb_axi_lite_bug.awaddr @ 55000)"
+reaches = "tb_axi_lite_bug.step"
+
+[checks]
+required_signals = ["tb_axi_lite_bug.awaddr"]
+required_checks = ["protocol_rule"]
+required_locations = true

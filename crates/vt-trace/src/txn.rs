@@ -147,9 +147,7 @@ pub fn read(path: impl AsRef<Path>) -> Result<Vec<(String, Column)>> {
                         .as_any()
                         .downcast_ref::<StringArray>()
                         .ok_or_else(|| Error::Store(format!("column {i} is not utf8")))?;
-                    v.extend(
-                        (0..a.len()).map(|r| (!a.is_null(r)).then(|| a.value(r).to_string())),
-                    );
+                    v.extend((0..a.len()).map(|r| (!a.is_null(r)).then(|| a.value(r).to_string())));
                 }
             }
         }
@@ -163,7 +161,10 @@ mod tests {
 
     fn table() -> Vec<(String, Column)> {
         vec![
-            ("type".into(), Column::Text(vec![Some("WRITE".into()), Some("READ".into())])),
+            (
+                "type".into(),
+                Column::Text(vec![Some("WRITE".into()), Some("READ".into())]),
+            ),
             ("addr".into(), Column::Int(vec![Some(0x4000), Some(0x4004)])),
             ("resp".into(), Column::Text(vec![Some("OKAY".into()), None])),
             ("latency".into(), Column::Int(vec![Some(22), None])),

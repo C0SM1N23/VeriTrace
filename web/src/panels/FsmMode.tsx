@@ -19,13 +19,16 @@
  * is the whole argument of §8.8: the findings in the Checks tab come from the
  * RTL, and the colours are a view on top of them.
  *
- * Layout is elkjs, as §8.8 names, loaded on demand — it is half a megabyte and
- * a session that never opens this mode should never pay for it.
+ * Layout is elkjs, as §8.8 names, loaded with this lazy pane and executed in a
+ * Web Worker. A session that never opens this mode neither downloads the
+ * worker nor spends main-thread time on graph layout.
  */
 
+import ELK, { type ELK as ElkInstance } from "elkjs/lib/elk-api.js";
+import elkWorkerUrl from "elkjs/lib/elk-worker.min.js?url";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { fsmSvgUrl } from "../api/client";
-import type { Machine } from "../lib/types";
+import type { FsmTransition, Machine, Row } from "../lib/types";
 import { useWave } from "../state/store";
 
 /**
@@ -57,6 +60,7 @@ interface Placed {
     points: { x: number; y: number }[];
     label: string;
     at: { x: number; y: number } | null;
+    transition: FsmTransition;
   }[];
   width: number;
   height: number;
@@ -76,6 +80,16 @@ const MAX_GROW = 1.8;
  */
 const LABEL_CHAR_W = 6;
 const LABEL_H = 13;
+
+// One worker can multiplex layout requests and lives for the lifetime of the
+// lazily loaded FSM module. Constructing one in every effect leaked a worker on
+// each machine selection and made larger projects progressively more costly.
+let layoutEngine: ElkInstance | null = null;
+
+function getLayoutEngine(): ElkInstance {
+  layoutEngine ??= new ELK({ workerUrl: elkWorkerUrl });
+  return layoutEngine;
+}
 
 export function FsmMode() {
   const open = useWave((s) => s.fsmOpen);
@@ -160,16 +174,17 @@ function coverage(m: Machine): string {
   return `, ${Math.round((100 * seen) / Math.max(1, m.states.length))}% covered`;
 }
 
-/** elkjs, loaded the first time this mode is opened and kept afterwards. */
-function useLayout(machine: Machine): Placed | null {
+/** elkjs runs in the shared worker loaded with this mode. */
+function useLayout(machine: Machine): { placed: Placed | null; error: string | null; retry: () => void } {
   const [placed, setPlaced] = useState<Placed | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     let live = true;
     setPlaced(null);
+    setError(null);
     void (async () => {
-      const { default: ELK } = await import("elkjs/lib/elk.bundled.js");
-      const elk = new ELK();
       const heights = new Map(
         machine.states.map((s) => [s.value, NODE_H * grow(machine, s.value)]),
       );
@@ -182,6 +197,7 @@ function useLayout(machine: Machine): Placed | null {
           sources: [`s${t.src}`],
           targets: [`s${t.dst}`],
           label: label(machine, t.src as number, t.dst, t.guard),
+          transition: t,
         }));
       const graph = {
         id: "root",
@@ -211,9 +227,9 @@ function useLayout(machine: Machine): Placed | null {
           labels: [{ text, width: text.length * LABEL_CHAR_W, height: LABEL_H }],
         })),
       };
-      const out = (await elk.layout(graph)) as ElkResult;
+      const out = (await getLayoutEngine().layout(graph)) as ElkResult;
       if (!live) return;
-      const byId = new Map(edges.map((e) => [e.id, e.label]));
+      const byId = new Map(edges.map((e) => [e.id, e]));
       setPlaced({
         width: out.width ?? 640,
         height: out.height ?? 480,
@@ -229,7 +245,8 @@ function useLayout(machine: Machine): Placed | null {
           const l = e.labels?.[0];
           return {
             id: e.id,
-            label: byId.get(e.id) ?? "",
+            label: byId.get(e.id)?.label ?? "",
+            transition: byId.get(e.id)!.transition,
             // Where elk put the label, in its own top-left coordinates; the
             // renderer only has to turn that into a baseline.
             at: l && l.x !== undefined && l.y !== undefined ? { x: l.x, y: l.y } : null,
@@ -237,13 +254,15 @@ function useLayout(machine: Machine): Placed | null {
           };
         }),
       });
-    })().catch(() => live && setPlaced(null));
+    })().catch((e: unknown) => {
+      if (live) setError(e instanceof Error ? e.message : String(e));
+    });
     return () => {
       live = false;
     };
-  }, [machine]);
+  }, [machine, attempt]);
 
-  return placed;
+  return { placed, error, retry: () => setAttempt((n) => n + 1) };
 }
 
 function grow(m: Machine, value: number): number {
@@ -260,11 +279,61 @@ function label(m: Machine, src: number, dst: number, guard: string): string {
 }
 
 function Diagram({ machine }: { machine: Machine }) {
-  const placed = useLayout(machine);
+  const { placed, error, retry } = useLayout(machine);
   const scrub = useWave((s) => s.fsmScrub);
   const overlay = Object.keys(machine.visits).length > 0;
   const current = scrub === null ? null : stateAt(machine, scrub);
 
+  const focusState = (value: number) => {
+    const state = useWave.getState();
+    const named = machine.states.find((candidate) => candidate.value === value);
+    const rows = [machine.signal, ...machine.companions]
+      .map((path) => state.signals.find((signal) => signal.path === path))
+      .filter((signal) => signal !== undefined)
+      .map(
+        (signal) =>
+          ({ kind: "signal", handle: signal.handle, path: signal.path }) satisfies Row,
+      );
+    state.focusRows(rows, `FSM ${named?.name ?? value}`);
+
+    const intervals = segmentsOf(machine).filter((segment) => segment.state === value);
+    if (intervals.length) {
+      const first = intervals[0];
+      const t0 = first.start;
+      const t1 = first.end;
+      state.setView({ t0, t1: Math.max(t0 + 1, t1) });
+      state.setCursor(t0);
+      useWave.setState({
+        note: `${named?.name ?? value}: showing interval 1 of ${intervals.length} in Wave.`,
+      });
+    } else {
+      useWave.setState({
+        note: `${named?.name ?? value} was not visited in the loaded run.`,
+      });
+    }
+    state.setTab(1);
+  };
+
+  const explainEdge = (transition: FsmTransition) => {
+    if (!transition.loc) return;
+    const query = `uncovered(${transition.loc.file})`;
+    void useWave
+      .getState()
+      .runQueryText(query)
+      .then(() => {
+        const state = useWave.getState();
+        const hole = state.coverage?.holes.find(
+          (candidate) =>
+            candidate.kind === "fsm-transition" &&
+            candidate.signal === machine.signal &&
+            candidate.file.endsWith(transition.loc!.file) &&
+            candidate.line === transition.loc!.line,
+        );
+        if (hole) state.selectHole(`${hole.file}:${hole.line}:${hole.label}`);
+      });
+  };
+
+  if (error) return <div className="pane-note error" role="alert">FSM layout failed: {error} <button onClick={retry}>Retry</button></div>;
   if (!placed) return <div className="pane-note">Laying out…</div>;
 
   return (
@@ -298,8 +367,33 @@ function Diagram({ machine }: { machine: Machine }) {
           const taken = /(\d+)×$/.exec(e.label);
           const n = taken ? Number(taken[1]) : 0;
           return (
-            <g key={e.id} className={overlay && !n ? "fsm-edge untaken" : "fsm-edge"}>
+            <g
+              key={e.id}
+              className={overlay && !n ? "fsm-edge untaken" : "fsm-edge"}
+              data-testid={`fsm-edge-${e.id}`}
+              onClick={overlay && !n ? () => explainEdge(e.transition) : undefined}
+              role={overlay && !n ? "button" : undefined}
+              tabIndex={overlay && !n ? 0 : undefined}
+              onKeyDown={
+                overlay && !n
+                  ? (event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        explainEdge(e.transition);
+                      }
+                    }
+                  : undefined
+              }
+            >
+              {overlay && !n ? (
+                <path
+                  className="fsm-edge-hit"
+                  d={e.points.map((p, i) => `${i ? "L" : "M"}${p.x},${p.y}`).join(" ")}
+                  aria-hidden="true"
+                />
+              ) : null}
               <path
+                className="fsm-edge-line"
                 d={e.points.map((p, i) => `${i ? "L" : "M"}${p.x},${p.y}`).join(" ")}
                 style={n ? { strokeWidth: 1.2 + Math.min(3, Math.log2(1 + n) / 2) } : undefined}
               />
@@ -338,8 +432,17 @@ function Diagram({ machine }: { machine: Machine }) {
               key={n.id}
               className={cls}
               transform={`translate(${n.x},${n.y})`}
-              onClick={() => useWave.getState().selectMachine(machine.signal)}
+              onClick={() => focusState(n.id)}
               data-state={state.name}
+              data-testid={`fsm-state-${state.name}`}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  focusState(n.id);
+                }
+              }}
             >
               <rect width={n.w} height={n.h} rx={8} />
               {/* The counts go inside the box. Below it they sat exactly where
@@ -354,7 +457,7 @@ function Diagram({ machine }: { machine: Machine }) {
               </text>
               {overlay && (
                 <text x={n.w / 2} y={n.h / 2 + 13} className="fsm-node-sub">
-                  {visits ? `${visits}× · ${machine.cycles_in[String(n.id)] ?? 0}c` : "never"}
+                  {visits ? `${visits}× · ${machine.cycles_in[String(n.id)] ?? 0}${machine.clock_path ? "c" : " ticks"}` : "never"}
                 </text>
               )}
             </g>
@@ -408,7 +511,7 @@ function Timeline({ machine }: { machine: Machine }) {
               width: `${Math.max(0.15, pct(s.end) - pct(s.start))}%`,
               background: shade(index(s.state), machine.states.length),
             }}
-            title={`${machine.states[index(s.state)]?.name}: c${s.start}–c${s.end}`}
+            title={`${machine.states[index(s.state)]?.name}: ${s.start}–${s.end} ticks`}
           />
         ))}
         {scrub !== null && <div className="fsm-cursor" style={{ left: `${pct(scrub)}%` }} />}
@@ -424,7 +527,7 @@ function Timeline({ machine }: { machine: Machine }) {
         {machine.sequence_truncated && (
           <span className="dim">first {segments.length} stays only</span>
         )}
-        <span className="dim">{scrub === null ? "drag to scrub" : `c${scrub}`}</span>
+        <span className="dim">{scrub === null ? "drag to scrub" : `${scrub} ticks`}</span>
       </div>
     </div>
   );
@@ -450,28 +553,21 @@ interface Segment {
 /**
  * The run, as the stays it actually made.
  *
- * Built from `machine.sequence`, which is the ordered list of state changes.
+ * Built from the exact observed stays, including the last one before EOF.
  * The obvious shortcut — laying the per-state cycle totals out side by side —
  * draws the states in *declaration* order and reads as a timeline of a run that
  * never happened. Totals cannot answer "what was the sequence", and §8.8 step 6
  * asks exactly that.
  */
 function segmentsOf(machine: Machine): Segment[] {
-  const seq = machine.sequence ?? [];
-  if (seq.length < 2) return [];
-  const out: Segment[] = [];
-  for (let i = 0; i < seq.length - 1; i++) {
-    const [cycle, state] = seq[i];
-    const [next] = seq[i + 1];
-    if (next > cycle) out.push({ state, start: cycle, end: next });
-  }
-  return out;
+  return (machine.intervals ?? []).map(([start, end, state]) => ({ start, end, state }));
 }
 
-function stateAt(machine: Machine, cycle: number): number | null {
+function stateAt(machine: Machine, time: number): number | null {
   const segs = segmentsOf(machine);
   for (const s of segs) {
-    if (cycle >= s.start && cycle < s.end) return s.state;
+    if (time >= s.start && time < s.end) return s.state;
   }
-  return segs.length ? segs[segs.length - 1].state : null;
+  const last = segs[segs.length - 1];
+  return last && time === last.end ? last.state : null;
 }

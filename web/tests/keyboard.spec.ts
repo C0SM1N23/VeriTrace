@@ -157,7 +157,7 @@ test("cmd-B bookmarks the cursor, and the note survives a reload", async ({ page
 test("n and p walk the findings in Checks, not only in Diff", async ({ page }) => {
   // §11.7 lists the keys for "Checks/Diff"; only Diff had them.
   await open(page);
-  await page.locator('[data-testid="tab-5"]').click();
+  await page.locator('[data-testid="tab-6"]').click();
   await expect(page.locator('[data-testid="checks-tab"]')).toBeVisible();
   const rows = page.locator('[data-testid="check-row"]');
   await expect(rows.first()).toBeVisible();
@@ -209,4 +209,41 @@ test("a chord still works while a field has focus", async ({ page }) => {
   await page.locator('[data-testid="tree-search"]').click();
   await page.keyboard.press("c");
   await expect(page.locator('[data-testid="query-bar"]')).toHaveValue("");
+});
+
+test("cmd-backslash toggles both side panels", async ({ page }) => {
+  await open(page);
+  await expect(page.locator('[data-testid="hierarchy"]')).toBeVisible();
+  await expect(page.locator('[data-testid="inspector"]')).toBeVisible();
+
+  await page.keyboard.press("ControlOrMeta+\\");
+  await expect(page.locator('[data-testid="hierarchy"]')).toHaveCount(0);
+  await expect(page.locator('[data-testid="inspector"]')).toHaveCount(0);
+
+  await page.keyboard.press("ControlOrMeta+\\");
+  await expect(page.locator('[data-testid="hierarchy"]')).toBeVisible();
+  await expect(page.locator('[data-testid="inspector"]')).toBeVisible();
+});
+
+test("cmd-shift-F searches indexed signals across the design", async ({ page }) => {
+  await open(page);
+  await page.locator('[data-testid="tab-3"]').click();
+  await page.keyboard.press("ControlOrMeta+Shift+f");
+  const palette = page.locator('[data-testid="palette"]');
+  await expect(palette).toBeVisible();
+  await palette.locator("input").fill("full");
+  await expect(palette.locator("button", { hasText: "full" }).first()).toBeVisible();
+});
+
+test("cycle ruler uses the backend's resolved primary clock", async ({ page, request }) => {
+  await open(page);
+  const status = await (await request.get(`${BACKEND}/session/${sessionId}/status`)).json();
+  const primary = status.clock_domains.find((d: { primary: boolean }) => d.primary);
+  expect(primary).toBeTruthy();
+
+  const clock = await page.evaluate(() => {
+    const s = (window as any).__vtStore.getState();
+    return { period: s.clockPeriod, origin: s.clockOrigin };
+  });
+  expect(clock).toEqual({ period: primary.period, origin: primary.origin });
 });

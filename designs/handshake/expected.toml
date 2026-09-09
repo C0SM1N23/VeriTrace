@@ -5,6 +5,10 @@ bug = """s_axi_wready is a combinational function of s_axi_wvalid, so this \
 slave deadlocks against any master that waits for ready before raising valid"""
 correlation_min = 90
 
+[[why]]
+question = "why(tb_handshake.dut.s_axi_wready)"
+reaches = "tb_handshake.dut.s_axi_wvalid"
+
 [checks]
 # The bug, found structurally. Every transfer in this run completes, so a check
 # that looked only at the waveform would report nothing at all.

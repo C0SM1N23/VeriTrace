@@ -14,6 +14,8 @@ looks like evidence.
 
 from __future__ import annotations
 
+import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -56,6 +58,26 @@ class Reproduction:
         }
 
 
+class ReproductionError(RuntimeError):
+    """A recorded run lacks executable provenance, or could not be rerun."""
+
+
+@dataclass(slots=True)
+class Replay:
+    """The observable result of executing a recorded command."""
+
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "returncode": self.returncode,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+        }
+
+
 def plan(con, run_id: int, rtl: list[Path] | None = None, root: Path | str = ".") -> Reproduction:
     """The recorded command, and an honest statement about the sources."""
     row = db.get(con, run_id)
@@ -90,3 +112,57 @@ def plan(con, run_id: int, rtl: list[Path] | None = None, root: Path | str = "."
             "The reproduction is not guaranteed to be identical."
         )
     return out
+
+
+def execute(reproduction: Reproduction, timeout: float = 3600.0) -> Replay:
+    """Execute the command in the directory and with the seed it recorded.
+
+    The database is local and the command was supplied by its owner, so this is
+    intentionally a real shell command rather than an argv guessed from a
+    string.  Guessing would break Make recipes, pipelines and simulator plusargs.
+    """
+    if not reproduction.command.strip():
+        raise ReproductionError(
+            "run has no recorded command; record it again with --command (or from "
+            "a waveform produced by `veritrace run`)"
+        )
+    if not reproduction.work_dir:
+        raise ReproductionError(
+            "run has no recorded working directory; it cannot be reproduced exactly"
+        )
+    cwd = Path(reproduction.work_dir)
+    if not cwd.is_dir():
+        raise ReproductionError(
+            f"the recorded working directory no longer exists: {cwd}"
+        )
+
+    command = reproduction.command
+    if os.name == "nt" and "\n" in command:
+        # Older VeriTrace rows stored compile and run on separate lines.  cmd's
+        # `/c` executes only the first line, silently.  Preserve their intended
+        # fail-fast sequence when replaying those rows.
+        command = " && ".join(line.strip() for line in command.splitlines() if line.strip())
+    env = os.environ.copy()
+    # A Make/cocotb flow commonly reads SEED, while VERITRACE_SEED is
+    # unambiguous for custom wrappers.  Explicit command-line plusargs remain
+    # untouched and therefore still win according to the simulator's rules.
+    env["SEED"] = str(reproduction.seed)
+    env["VERITRACE_SEED"] = str(reproduction.seed)
+    try:
+        out = subprocess.run(
+            command,
+            cwd=cwd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            errors="replace",
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ReproductionError(
+            f"recorded command did not finish within {timeout:g}s"
+        ) from exc
+    except OSError as exc:
+        raise ReproductionError(f"could not execute the recorded command: {exc}") from exc
+    return Replay(out.returncode, out.stdout or "", out.stderr or "")

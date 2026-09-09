@@ -22,7 +22,7 @@
  *   is the block of text itself, selectable as one unit.
  */
 
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type {
   CoverageReport,
   CoverPoint,
@@ -41,11 +41,11 @@ export function CoverageTab() {
   const select = useWave((s) => s.selectCovIface);
 
   useEffect(() => {
-    if (!report && !busy) void load();
-  }, [report, busy, load]);
+    if (!report && !busy && !error) void load();
+  }, [report, busy, error, load]);
 
   if (busy && !report) return <div className="pane-note">Measuring coverage…</div>;
-  if (error && !report) return <div className="pane-note">{error}</div>;
+  if (error && !report) return <div className="pane-note" role="alert">{error} <button onClick={() => void load()}>Retry</button></div>;
   if (!report) return <div className="pane-note">No coverage yet.</div>;
 
   const current =
@@ -98,6 +98,7 @@ export function CoverageTab() {
           <Code report={report} />
         </section>
       </div>
+      <HoleList report={report} />
       {report.plan && <Plan plan={report.plan} />}
     </div>
   );
@@ -216,7 +217,7 @@ function Point({ point }: { point: CoverPoint }) {
 
 function hitsOf(point: CoverPoint): Map<string, number> {
   const out = new Map<string, number>();
-  for (const c of point.cells) out.set(c.key.join(" "), c.hits);
+  for (const c of point.cells) out.set(c.key.join("\0"), c.hits);
   return out;
 }
 
@@ -265,7 +266,7 @@ function Matrix({ point }: { point: CoverPoint }) {
             <tr key={r}>
               <th className="cov-axis">{r}</th>
               {cols.map((c) => {
-                const n = hits.get(`${r} ${c}`) ?? 0;
+                const n = hits.get(`${r}\0${c}`) ?? 0;
                 return (
                   <td
                     key={c}
@@ -288,9 +289,6 @@ function Matrix({ point }: { point: CoverPoint }) {
 
 /** The §8.12 half: imported totals, per-file heatmap, and the derived holes. */
 function Code({ report }: { report: CoverageReport }) {
-  const openFinding = useWave((s) => s.openFinding);
-  const expanded = useWave((s) => s.covHole);
-  const selectHole = useWave((s) => s.selectHole);
   const code = report.code;
 
   if (!code) {
@@ -345,8 +343,18 @@ function Code({ report }: { report: CoverageReport }) {
         ))}
       </div>
 
-      {report.holes.length > 0 && (
-        <div className="cov-holes">
+    </div>
+  );
+}
+
+/** FSM-derived holes remain useful when no code coverage database exists. */
+function HoleList({ report }: { report: CoverageReport }) {
+  const openFinding = useWave((s) => s.openFinding);
+  const expanded = useWave((s) => s.covHole);
+  const selectHole = useWave((s) => s.selectHole);
+  if (!report.holes.length) return null;
+  return (
+        <div className="cov-holes" data-testid="cov-holes">
           <h3>
             Uncovered — and what would close it
             <span className="cov-sub">derived from the graph, not suggested (§8.12)</span>
@@ -359,16 +367,16 @@ function Code({ report }: { report: CoverageReport }) {
                 hole={h}
                 open={expanded === key}
                 onToggle={() => selectHole(expanded === key ? null : key)}
-                onOpenSource={() =>
-                  openFinding({ why: null, loc: { file: h.file, line: h.line } })
-                }
+                onOpenSource={() => {
+                  selectHole(key);
+                  useWave.getState().setFsmOpen(false);
+                  openFinding({ why: null, loc: { file: h.file, line: h.line } });
+                }}
               />
             );
           })}
           {report.skipped.holes && <div className="pane-hint">{report.skipped.holes}</div>}
         </div>
-      )}
-    </div>
   );
 }
 
@@ -383,6 +391,17 @@ function HoleRow({
   onToggle: () => void;
   onOpenSource: () => void;
 }) {
+  const [copyMessage, setCopyMessage] = useState("");
+  const copyConditions = async () => {
+    try {
+      await navigator.clipboard.writeText(
+        [`${hole.file}:${hole.line} — ${hole.label}`, ...hole.conditions.map((c) => c.text)].join("\n"),
+      );
+      setCopyMessage("Conditions copied.");
+    } catch (error) {
+      setCopyMessage(`Could not copy: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
   return (
     <div className={`cov-hole${open ? " on" : ""}`} data-testid={`cov-hole-${hole.line}`}>
       <div className="cov-hole-head">
@@ -400,6 +419,10 @@ function HoleRow({
           {hole.note && <div className="cov-hole-note">{hole.note}</div>}
           {hole.conditions.length > 0 && (
             <div className="cov-conds">
+              <button className="chip" onClick={() => void copyConditions()} data-testid="cov-copy-conditions">
+                Copy conditions
+              </button>
+              {copyMessage && <span role="status">{copyMessage}</span>}
               <div className="cov-conds-lead">All of these must hold at once:</div>
               {hole.conditions.map((c) => (
                 <div className="cov-cond" key={c.text}>

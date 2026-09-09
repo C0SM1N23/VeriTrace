@@ -102,9 +102,9 @@ class Beat:
     says *this is what came back*. Both are the same shape, so the scoreboard is
     one ordered walk rather than two.
 
-    Produced during extraction (`protocol.beats`) because it is derived from the
-    channel events, which are not kept: the transaction table records how many
-    beats there were, not what each carried.
+    Produced during extraction (`protocol.beats`) from accepted channel events.
+    The public transaction table records the count; the beat/event sidecars and
+    exact payload cache retain the data consumed by integrity and performance.
     """
 
     iface: str

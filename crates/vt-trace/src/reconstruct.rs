@@ -72,7 +72,11 @@ fn emit(
 ) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "$date\n\t{}\n$end", date.unwrap_or("").trim());
-    let _ = writeln!(out, "$version\n\t{}\n$end", version.unwrap_or("VeriTrace").trim());
+    let _ = writeln!(
+        out,
+        "$version\n\t{}\n$end",
+        version.unwrap_or("VeriTrace").trim()
+    );
     let _ = writeln!(out, "$timescale\n\t{timescale}\n$end");
 
     // Codes are per stream, so aliased paths keep sharing one code.
@@ -90,7 +94,11 @@ fn emit(
     // changes, so the hierarchy comes out as a properly nested tree.
     let mut cur: Vec<String> = Vec::new();
     for d in decls {
-        let common = cur.iter().zip(d.path.iter()).take_while(|(a, b)| a == b).count();
+        let common = cur
+            .iter()
+            .zip(d.path.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
         for _ in common..cur.len() {
             let _ = writeln!(out, "$upscope $end");
         }
@@ -119,8 +127,10 @@ fn emit(
     }
     let _ = writeln!(out, "$enddefinitions $end");
 
-    let widths: HashMap<u32, (u32, Kind)> =
-        decls.iter().map(|d| (d.stream, (d.width, d.kind))).collect();
+    let widths: HashMap<u32, (u32, Kind)> = decls
+        .iter()
+        .map(|d| (d.stream, (d.width, d.kind)))
+        .collect();
 
     let mut last_time: Option<Time> = None;
     for (t, stream, row) in events {
@@ -163,7 +173,14 @@ pub fn from_trace(trace: &Trace) -> String {
         values.insert(sid, vs);
     }
     events.sort_unstable();
-    emit(trace.timescale, trace.date.as_deref(), trace.version.as_deref(), &decls, &events, &values)
+    emit(
+        trace.timescale,
+        trace.date.as_deref(),
+        trace.version.as_deref(),
+        &decls,
+        &events,
+        &values,
+    )
 }
 
 /// Canonical VCD for a `.vtx` store.
@@ -209,7 +226,14 @@ pub fn from_store(store: &TraceStore) -> Result<String> {
     events.sort_unstable();
 
     let ts = store.timescale();
-    Ok(emit(ts, store.meta.date.as_deref(), store.meta.writer.as_deref(), &decls, &events, &values))
+    Ok(emit(
+        ts,
+        store.meta.date.as_deref(),
+        store.meta.writer.as_deref(),
+        &decls,
+        &events,
+        &values,
+    ))
 }
 
 #[cfg(test)]

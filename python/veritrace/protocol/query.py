@@ -127,10 +127,8 @@ def protocol(analysis: Any, pipeline: Pipeline) -> dict[str, Any]:
         # Rules that were checked, so "no violations" is distinguishable from
         # "this pack declares no rules" (P7, and §8.14's honesty rule).
         "rules": sorted(
-            {r.id for e in chosen for r in getattr(e.interface_pack, "rules", []) or []}
-        )
-        if any(hasattr(e, "interface_pack") for e in chosen)
-        else [],
+            {r.id for e in chosen for r in (e.interface.pack.rules or [])}
+        ),
         "violations": rows,
         "n": len(rows),
     }

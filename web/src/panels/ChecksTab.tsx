@@ -44,9 +44,12 @@ const SECTIONS = (Object.entries(LABELS) as [FindingGroup, string][]).map(
 export function ChecksTab() {
   const checks = useWave((s) => s.checks);
   const busy = useWave((s) => s.checksBusy);
+  const error = useWave((s) => s.checksError);
   const hasRtl = useWave((s) => s.status?.has_rtl ?? false);
   const load = useWave((s) => s.loadChecks);
   const [filter, setFilter] = useState("");
+  const [severity, setSeverity] = useState("");
+  const [group, setGroup] = useState("");
   // §8.4's threshold, tried without restarting the server. Held here rather
   // than in the store because it is a question about this view, not session
   // state: nothing else in the application depends on the window it is asking
@@ -57,18 +60,23 @@ export function ChecksTab() {
   const [at, setAt] = useState(-1);
 
   useEffect(() => {
-    if (!checks && !busy) void load();
-  }, [checks, busy, load]);
+    if (!checks && !busy && !error) void load();
+  }, [checks, busy, error, load]);
 
   if (busy && !checks) return <div className="pane-note">Running checks…</div>;
+  if (error) return <div className="pane-note" role="alert">{error} <button onClick={() => void load()}>Retry</button></div>;
   if (!checks) return <div className="pane-note">No checks yet.</div>;
 
   const q = filter.trim().toLowerCase();
   const match = (f: Finding) =>
-    !q ||
-    f.signal?.toLowerCase().includes(q) ||
-    f.check.includes(q) ||
-    f.title.toLowerCase().includes(q);
+    (!severity || f.severity === severity) &&
+    (!group || f.group === group) &&
+    (!q ||
+      f.signal?.toLowerCase().includes(q) ||
+      f.check.includes(q) ||
+      f.group.includes(q) ||
+      f.severity.includes(q) ||
+      f.title.toLowerCase().includes(q));
 
   // An override replaces the STUCK group and nothing else, so the rest of the
   // report stays the one the session computed.
@@ -93,6 +101,10 @@ export function ChecksTab() {
       setStuck={setStuck}
       filter={filter}
       setFilter={setFilter}
+      severity={severity}
+      setSeverity={setSeverity}
+      group={group}
+      setGroup={setGroup}
       at={at}
       setAt={setAt}
     />
@@ -118,6 +130,10 @@ function ChecksBody({
   setStuck,
   filter,
   setFilter,
+  severity,
+  setSeverity,
+  group,
+  setGroup,
   at,
   setAt,
 }: {
@@ -131,6 +147,10 @@ function ChecksBody({
   setStuck: (r: StuckResult | null) => void;
   filter: string;
   setFilter: (q: string) => void;
+  severity: string;
+  setSeverity: (severity: string) => void;
+  group: string;
+  setGroup: (group: string) => void;
   at: number;
   setAt: (i: number) => void;
 }) {
@@ -175,6 +195,30 @@ function ChecksBody({
           onChange={(e) => setFilter(e.target.value)}
           data-testid="checks-filter"
         />
+        <select
+          className="checks-select"
+          value={severity}
+          onChange={(e) => setSeverity(e.target.value)}
+          data-testid="checks-severity"
+          aria-label="Filter by severity"
+        >
+          <option value="">all severities</option>
+          <option value="error">error</option>
+          <option value="warn">warn</option>
+          <option value="info">info</option>
+        </select>
+        <select
+          className="checks-select"
+          value={group}
+          onChange={(e) => setGroup(e.target.value)}
+          data-testid="checks-group"
+          aria-label="Filter by finding type"
+        >
+          <option value="">all types</option>
+          {SECTIONS.map(({ key, label }) => (
+            <option value={key} key={key}>{label.toLowerCase()}</option>
+          ))}
+        </select>
         <span className="spacer" />
         <span className="dim" data-testid="checks-count">
           {total} finding{total === 1 ? "" : "s"} · {checks.ms} ms

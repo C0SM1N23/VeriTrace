@@ -198,10 +198,17 @@ impl TraceStore {
         let index = Index::open(dir.join("index.bin"))?;
         let signals = read_signals(&dir.join("signals.parquet"))?;
         let scopes = read_scopes(&dir.join("scopes.parquet"))?;
-        let by_path =
-            signals.iter().map(|s| (s.path.clone(), s.signal_id)).collect::<HashMap<_, _>>();
-        let by_stream =
-            signals.iter().map(|s| (s.stream_id, s.signal_id)).collect::<HashMap<_, _>>();
+        validate_store(&dir, &meta, &index, &signals, &scopes)?;
+        let mut by_path = HashMap::with_capacity(signals.len());
+        for s in &signals {
+            if by_path.insert(s.path.clone(), s.signal_id).is_some() {
+                return Err(Error::Store(format!("duplicate signal path `{}`", s.path)));
+            }
+        }
+        let by_stream = signals
+            .iter()
+            .map(|s| (s.stream_id, s.signal_id))
+            .collect::<HashMap<_, _>>();
         Ok(TraceStore {
             dir,
             meta,
@@ -218,10 +225,16 @@ impl TraceStore {
 
     /// Open a part file with its footer taken from cache.
     fn part_reader(&self, part_id: u32) -> Result<ParquetRecordBatchReaderBuilder<File>> {
-        let path = self.dir.join("events").join(format!("part-{part_id:03}.parquet"));
+        let path = self
+            .dir
+            .join("events")
+            .join(format!("part-{part_id:03}.parquet"));
         let file = File::open(&path)?;
         if let Some(m) = self.part_meta.read().unwrap().get(&part_id) {
-            return Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(file, m.clone()));
+            return Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(
+                file,
+                m.clone(),
+            ));
         }
         let m = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())?;
         self.part_meta.write().unwrap().insert(part_id, m.clone());
@@ -229,11 +242,55 @@ impl TraceStore {
     }
 
     pub fn timescale(&self) -> Timescale {
-        Timescale { num: self.meta.timescale_num, unit_exp: self.meta.timescale_unit_exp }
+        Timescale {
+            num: self.meta.timescale_num,
+            unit_exp: self.meta.timescale_unit_exp,
+        }
     }
 
     pub fn time_range(&self) -> (Time, Time) {
         (self.meta.t_min, self.meta.t_max)
+    }
+
+    /// Compare the source dump's current O(1) identity with the one recorded
+    /// at conversion. `None` means this is a legacy store with no identity and
+    /// must be rebuilt (or verified by hashing) before it can be trusted.
+    pub fn source_identity_matches(&self, path: impl AsRef<Path>) -> Result<Option<bool>> {
+        let Some(recorded) = &self.meta.source_identity else {
+            return Ok(None);
+        };
+        Ok(Some(
+            crate::store::source_identity(path.as_ref())? == *recorded,
+        ))
+    }
+
+    /// Prove that `path` is still this store's source.
+    ///
+    /// The normal path is metadata-only. If identity changed (including a
+    /// same-size rewrite with restored mtime), hash once. Equal bytes refresh
+    /// the recorded identity so subsequent opens return to O(1); unequal bytes
+    /// return false and the caller reconverts.
+    pub fn verify_source(&mut self, path: impl AsRef<Path>) -> Result<bool> {
+        let path = path.as_ref();
+        let before = crate::store::source_identity(path)?;
+        if self.meta.source_identity.as_ref() == Some(&before) {
+            return Ok(true);
+        }
+        if self.meta.source_bytes.is_some_and(|n| n != before.bytes) {
+            return Ok(false);
+        }
+        let Some(recorded_hash) = &self.meta.source_sha256 else {
+            return Ok(false);
+        };
+        let current_hash = crate::store::sha256_file(path)?;
+        let after = crate::store::source_identity(path)?;
+        if before != after || &current_hash != recorded_hash {
+            return Ok(false);
+        }
+        self.meta.source_bytes = Some(after.bytes);
+        self.meta.source_identity = Some(after);
+        crate::store::write_meta(&self.dir, &self.meta)?;
+        Ok(true)
     }
 
     pub fn n_signals(&self) -> usize {
@@ -245,11 +302,14 @@ impl TraceStore {
     }
 
     pub fn handle(&self, path: &str) -> Result<Handle> {
-        self.find(path).ok_or_else(|| Error::UnknownSignal(path.to_string()))
+        self.find(path)
+            .ok_or_else(|| Error::UnknownSignal(path.to_string()))
     }
 
     pub fn signal(&self, h: Handle) -> Result<&SignalMeta> {
-        self.signals.get(h as usize).ok_or_else(|| Error::UnknownSignal(format!("handle {h}")))
+        self.signals
+            .get(h as usize)
+            .ok_or_else(|| Error::UnknownSignal(format!("handle {h}")))
     }
 
     /// All paths that share a signal's event stream (§7 alias resolution).
@@ -271,7 +331,10 @@ impl TraceStore {
         }
         let d = Arc::new(self.load_stream(stream, sig.width, sig.encoding)?);
         self.cache.write().unwrap().insert(stream, d.clone());
-        self.times_cache.write().unwrap().insert(stream, d.times.clone());
+        self.times_cache
+            .write()
+            .unwrap()
+            .insert(stream, d.times.clone());
         Ok(d)
     }
 
@@ -296,7 +359,10 @@ impl TraceStore {
             let builder = self.part_reader(part_id)?;
             // Column 1 is `time`; the value payload is never touched.
             let mask = ProjectionMask::roots(builder.parquet_schema(), [1]);
-            let reader = builder.with_row_groups(groups).with_projection(mask).build()?;
+            let reader = builder
+                .with_row_groups(groups)
+                .with_projection(mask)
+                .build()?;
             for batch in reader {
                 let batch = batch?;
                 let ts = col::<Int64Array>(&batch, 0, "time")?;
@@ -311,13 +377,21 @@ impl TraceStore {
         let (lo, hi) = self.index.chunks_of(stream);
         let mut by_part: HashMap<u32, Vec<usize>> = HashMap::new();
         for i in lo..hi {
-            by_part.entry(self.index.entry(i).part_id).or_default().push(i);
+            by_part
+                .entry(self.index.entry(i).part_id)
+                .or_default()
+                .push(i);
         }
         let mut parts: Vec<_> = by_part
             .into_iter()
             .map(|(p, mut idxs)| {
                 idxs.sort_by_key(|i| self.index.entry(*i).row_offset);
-                (p, idxs.iter().map(|i| self.index.entry(*i).row_group as usize).collect())
+                (
+                    p,
+                    idxs.iter()
+                        .map(|i| self.index.entry(*i).row_group as usize)
+                        .collect(),
+                )
             })
             .collect();
         parts.sort_by_key(|(p, _)| *p);
@@ -368,7 +442,11 @@ impl TraceStore {
             Encoding::Str => ValueColumn::Str(strs),
             _ => ValueColumn::Bits { width, words, a, b },
         };
-        Ok(StreamData { times: Arc::new(times), deltas, values })
+        Ok(StreamData {
+            times: Arc::new(times),
+            deltas,
+            values,
+        })
     }
 
     // ---- §6.4 API -------------------------------------------------------
@@ -584,7 +662,12 @@ impl TraceStore {
         let initial = d.idx_at(t0).map(|i| d.values.get(i).to_vcd_bits());
 
         if t1 <= t0 {
-            return Ok(Wave { initial, mode: WaveMode::Exact, points: Vec::new(), buckets: Vec::new() });
+            return Ok(Wave {
+                initial,
+                mode: WaveMode::Exact,
+                points: Vec::new(),
+                buckets: Vec::new(),
+            });
         }
         let lo = d.times.partition_point(|&x| x < t0);
         let hi = d.times.partition_point(|&x| x < t1);
@@ -592,9 +675,15 @@ impl TraceStore {
         // Fewer transitions than pixels: nothing to gain from bucketing, and the
         // client gets an exact picture.
         if hi - lo <= px {
-            let points =
-                (lo..hi).map(|i| (d.times[i], d.values.get(i).to_vcd_bits())).collect::<Vec<_>>();
-            return Ok(Wave { initial, mode: WaveMode::Exact, points, buckets: Vec::new() });
+            let points = (lo..hi)
+                .map(|i| (d.times[i], d.values.get(i).to_vcd_bits()))
+                .collect::<Vec<_>>();
+            return Ok(Wave {
+                initial,
+                mode: WaveMode::Exact,
+                points,
+                buckets: Vec::new(),
+            });
         }
 
         let span = (t1 - t0) as i128;
@@ -629,11 +718,11 @@ impl TraceStore {
             // 64 bits; anything else is represented by the flags plus a
             // first-seen fallback.
             if let Some(k) = v.as_u64() {
-                if entry.min_key.map_or(true, |m| k < m) {
+                if entry.min_key.is_none_or(|m| k < m) {
                     entry.min_key = Some(k);
                     entry.min_bits = bits.clone();
                 }
-                if entry.max_key.map_or(true, |m| k > m) {
+                if entry.max_key.is_none_or(|m| k > m) {
                     entry.max_key = Some(k);
                     entry.max_bits = bits;
                 }
@@ -648,34 +737,44 @@ impl TraceStore {
                     a.min_bits = a.first_bits.clone();
                     a.max_bits = a.first_bits.clone();
                 }
-                WaveBucket { t: a.t, min: a.min_bits, max: a.max_bits, n: a.n, flags: a.flags }
+                WaveBucket {
+                    t: a.t,
+                    min: a.min_bits,
+                    max: a.max_bits,
+                    n: a.n,
+                    flags: a.flags,
+                }
             })
             .collect::<Vec<_>>();
 
         debug_assert!(buckets.len() <= px);
-        Ok(Wave { initial, mode: WaveMode::MinMax, points: Vec::new(), buckets })
+        Ok(Wave {
+            initial,
+            mode: WaveMode::MinMax,
+            points: Vec::new(),
+            buckets,
+        })
     }
 
     // ---- whole-trace scans (rayon, per §4.1) -----------------------------
 
     /// `first_x` for every signal, in parallel.
-    pub fn first_x_all(&self) -> Vec<(Handle, Time)> {
-        (0..self.signals.len() as Handle)
+    pub fn first_x_all(&self) -> Result<Vec<(Handle, Time)>> {
+        let rows: Result<Vec<Option<(Handle, Time)>>> = (0..self.signals.len() as Handle)
             .into_par_iter()
-            .filter_map(|h| match self.first_x(h) {
-                Ok(Some(t)) => Some((h, t)),
-                _ => None,
-            })
-            .collect()
+            .map(|h| self.first_x(h).map(|t| t.map(|t| (h, t))))
+            .collect();
+        Ok(rows?.into_iter().flatten().collect())
     }
 
     /// Signals that never change over `[start, end)` — the basis of the stuck
     /// detector in §8.
-    pub fn constant_signals(&self, start: Time, end: Time) -> Vec<Handle> {
-        (0..self.signals.len() as Handle)
+    pub fn constant_signals(&self, start: Time, end: Time) -> Result<Vec<Handle>> {
+        let rows: Result<Vec<Option<Handle>>> = (0..self.signals.len() as Handle)
             .into_par_iter()
-            .filter(|h| self.is_constant(*h, start, end).unwrap_or(false))
-            .collect()
+            .map(|h| self.is_constant(h, start, end).map(|yes| yes.then_some(h)))
+            .collect();
+        Ok(rows?.into_iter().flatten().collect())
     }
 
     /// `last_change_before(t)` for every signal at once — the scan §8.4 runs on
@@ -689,7 +788,7 @@ impl TraceStore {
     /// Parallel because it touches every signal's time column: the work is one
     /// Parquet decode per signal and embarrassingly parallel, and it warms the
     /// time cache that the rest of the session then reads for free.
-    pub fn last_change_all(&self, t: Time) -> Vec<Option<Time>> {
+    pub fn last_change_all(&self, t: Time) -> Result<Vec<Option<Time>>> {
         (0..self.signals.len() as Handle)
             .into_par_iter()
             .map(|h| {
@@ -698,16 +797,15 @@ impl TraceStore {
                 // `last_change_before` would decode the whole time column of
                 // every signal in the design to rediscover it, which was most
                 // of what put the stuck detector over §4.2's budget.
-                if let Ok(sig) = self.signal(h) {
-                    let (lo, hi) = self.index.chunks_of(sig.stream_id);
-                    if hi > lo {
-                        let last = self.index.entry(hi - 1);
-                        if t > last.t_last {
-                            return Some(last.t_last);
-                        }
+                let sig = self.signal(h)?;
+                let (lo, hi) = self.index.chunks_of(sig.stream_id);
+                if hi > lo {
+                    let last = self.index.entry(hi - 1);
+                    if t > last.t_last {
+                        return Ok(Some(last.t_last));
                     }
                 }
-                self.last_change_before(h, t).unwrap_or(None)
+                self.last_change_before(h, t)
             })
             .collect()
     }
@@ -738,7 +836,7 @@ impl TraceStore {
     /// fixed cost each, which at three thousand frozen signals *is* the scan.
     /// A store has a handful of parts, so opening each once and reading all the
     /// row groups wanted from it turns three thousand opens into sixteen.
-    pub fn value_at_all(&self, handles: &[Handle], t: Time) -> Vec<Option<Value>> {
+    pub fn value_at_all(&self, handles: &[Handle], t: Time) -> Result<Vec<Option<Value>>> {
         // Stream → the one chunk that can contain `t`, from the index. Several
         // handles can share a stream (§7.1 aliases), so the work is per stream
         // and the answer is fanned back out per handle at the end.
@@ -746,7 +844,7 @@ impl TraceStore {
         let mut cached: HashMap<u32, Option<Value>> = HashMap::new();
         let mut seen: HashSet<u32> = HashSet::new();
         for &h in handles {
-            let Ok(sig) = self.signal(h) else { continue };
+            let sig = self.signal(h)?;
             let stream = sig.stream_id;
             if !seen.insert(stream) {
                 continue;
@@ -768,17 +866,20 @@ impl TraceStore {
                     // before format 3 has no summary and falls back below.
                     let past_end = t >= e.t_last;
                     if past_end && ci + 1 == self.index.chunks_of(stream).1 {
-                        if let Some(v) =
-                            self.index.last_value(stream).and_then(|b| self.decode_for(stream, b))
+                        if let Some(v) = self
+                            .index
+                            .last_value(stream)
+                            .and_then(|b| self.decode_for(stream, b))
                         {
                             cached.insert(stream, Some(v));
                             continue;
                         }
                     }
-                    by_part
-                        .entry(e.part_id)
-                        .or_default()
-                        .push((stream, e.row_group as usize, past_end));
+                    by_part.entry(e.part_id).or_default().push((
+                        stream,
+                        e.row_group as usize,
+                        past_end,
+                    ));
                 }
                 None => {
                     cached.insert(stream, None);
@@ -787,23 +888,24 @@ impl TraceStore {
         }
 
         let parts: Vec<_> = by_part.into_iter().collect();
-        let decoded: HashMap<u32, Option<Value>> = parts
+        let decoded_parts: Vec<Result<HashMap<u32, Option<Value>>>> = parts
             .par_iter()
-            .map(|(part, wanted)| self.values_from_part(*part, wanted, t).unwrap_or_default())
-            .reduce(HashMap::new, |mut a, b| {
-                a.extend(b);
-                a
-            });
+            .map(|(part, wanted)| self.values_from_part(*part, wanted, t))
+            .collect();
+        let mut decoded: HashMap<u32, Option<Value>> = HashMap::new();
+        for part in decoded_parts {
+            decoded.extend(part?);
+        }
 
         handles
             .iter()
             .map(|&h| {
-                let stream = self.signal(h).ok()?.stream_id;
-                cached
+                let stream = self.signal(h)?.stream_id;
+                Ok(cached
                     .get(&stream)
                     .or_else(|| decoded.get(&stream))
                     .cloned()
-                    .flatten()
+                    .flatten())
             })
             .collect()
     }
@@ -832,7 +934,10 @@ impl TraceStore {
         let builder = self.part_reader(part)?;
         let cols: &[usize] = if past_end { &[0, 3] } else { &[0, 1, 3] };
         let mask = ProjectionMask::roots(builder.parquet_schema(), cols.iter().copied());
-        let reader = builder.with_row_groups(groups).with_projection(mask).build()?;
+        let reader = builder
+            .with_row_groups(groups)
+            .with_projection(mask)
+            .build()?;
 
         // Last row at or before `t` wins: rows inside a chunk are in time order
         // and a timestamp repeats across delta cycles (§5.5), so the settled
@@ -871,7 +976,9 @@ impl TraceStore {
         for &(stream, _, _) in wanted {
             // Width and encoding belong to the stream, so any handle on it will
             // do; `by_stream` is built once at open rather than searched here.
-            let value = best.get(&stream).and_then(|bytes| self.decode_for(stream, bytes));
+            let value = best
+                .get(&stream)
+                .and_then(|bytes| self.decode_for(stream, bytes));
             out.insert(stream, value);
         }
         Ok(out)
@@ -886,7 +993,12 @@ impl TraceStore {
     fn decode_for(&self, stream: u32, bytes: &[u8]) -> Option<Value> {
         let &h = self.by_stream.get(&stream)?;
         let s = &self.signals[h as usize];
-        Some(decode_one(bytes, s.width, s.encoding, words_for(s.width).max(1)))
+        Some(decode_one(
+            bytes,
+            s.width,
+            s.encoding,
+            words_for(s.width).max(1),
+        ))
     }
 
     // ---- cycle-aligned sampling (§5.5, §8.14) ----------------------------
@@ -937,8 +1049,14 @@ impl TraceStore {
     ///
     /// One row per handle in the order given; `None` where the signal has no
     /// event before that time yet.
-    pub fn sample_before(&self, handles: &[Handle], times: &[Time]) -> Result<Vec<Vec<Option<Value>>>> {
-        debug_assert!(times.windows(2).all(|w| w[0] <= w[1]), "times must be ascending");
+    pub fn sample_before(
+        &self,
+        handles: &[Handle],
+        times: &[Time],
+    ) -> Result<Vec<Vec<Option<Value>>>> {
+        if !times.windows(2).all(|w| w[0] <= w[1]) {
+            return Err(Error::Store("sample timestamps must be ascending".into()));
+        }
         handles
             .par_iter()
             .map(|&h| {
@@ -949,12 +1067,182 @@ impl TraceStore {
                     while i < d.len() && d.times[i] < t {
                         i += 1;
                     }
-                    out.push(if i == 0 { None } else { Some(d.values.get(i - 1)) });
+                    out.push(if i == 0 {
+                        None
+                    } else {
+                        Some(d.values.get(i - 1))
+                    });
                 }
                 Ok(out)
             })
             .collect()
     }
+}
+
+/// Validate the small, eagerly-read part of a store before it can answer a
+/// query. A truncated event part can still fail lazily when touched, but a
+/// contradictory index/metadata table must never open successfully and then
+/// turn into a plausible empty answer in a whole-trace scan.
+fn validate_store(
+    dir: &Path,
+    meta: &Meta,
+    index: &Index,
+    signals: &[SignalMeta],
+    scopes: &[ScopeMeta],
+) -> Result<()> {
+    let bad = |msg: String| Error::Store(msg);
+    if meta.version != crate::index::VERSION {
+        return Err(bad(format!(
+            "meta.json: version {}, expected {}",
+            meta.version,
+            crate::index::VERSION
+        )));
+    }
+    if meta.n_signals as usize != signals.len() || index.header.n_signals != meta.n_signals {
+        return Err(bad(format!(
+            "signal count mismatch: meta={}, index={}, table={}",
+            meta.n_signals,
+            index.header.n_signals,
+            signals.len()
+        )));
+    }
+    if index.header.n_streams != meta.n_streams {
+        return Err(bad(format!(
+            "stream count mismatch: meta={}, index={}",
+            meta.n_streams, index.header.n_streams
+        )));
+    }
+    if (index.header.t_min, index.header.t_max) != (meta.t_min, meta.t_max) {
+        return Err(bad(
+            "time range differs between meta.json and index.bin".into()
+        ));
+    }
+    if index.header.timescale
+        != (Timescale {
+            num: meta.timescale_num,
+            unit_exp: meta.timescale_unit_exp,
+        })
+    {
+        return Err(bad(
+            "timescale differs between meta.json and index.bin".into()
+        ));
+    }
+    if meta.n_parts == 0 {
+        return Err(bad("meta.json declares no event parts".into()));
+    }
+    for part in 0..meta.n_parts {
+        let path = dir.join("events").join(format!("part-{part:03}.parquet"));
+        if !path.is_file() {
+            return Err(bad(format!("missing event part {}", path.display())));
+        }
+    }
+
+    for (i, scope) in scopes.iter().enumerate() {
+        if scope.scope_id as usize != i {
+            return Err(bad(format!(
+                "scopes.parquet: row {i} has scope_id {}",
+                scope.scope_id
+            )));
+        }
+        if scope.parent.is_some_and(|p| p as usize >= i) {
+            return Err(bad(format!(
+                "scopes.parquet: scope {i} has invalid parent {:?}",
+                scope.parent
+            )));
+        }
+    }
+
+    let mut stream_meta: Vec<Option<(u32, Encoding, u64)>> = vec![None; meta.n_streams as usize];
+    let mut paths = HashSet::with_capacity(signals.len());
+    for (i, signal) in signals.iter().enumerate() {
+        if signal.signal_id as usize != i {
+            return Err(bad(format!(
+                "signals.parquet: row {i} has signal_id {}",
+                signal.signal_id
+            )));
+        }
+        if signal.stream_id >= meta.n_streams {
+            return Err(bad(format!(
+                "signals.parquet: signal `{}` references stream {} of {}",
+                signal.path, signal.stream_id, meta.n_streams
+            )));
+        }
+        if !paths.insert(signal.path.as_str()) {
+            return Err(bad(format!("duplicate signal path `{}`", signal.path)));
+        }
+        let this = (signal.width, signal.encoding, signal.n_events);
+        match &mut stream_meta[signal.stream_id as usize] {
+            slot @ None => *slot = Some(this),
+            Some(previous) if *previous != this => {
+                return Err(bad(format!(
+                    "aliases of stream {} disagree about width, encoding, or event count",
+                    signal.stream_id
+                )))
+            }
+            _ => {}
+        }
+    }
+    if let Some(missing) = stream_meta.iter().position(Option::is_none) {
+        return Err(bad(format!("stream {missing} has no signal declaration")));
+    }
+    let table_events: u64 = stream_meta.into_iter().flatten().map(|x| x.2).sum();
+    if table_events != meta.n_events {
+        return Err(bad(format!(
+            "event count mismatch: meta={}, signals={table_events}",
+            meta.n_events
+        )));
+    }
+
+    let mut next_offset = vec![0u64; meta.n_streams as usize];
+    let mut indexed_events = 0u64;
+    for i in 0..index.len() {
+        let entry = index.entry(i);
+        if entry.stream_id >= meta.n_streams {
+            return Err(bad(format!(
+                "index entry {i} references invalid stream {}",
+                entry.stream_id
+            )));
+        }
+        if entry.part_id >= meta.n_parts {
+            return Err(bad(format!(
+                "index entry {i} references invalid part {}",
+                entry.part_id
+            )));
+        }
+        if entry.n_rows == 0 || entry.t_first > entry.t_last {
+            return Err(bad(format!(
+                "index entry {i} has an invalid row/time range"
+            )));
+        }
+        let expected = &mut next_offset[entry.stream_id as usize];
+        if entry.row_offset != *expected {
+            return Err(bad(format!(
+                "index entry {i} starts at row {}, expected {}",
+                entry.row_offset, *expected
+            )));
+        }
+        *expected += entry.n_rows as u64;
+        indexed_events += entry.n_rows as u64;
+    }
+    if indexed_events != meta.n_events {
+        return Err(bad(format!(
+            "event count mismatch: meta={}, index={indexed_events}",
+            meta.n_events
+        )));
+    }
+    for (stream, expected) in next_offset.into_iter().enumerate() {
+        let declared = signals
+            .iter()
+            .find(|s| s.stream_id as usize == stream)
+            .map(|s| s.n_events)
+            .unwrap_or(0);
+        if expected != declared {
+            return Err(bad(format!(
+                "stream {stream} has {expected} indexed rows, signals table declares {declared}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// One serialised row back into a [`Value`], without building a column for it.
@@ -986,7 +1274,7 @@ fn append_planes(
     a: &mut Vec<u64>,
     b: &mut Vec<u64>,
 ) {
-    let nbytes = ((width as usize) + 7) / 8;
+    let nbytes = (width as usize).div_ceil(8);
     let base = a.len();
     a.resize(base + words, 0);
     for i in 0..nbytes.min(bytes.len()) {
@@ -1040,7 +1328,13 @@ fn read_signals(path: &Path) -> Result<Vec<SignalMeta>> {
         let code = col::<StringArray>(&batch, 10, "code")?;
         let nev = col::<UInt64Array>(&batch, 11, "n_events")?;
         let enc = col::<StringArray>(&batch, 12, "encoding")?;
-        let opt = |arr: &Int64Array, r: usize| if arr.is_null(r) { None } else { Some(arr.value(r)) };
+        let opt = |arr: &Int64Array, r: usize| {
+            if arr.is_null(r) {
+                None
+            } else {
+                Some(arr.value(r))
+            }
+        };
         for r in 0..batch.num_rows() {
             out.push(SignalMeta {
                 signal_id: id.value(r),
@@ -1055,7 +1349,7 @@ fn read_signals(path: &Path) -> Result<Vec<SignalMeta>> {
                 array_index: opt(ai, r),
                 code: code.value(r).to_string(),
                 n_events: nev.value(r),
-                encoding: Encoding::from_str(enc.value(r))
+                encoding: Encoding::parse(enc.value(r))
                     .ok_or_else(|| Error::Store(format!("unknown encoding {}", enc.value(r))))?,
             });
         }
@@ -1084,7 +1378,11 @@ fn read_scopes(path: &Path) -> Result<Vec<ScopeMeta>> {
                 scope_id: id.value(r),
                 name: name.value(r).to_string(),
                 kind: kind.value(r).to_string(),
-                parent: if parent.is_null(r) { None } else { Some(parent.value(r)) },
+                parent: if parent.is_null(r) {
+                    None
+                } else {
+                    Some(parent.value(r))
+                },
                 path: path_c.value(r).to_string(),
             });
         }

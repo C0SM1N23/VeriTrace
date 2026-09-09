@@ -73,19 +73,19 @@ fn value_at_all_agrees_with_value_at_signal_by_signal() {
     let (_d, s, _) = convert(GLITCH);
     let handles: Vec<u32> = (0..s.n_signals() as u32).collect();
     for t in [0, 5, 10, 15, 20, 25] {
-        let bulk = s.value_at_all(&handles, t);
+        let bulk = s.value_at_all(&handles, t).unwrap();
         let one: Vec<_> = handles.iter().map(|&h| s.value_at(h, t).unwrap()).collect();
         assert_eq!(bulk, one, "at t={t}");
     }
     // t=10 has three writes; both routes have to settle on the last.
     assert_eq!(
-        s.value_at_all(&[s.handle("top.sum").unwrap()], 10)[0]
+        s.value_at_all(&[s.handle("top.sum").unwrap()], 10).unwrap()[0]
             .as_ref()
             .and_then(Value::as_u64),
         Some(2)
     );
     // Before the first event of the trace there is nothing to report, not zero.
-    assert_eq!(s.value_at_all(&handles, -1), vec![None, None]);
+    assert_eq!(s.value_at_all(&handles, -1).unwrap(), vec![None, None]);
 }
 
 #[test]
@@ -97,10 +97,10 @@ fn value_at_all_does_not_pull_whole_streams_into_the_cache() {
     // and a later `value_at` still has to produce the same answer.
     let (_d, s, _) = convert(GLITCH);
     let handles: Vec<u32> = (0..s.n_signals() as u32).collect();
-    assert_eq!(s.value_at_all(&handles, 20), vec![
-        s.value_at(0, 20).unwrap(),
-        s.value_at(1, 20).unwrap(),
-    ]);
+    assert_eq!(
+        s.value_at_all(&handles, 20).unwrap(),
+        vec![s.value_at(0, 20).unwrap(), s.value_at(1, 20).unwrap(),]
+    );
     assert_eq!(u64_at(&s, "top.sum", 10), Some(2));
 }
 
@@ -235,7 +235,10 @@ fn seven_functions_behave() {
 
     // transitions
     let tr = s.transitions(clk, 0, 25).unwrap();
-    assert_eq!(tr.iter().map(|(t, _)| *t).collect::<Vec<_>>(), vec![0, 10, 20]);
+    assert_eq!(
+        tr.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        vec![0, 10, 20]
+    );
     let tr = s.transitions(clk, 10, 30).unwrap();
     assert_eq!(tr.iter().map(|(t, _)| *t).collect::<Vec<_>>(), vec![10, 20]);
 
@@ -265,11 +268,11 @@ fn seven_functions_behave() {
 #[test]
 fn parallel_scans_agree_with_serial() {
     let (_d, s, _) = convert(BASIC);
-    let xs = s.first_x_all();
+    let xs = s.first_x_all().unwrap();
     let bus = s.handle("top.bus").unwrap();
     assert_eq!(xs, vec![(bus, 0)]);
 
-    let consts = s.constant_signals(11, 19);
+    let consts = s.constant_signals(11, 19).unwrap();
     assert_eq!(consts.len(), s.n_signals());
 }
 
@@ -293,13 +296,67 @@ fn vtx_directory_contains_expected_files() {
     let trace = vcd::parse_str(BASIC).unwrap();
     let out = dir.path().join("dump.vtx");
     store::write_vtx(&trace, &out, None).unwrap();
-    for f in ["meta.json", "signals.parquet", "scopes.parquet", "index.bin"] {
+    for f in [
+        "meta.json",
+        "signals.parquet",
+        "scopes.parquet",
+        "index.bin",
+    ] {
         assert!(out.join(f).exists(), "missing {f}");
     }
     assert!(out.join("events").is_dir());
     assert!(out.join("txn").is_dir());
     let parts: Vec<_> = std::fs::read_dir(out.join("events")).unwrap().collect();
     assert!(!parts.is_empty(), "no event parts written");
+}
+
+#[test]
+fn writer_refuses_to_replace_an_unrelated_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let trace = vcd::parse_str(BASIC).unwrap();
+    let out = dir.path().join("not-a-store");
+    std::fs::create_dir(&out).unwrap();
+    let sentinel = out.join("must-survive.txt");
+    std::fs::write(&sentinel, b"owned by the user").unwrap();
+
+    let err = store::write_vtx(&trace, &out, None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("not a VeriTrace store"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"owned by the user");
+    assert!(!out.join("meta.json").exists());
+}
+
+#[test]
+fn writer_rejects_duplicate_paths_before_publishing_a_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut trace = vcd::parse_str(BASIC).unwrap();
+    trace.signals.push(trace.signals[0].clone());
+    let out = dir.path().join("duplicate.vtx");
+
+    let error = store::write_vtx(&trace, &out, None)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("duplicate signal path"), "{error}");
+    assert!(!out.exists(), "an invalid store must never be published");
+}
+
+#[test]
+fn writer_can_replace_a_store_it_previously_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("dump.vtx");
+    let first = vcd::parse_str(BASIC).unwrap();
+    store::write_vtx(&first, &out, None).unwrap();
+    let replacement = vcd::parse_str(GLITCH).unwrap();
+    store::write_vtx(&replacement, &out, None).unwrap();
+
+    let opened = TraceStore::open(&out).unwrap();
+    assert!(opened.find("top.sum").is_some());
+    assert!(opened.find("top.clk").is_none());
 }
 
 #[test]
@@ -321,7 +378,10 @@ $enddefinitions $end
     let (_d, s, _) = convert(src);
     let a = s.handle("tb.clk").unwrap();
     let b = s.handle("tb.dut.clk").unwrap();
-    assert_eq!(s.signal(a).unwrap().stream_id, s.signal(b).unwrap().stream_id);
+    assert_eq!(
+        s.signal(a).unwrap().stream_id,
+        s.signal(b).unwrap().stream_id
+    );
     assert_eq!(s.value_at(a, 5).unwrap(), s.value_at(b, 5).unwrap());
     let mut al = s.aliases(a).unwrap();
     al.sort();
@@ -330,7 +390,7 @@ $enddefinitions $end
 
 #[test]
 fn wide_signals_survive_the_store() {
-    let wide: String = std::iter::repeat('1').take(100).collect();
+    let wide = "1".repeat(100);
     let src = format!(
         "$timescale 1ns $end\n$scope module top $end\n$var wire 100 ! w [99:0] $end\n\
          $upscope $end\n$enddefinitions $end\n#0\nb{wide} !\n#10\nbx !\n"
@@ -388,21 +448,33 @@ fn roundtrip_fifo_async_is_lossless() {
 
     let from_original = reconstruct::from_trace(&original);
     let from_vtx = reconstruct::from_store(&s).unwrap();
-    assert_eq!(from_original, from_vtx, "reconstruction from .vtx differs from the source trace");
+    assert_eq!(
+        from_original, from_vtx,
+        "reconstruction from .vtx differs from the source trace"
+    );
 
     // Re-parsing the reconstruction must yield identical events.
     let again = vcd::parse_str(&from_vtx).unwrap();
     assert_eq!(again.signals.len(), original.signals.len());
     assert_eq!(again.streams.len(), original.streams.len());
     assert_eq!(again.total_events(), original.total_events());
-    for (i, (a, b)) in again.streams.iter().zip(original.streams.iter()).enumerate() {
+    for (i, (a, b)) in again
+        .streams
+        .iter()
+        .zip(original.streams.iter())
+        .enumerate()
+    {
         assert_eq!(a.times, b.times, "stream {i} times");
         assert_eq!(a.deltas, b.deltas, "stream {i} deltas");
         for r in 0..a.len() {
             assert_eq!(a.values.get(r), b.values.get(r), "stream {i} row {r}");
         }
     }
-    assert_eq!(reconstruct::from_trace(&again), from_original, "canonical form is not a fixed point");
+    assert_eq!(
+        reconstruct::from_trace(&again),
+        from_original,
+        "canonical form is not a fixed point"
+    );
 }
 
 /// The reference dump is where the NBA case shows up for real: `wr_ptr` updates
@@ -434,10 +506,16 @@ fn reference_design_has_real_nba_case() {
         }
         let after = s.value_at(wr_ptr, t).unwrap();
         let before = s.value_before(wr_ptr, t).unwrap();
-        assert_ne!(after, before, "at t={t} the pre-edge value must differ from the post-edge one");
+        assert_ne!(
+            after, before,
+            "at t={t} the pre-edge value must differ from the post-edge one"
+        );
         checked += 1;
     }
-    assert!(checked > 0, "reference dump should contain at least one same-timestamp register update");
+    assert!(
+        checked > 0,
+        "reference dump should contain at least one same-timestamp register update"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -474,7 +552,10 @@ x!
     // A clock that starts unknown still has a first real edge; dropping it
     // would shift the whole run by one cycle.
     let (_d, s, _) = convert(src);
-    assert_eq!(s.rising_edges(s.handle("top.clk").unwrap()).unwrap(), vec![10, 30]);
+    assert_eq!(
+        s.rising_edges(s.handle("top.clk").unwrap()).unwrap(),
+        vec![10, 30]
+    );
 }
 
 #[test]
@@ -519,7 +600,9 @@ fn sample_before_reads_the_pre_edge_value_at_an_edge() {
 #[test]
 fn sample_before_has_no_value_before_the_first_event() {
     let (_d, s, _) = convert(BASIC);
-    let rows = s.sample_before(&[s.handle("top.clk").unwrap()], &[-1, 0, 1]).unwrap();
+    let rows = s
+        .sample_before(&[s.handle("top.clk").unwrap()], &[-1, 0, 1])
+        .unwrap();
     assert_eq!(rows[0][0], None);
     assert_eq!(rows[0][1], None);
     assert_eq!(rows[0][2].as_ref().unwrap().as_u64(), Some(0));
@@ -568,7 +651,7 @@ fn the_summary_agrees_with_the_rows_it_summarises() {
     let (_t0, t1) = s.time_range();
 
     for t in [t1, t1 + 1, t1 + 1000] {
-        let bulk = s.value_at_all(&handles, t);
+        let bulk = s.value_at_all(&handles, t).unwrap();
         let one: Vec<_> = handles.iter().map(|&h| s.value_at(h, t).unwrap()).collect();
         assert_eq!(bulk, one, "past the end at t={t}");
     }
@@ -579,7 +662,7 @@ fn the_summary_agrees_with_the_rows_it_summarises() {
 
     // Inside the trace the row-group path still runs, and still agrees.
     for t in [0, 5, 10, 20, 25, 30, 40] {
-        let bulk = s.value_at_all(&handles, t);
+        let bulk = s.value_at_all(&handles, t).unwrap();
         let one: Vec<_> = handles.iter().map(|&h| s.value_at(h, t).unwrap()).collect();
         assert_eq!(bulk, one, "inside the trace at t={t}");
     }
@@ -594,7 +677,7 @@ fn last_change_all_agrees_with_last_change_before() {
     let (_d, s, _) = convert(RAGGED);
     let (_t0, t1) = s.time_range();
     for t in [0, 15, 25, t1, t1 + 1, t1 + 1000] {
-        let bulk = s.last_change_all(t);
+        let bulk = s.last_change_all(t).unwrap();
         for h in 0..s.n_signals() as u32 {
             assert_eq!(
                 bulk[h as usize],

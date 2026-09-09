@@ -101,7 +101,10 @@ def _snippet(loc: Any, sources: dict[str, Path]) -> Snippet | None:
         return None
     name = loc["file"] if isinstance(loc, dict) else loc.file
     line = loc["line"] if isinstance(loc, dict) else loc.line
-    path = sources.get(Path(name).name)
+    path = sources.get(name)
+    if path is None:
+        matches = {p for p in sources.values() if p.name == Path(name).name}
+        path = next(iter(matches)) if len(matches) == 1 else None
     if path is None:
         return None
     text = _read_lines(path)
@@ -110,7 +113,7 @@ def _snippet(loc: Any, sources: dict[str, Path]) -> Snippet | None:
     lo = max(1, line - SNIPPET_CONTEXT)
     hi = min(len(text), line + SNIPPET_CONTEXT)
     return Snippet(
-        file=Path(name).name,
+        file=name,
         line=line,
         lines=[(n, text[n - 1], n == line) for n in range(lo, hi + 1)],
     )
@@ -269,6 +272,35 @@ def _svg(store: Any, sub: Subtrace, clock: Any) -> str:
     return "".join(parts)
 
 
+def waveform_svg(store: Any, sub: Subtrace, clock: Any) -> str:
+    """Return the causal subtrace waveform as a standalone SVG document.
+
+    The HTML report supplies these styles from its page stylesheet.  The REST
+    export route also promises an SVG artifact, so that representation must
+    carry its own styling instead of returning an apparently valid but
+    invisible collection of unstyled paths.
+    """
+    drawing = _svg(store, sub, clock)
+    if not drawing:
+        return (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 80" '
+            'role="img" aria-label="empty causal waveform">'
+            '<rect width="100%" height="100%" fill="#0E1116"/>'
+            '<text x="20" y="44" fill="#A8B4C2" '
+            'font-family="ui-monospace,monospace">No waveform events.</text></svg>'
+        )
+    style = (
+        "<style>"
+        ".wave{background:#0E1116}.sig{fill:none;stroke:#A8B4C2;stroke-width:1.4}"
+        ".bus{fill:#1C232C;stroke:#A8B4C2;stroke-width:.8}"
+        ".busv,.lbl,.axis,.busy-t{font:10px ui-monospace,monospace;fill:#A8B4C2}"
+        ".lbl{fill:#6B7785}.mark{stroke:#E8A33D;stroke-width:1;stroke-dasharray:2 3}"
+        ".busy{fill:#1C232C;stroke:#262F3A}"
+        "</style>"
+    )
+    return drawing.replace(">", f">{style}", 1)
+
+
 def _hex(bits: str, width: int) -> str:
     if not bits or any(c in "xzXZ" for c in bits):
         return bits[:8]
@@ -320,7 +352,7 @@ def build(
         query=query,
         top=top or "(unknown)",
         trace=str(trace_path) if trace_path else "(not recorded)",
-        command=command,
+        command=command or "(not recorded)",
         rtl_sha256=rtl_sha256 or "",
         version=__version__,
         generated=_dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z"),
@@ -351,8 +383,8 @@ def _nearby(findings: Any, steps: list[ChainStep]) -> list[Any]:
     out = []
     for f in getattr(findings, "findings", []):
         loc = getattr(f, "loc", None)
-        near = loc is not None and Path(loc.file).name in files and any(
-            abs(loc.line - line) <= 3 for file, line in lines if file == Path(loc.file).name
+        near = loc is not None and loc.file in files and any(
+            abs(loc.line - line) <= 3 for file, line in lines if file == loc.file
         )
         if near or (f.signal in signals):
             out.append(f)

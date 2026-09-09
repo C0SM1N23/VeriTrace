@@ -70,7 +70,11 @@ impl Bit {
 #[derive(Clone, PartialEq, Debug)]
 pub enum Value {
     /// Bit vector, LSB at index 0. `b` is empty when the value is 2-state.
-    Bits { width: u32, a: Vec<u64>, b: Vec<u64> },
+    Bits {
+        width: u32,
+        a: Vec<u64>,
+        b: Vec<u64>,
+    },
     /// `r<double>` VCD values.
     Real(f64),
     /// `s<string>` VCD values, emitted by some tools for enums.
@@ -78,7 +82,7 @@ pub enum Value {
 }
 
 pub fn words_for(width: u32) -> usize {
-    ((width as usize) + 63) / 64
+    (width as usize).div_ceil(64)
 }
 
 impl Value {
@@ -117,8 +121,8 @@ impl Value {
                     return Bit::Zero;
                 }
                 let (w, off) = ((i / 64) as usize, i % 64);
-                let pa = a.get(w).map_or(false, |x| x >> off & 1 == 1);
-                let pb = b.get(w).map_or(false, |x| x >> off & 1 == 1);
+                let pa = a.get(w).is_some_and(|x| x >> off & 1 == 1);
+                let pb = b.get(w).is_some_and(|x| x >> off & 1 == 1);
                 Bit::from_planes(pa, pb)
             }
             _ => Bit::Zero,
@@ -266,12 +270,15 @@ mod tests {
         let wide = parse_vcd_vector(b"", 4).expect("same, with a declared width");
         assert_eq!(wide.width(), 4);
         assert!((0..4).all(|i| wide.bit(i) == Bit::X));
-        assert_eq!(parse_vcd_vector(wide.to_vcd_bits().as_bytes(), 4), Some(wide));
+        assert_eq!(
+            parse_vcd_vector(wide.to_vcd_bits().as_bytes(), 4),
+            Some(wide)
+        );
     }
 
     #[test]
     fn scalar_round_trip() {
-        for c in [b'0', b'1', b'x', b'z'] {
+        for c in *b"01xz" {
             let v = parse_vcd_scalar(c).unwrap();
             assert_eq!(v.to_vcd_bits(), (c as char).to_string());
         }
@@ -316,7 +323,7 @@ mod tests {
 
     #[test]
     fn wide_vector_beyond_64_bits() {
-        let digits: Vec<u8> = std::iter::repeat(b'1').take(100).collect();
+        let digits: Vec<u8> = std::iter::repeat_n(b'1', 100).collect();
         let v = parse_vcd_vector(&digits, 100).unwrap();
         assert_eq!(v.width(), 100);
         assert!(v.is_two_state());

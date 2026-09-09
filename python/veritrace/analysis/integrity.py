@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any, Iterator
 
-from veritrace.analysis.findings import Finding, Group, Severity
+from veritrace.analysis.findings import Finding, Group, Severity, location_of
 
 CHECK = "data_mismatch"
 
@@ -23,7 +23,7 @@ CHECKS: dict[str, str] = {
 }
 
 
-def scan(report: Any, config: Any = None) -> Iterator[Finding]:
+def scan(report: Any, config: Any = None, graph: Any = None) -> Iterator[Finding]:
     """Every §8.19 mismatch, as a finding that names the bytes."""
     if report is None:
         return
@@ -36,6 +36,7 @@ def scan(report: Any, config: Any = None) -> Iterator[Finding]:
             check=CHECK,
             title=f"byte(s) {m.lane_text}{addr} changed {where} {m.where}",
             signal=m.signal,
+            loc=location_of(graph, m.signal),
             time=m.time,
             detail=m.detail,
             why=m.why,

@@ -14,6 +14,8 @@
  */
 
 import { expect, test, type Page } from "@playwright/test";
+import { readFile } from "node:fs/promises";
+import { waitForReady } from "./session";
 
 const BACKEND = process.env.VERITRACE_BACKEND ?? "http://127.0.0.1:8765";
 
@@ -25,12 +27,22 @@ test.beforeAll(async ({ request }) => {
       data: { trace_path: trace, rtl_paths: ["designs/deadlock"] },
     });
     expect(r.ok(), `could not open ${trace}: ${await r.text()}`).toBeTruthy();
-    return (await r.json()).session_id as string;
+    const sid = (await r.json()).session_id as string;
+    await waitForReady(request, BACKEND, sid);
+    return sid;
   };
   clean = await open("designs/deadlock/dump_ok.vtx");
   // Opened so the tab has a second run to offer; the picker lists what the
   // server holds (§10.1).
   await open("designs/deadlock/dump.vtx");
+});
+
+test.beforeEach(async ({ request }) => {
+  const current = await request.get(`${BACKEND}/session/${clean}/layout`);
+  const saved = await request.put(`${BACKEND}/session/${clean}/layout`, { data: {
+    ...await current.json(), diffOptions: { other: "", strategy: "cycle", anchor: "", marksA: "", marksB: "", ignore: [] },
+  } });
+  expect(saved.ok(), await saved.text()).toBeTruthy();
 });
 
 /**
@@ -50,7 +62,7 @@ async function ready(page: Page, session: string): Promise<void> {
 
 async function openDiff(page: Page): Promise<void> {
   await ready(page, clean);
-  await page.locator('[data-testid="tab-6"]').click();
+  await page.locator('[data-testid="tab-5"]').click();
   await expect(page.locator('[data-testid="diff-other"]')).toBeVisible();
 }
 
@@ -77,8 +89,8 @@ async function buggyTrace(page: Page): Promise<string> {
 
 test("the tab is built and reachable by key", async ({ page }) => {
   await ready(page, clean);
-  await page.keyboard.press("6");
-  await expect(page.locator('[data-testid="tab-6"]')).toHaveAttribute("aria-selected", "true");
+  await page.keyboard.press("5");
+  await expect(page.locator('[data-testid="tab-5"]')).toHaveAttribute("aria-selected", "true");
   await expect(page.locator('[data-testid="diff-run"]')).toBeVisible();
 });
 
@@ -125,8 +137,71 @@ test("n and p walk the divergences", async ({ page }) => {
   await expect(card).toContainText("First divergence");
   await page.keyboard.press("n");
   await expect(card).toContainText("Divergence 2 at c");
+  const selected = (await card.locator(".diff-card-sig").textContent())!.trim();
+  await expect(page.getByTestId("diff-wave")).toHaveAttribute("data-signal", selected);
+  await expect(page.locator(".diff-chain").first().locator(".diff-node").first()).toContainText(selected);
   await page.keyboard.press("p");
   await expect(card).toContainText("First divergence");
+});
+
+test("aligned real waves and regression export follow the inspected divergence", async ({ page }) => {
+  await compare(page);
+  const wave = page.getByTestId("diff-wave");
+  await expect(wave.locator("svg")).toBeVisible();
+  await expect(wave.locator('g[data-different="true"]').first()).toBeVisible();
+  const exported = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Export regression JSON" }).click();
+  const download = await exported;
+  const report = JSON.parse(await readFile((await download.path())!, "utf8"));
+  expect(report.focus).toBe((await page.locator(".diff-card-sig").textContent())!.trim());
+  expect(report.wave.signal).toBe(report.focus);
+  expect(report.wave.segments.some((s: { different: boolean }) => s.different)).toBe(true);
+  expect(report.why_a.signal).toContain(report.focus);
+  const first = wave.locator('g[data-different="true"]').first();
+  const time = Number(await first.getAttribute("data-time-a"));
+  await first.click();
+  await expect(page.getByTestId("tab-1")).toHaveAttribute("aria-selected", "true");
+  await expect.poll(async () => {
+    const layout = await page.request.get(`${BACKEND}/session/${clean}/layout`);
+    return (await layout.json()).cursors[0];
+  }).toBe(time);
+});
+
+test("manual anchors affect alignment, reject invalid marks, and survive reload", async ({ page }) => {
+  await openDiff(page);
+  await page.getByTestId("diff-other").selectOption(await buggyTrace(page));
+  await page.getByTestId("diff-strategy").selectOption("manual");
+  await page.getByLabel("Anchors A", { exact: true }).fill("0, 100");
+  await page.getByLabel("Anchors B", { exact: true }).fill("0, 100");
+  await page.getByTestId("diff-run").click();
+  await expect(page.locator(".diff-align")).toContainText("aligned on manual · 2 anchor(s)");
+  await expect(page.getByTestId("diff-first")).toContainText("at anchor");
+  await expect.poll(async () => (await (await page.request.get(`${BACKEND}/session/${clean}/layout`)).json()).diffOptions.marksA).toBe("0, 100");
+  await page.reload();
+  await page.getByTestId("tab-5").click();
+  await expect(page.getByTestId("diff-strategy")).toHaveValue("manual");
+  await expect(page.getByLabel("Anchors A", { exact: true })).toHaveValue("0, 100");
+  await page.getByLabel("Anchors A", { exact: true }).fill("0, 0");
+  await page.getByTestId("diff-run").click();
+  await expect(page.getByRole("alert")).toContainText("strictly increasing");
+  await expect(page.getByTestId("diff-first")).toHaveCount(0);
+});
+
+test("B's causal node opens B's session and native timestamp, never A's", async ({ page, context }) => {
+  await compare(page);
+  const popup = context.waitForEvent("page");
+  await page.locator(".diff-chain").nth(1).locator(".diff-node").first().click();
+  const other = await popup;
+  await other.waitForLoadState();
+  const target = new URL(other.url());
+  expect(target.searchParams.get("session")).not.toBe(clean);
+  await expect(other.getByTestId("status-range")).not.toBeEmpty();
+  await expect(other.getByTestId("tab-3")).toHaveAttribute("aria-selected", "true");
+  await expect.poll(async () => {
+    const r = await page.request.get(`${BACKEND}/session/${target.searchParams.get("session")}/layout`);
+    return (await r.json()).cursors[0];
+  }).toBe(Number(target.searchParams.get("time")));
+  await other.close();
 });
 
 test("the two chains sit side by side with one node in magenta", async ({ page }) => {
@@ -135,6 +210,26 @@ test("the two chains sit side by side with one node in magenta", async ({ page }
   await expect(chains).toHaveCount(2);
   // §11.2: magenta is the Diff tab's alone, and marks exactly one line.
   await expect(page.locator(".diff-node.parted")).toHaveCount(2);
+});
+
+test("a failed focus request keeps the previous answer coherent and can be retried", async ({ page }) => {
+  await compare(page);
+  const card = page.getByTestId("diff-first");
+  const first = (await card.locator(".diff-card-sig").textContent())!.trim();
+  // Inject only a transport failure; both the baseline and retry use the real
+  // backend, native stores, alignment and causal analysis.
+  await page.route("**/session/*/diff", (route) => route.fulfill({
+    status: 503, contentType: "application/json", body: JSON.stringify({ detail: "temporary backend failure" }),
+  }), { times: 1 });
+  await page.keyboard.press("n");
+  await expect(page.getByRole("alert")).toContainText("temporary backend failure");
+  await expect(card.locator(".diff-card-sig")).toHaveText(first);
+  await expect(page.getByTestId("diff-wave")).toHaveAttribute("data-signal", first);
+  await expect(page.locator(".diff-chain").first().locator(".diff-node").first()).toContainText(first);
+  await page.keyboard.press("n");
+  await expect(card).toContainText("Divergence 2 at c");
+  await expect(card.locator(".diff-card-sig")).not.toHaveText(first);
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
 test("ignoring a signal takes it out and compares again", async ({ page }) => {

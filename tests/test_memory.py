@@ -2,7 +2,7 @@
 
 The two acceptance criteria of Prompt 11 are the first two sections:
 
-1. all four injected timing violations are detected with the exact cycle and
+1. the real injected timing violations are detected with the exact cycle and
    the correct constraint — and the *same RTL compiled clean* produces none,
    which is the half that proves the checker measures the design rather than
    announcing itself;
@@ -33,8 +33,9 @@ from veritrace.protocol import engine, pack
 
 DESIGNS = Path(__file__).resolve().parents[1] / "designs"
 
-#: The four categories Prompt 11 names, one injected violation each.
-INJECTED = {"tRCD", "tRP", "tRFC", "tFAW"}
+#: The fixture's four-ACTIVATE burst is legal for tFAW. It used to be a
+#: false-positive golden; real fifth-activation violations are tested below.
+INJECTED = {"tRCD", "tRP", "tRFC"}
 
 
 def _open(vcd: str, tmp_path_factory):
@@ -87,7 +88,7 @@ def test_every_command_in_the_pack_is_decoded(violating):
     assert rd.fields["col"] == 0x030 and rd.fields["ap"] == 0
 
 
-def test_all_four_injected_violations_are_found(violating):
+def test_injected_violations_are_found_without_blaming_four_legal_activations(violating):
     """Prompt 11's first acceptance criterion."""
     _store, _clock, _analysis, reports = violating
     found = {v.constraint for v in reports[0].violations}
@@ -105,7 +106,6 @@ def test_all_four_injected_violations_are_found(violating):
         ("tRCD", 9, 1, 2, 0),
         ("tRP", 15, 1, 2, 0),
         ("tRFC", 29, 6, 7, None),
-        ("tFAW", 44, 7, 8, None),
     ],
 )
 def test_each_violation_names_the_exact_cycle_and_constraint(
@@ -127,7 +127,7 @@ def test_each_violation_names_the_exact_cycle_and_constraint(
 
 def test_the_same_design_compiled_clean_has_no_violations(clean):
     """The half that makes the checker worth having: "none found" has to be as
-    trustworthy as "four found", or it is a horoscope."""
+    trustworthy as a positive finding."""
     _store, _clock, _analysis, reports = clean
     assert len(reports) == 1
     assert reports[0].violations == []
@@ -257,7 +257,8 @@ def test_trc_is_checked_across_the_precharge_between_two_activates():
         cmd(45, "ACTIVATE", bank=0, row=2),
     ]
     hits = [v for v in banks._same_bank_violations(seq, 0, u, None) if v.constraint == "tRC"]
-    assert len(hits) == 1 and hits[0].measured_cycles == 45
+    assert len(hits) == 1 and hits[0].measured_ticks == 45
+    assert hits[0].measured_cycles is None  # No clock, no fabricated cycles.
 
 
 def test_trrd_measures_against_the_last_different_bank_activate():
@@ -270,7 +271,22 @@ def test_trrd_measures_against_the_last_different_bank_activate():
         cmd(2, "ACTIVATE", bank=1),
     ]
     hits = [v for v in banks._device_wide_violations(acts, u, None) if v.constraint == "tRRD"]
-    assert len(hits) == 1 and hits[0].measured_cycles == 1
+    assert len(hits) == 1 and hits[0].measured_ticks == 1
+    assert hits[0].measured_cycles is None
+
+
+def test_fractional_limits_do_not_round_away_a_real_timing_violation():
+    from dataclasses import replace
+
+    chip = replace(timing.find("mt48lc16m16a2"), tRCD=20.5, tREFI=100.5)
+    clock = clocks.Clock("tb.clk", 0, list(range(0, 201, 10)))
+    commands = [cmd(0, "ACTIVATE", bank=0), cmd(20, "READ", bank=0),
+                cmd(40, "REFRESH"), cmd(141, "REFRESH")]
+    violations, _, _ = banks.check_timing(commands, 1, chip, "1ns", clock)
+    rcd = next(v for v in violations if v.constraint == "tRCD")
+    assert (rcd.measured_ticks, rcd.limit_ticks, rcd.limit_cycles) == (20, 21, 3)
+    refi = next(v for v in violations if v.constraint == "tREFI")
+    assert (refi.measured_ticks, refi.limit_ticks, refi.limit_cycles) == (101, 100, 10)
 
 
 def test_trefi_is_a_maximum_not_a_minimum():
@@ -440,3 +456,45 @@ def test_the_shipped_chip_file_carries_every_constraint():
 def test_a_chip_file_missing_a_parameter_is_refused():
     with pytest.raises(timing.TimingError, match="missing timing parameter"):
         timing.loads('name = "X"\ntRCD = 20\n')
+
+
+@pytest.mark.parametrize("field,value", [("tRCD", "nan"), ("tRFC", "inf"),
+                                        ("CL", "2.5"), ("CWL", "true")])
+def test_invalid_timing_values_are_rejected(field, value):
+    source = timing.find("mt48lc16m16a2").path.read_text()
+    import re
+    changed = re.sub(rf"(?m)^{field}\s*=.*$", f"{field} = {value}", source)
+    with pytest.raises(timing.TimingError, match="finite|whole number"):
+        timing.loads(changed)
+
+
+def test_tfaw_allows_four_activates_and_checks_the_fifth_at_the_exact_boundary():
+    limits = banks._Units(tFAW=100)
+    four = [cmd(t, "ACTIVATE", bank=i) for i, t in enumerate([0, 10, 20, 30])]
+    assert not [v for v in banks._device_wide_violations(four, limits, None) if v.constraint == "tFAW"]
+    for at, expected in [(99, 1), (100, 0)]:
+        five = four + [cmd(at, "ACTIVATE", bank=0)]
+        hits = [v for v in banks._device_wide_violations(five, limits, None) if v.constraint == "tFAW"]
+        assert len(hits) == expected
+        if hits:
+            assert hits[0].first.time == 0 and hits[0].second.time == 99
+
+
+def test_missing_command_pairs_are_not_reported_as_conformant():
+    chip = timing.find("mt48lc16m16a2")
+    violations, checked, skipped = banks.check_timing([cmd(0, "ACTIVATE", bank=0)], 1,
+                                                     chip, "1ns", None)
+    assert not violations and not checked
+    assert set(timing.NS_FIELDS) <= skipped.keys()
+    assert "no qualifying" in skipped["tREFI"]
+
+
+def test_command_only_write_recovery_and_auto_precharge_are_qualified():
+    chip = timing.find("mt48lc16m16a2")
+    commands = [cmd(0, "ACTIVATE", bank=0), cmd(100, "WRITE", bank=0, ap=1),
+                cmd(1000, "PRECHARGE", bank=0)]
+    violations, checked, skipped = banks.check_timing(commands, 1, chip, "1ns", None)
+    assert not violations
+    assert "tWR" not in checked
+    assert "last write data beat" in skipped["tWR"]
+    assert "auto-precharge" in skipped

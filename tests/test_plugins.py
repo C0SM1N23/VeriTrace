@@ -17,12 +17,13 @@ support.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from conftest import design_store
+from conftest import design_store, make_vtx
 from click.testing import CliRunner
 
 from veritrace import simulate
@@ -398,6 +399,229 @@ def test_a_plugin_whose_needs_are_unmet_is_not_run_and_says_why(tmp_path):
     assert "transactions" in got.skipped["needs_bus"]
 
 
+def test_project_plugin_replaces_a_user_plugin_with_the_same_name(tmp_path, monkeypatch):
+    """Discovery order promised an override but used to run both classes."""
+    from veritrace import plugin as plugin_mod
+
+    user = tmp_path / "user"
+    project = tmp_path / "project"
+    user.mkdir()
+    (project / "plugins").mkdir(parents=True)
+    template = (
+        "from veritrace.plugin import Analysis, register\n"
+        "@register\n"
+        "class Same(Analysis):\n"
+        "    name = 'same'\n"
+        "    description = {description!r}\n"
+        "    def run(self, ctx): return iter(())\n"
+    )
+    (user / "same.py").write_text(template.format(description="user"), encoding="utf-8")
+    (project / "plugins" / "same.py").write_text(
+        template.format(description="project"), encoding="utf-8"
+    )
+    monkeypatch.setattr(plugin_mod, "USER_DIR", user)
+
+    found, errors = plugin_mod.discover(project)
+    assert errors == {}
+    assert [(p.name, p.description) for p in found] == [("same", "project")]
+
+
+def test_discovery_does_not_leak_plugins_into_the_next_project(tmp_path, monkeypatch):
+    """A server process may open many unrelated projects in its lifetime."""
+    from veritrace import plugin as plugin_mod
+
+    monkeypatch.setattr(plugin_mod, "USER_DIR", tmp_path / "no-user-plugins")
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    (first / "plugins").mkdir(parents=True)
+    (second / "plugins").mkdir(parents=True)
+    (first / "plugins" / "only_first.py").write_text(
+        "from veritrace.plugin import Analysis, Exporter, register\n"
+        "@register\n"
+        "class OnlyFirst(Analysis):\n"
+        "    name = 'only-first'\n"
+        "    def run(self, ctx): return iter(())\n"
+        "@register\n"
+        "class FirstFormat(Exporter):\n"
+        "    name = 'first-format'\n"
+        "    def render(self, ctx): return 'first'\n",
+        encoding="utf-8",
+    )
+
+    found, errors = plugin_mod.discover(first)
+    assert errors == {}
+    assert [cls.name for cls in found] == ["only-first"]
+    assert [cls.name for cls in plugin_mod.exporters()] == ["first-format"]
+
+    found, errors = plugin_mod.discover(second)
+    assert errors == {}
+    assert found == []
+    assert plugin_mod.exporters() == []
+
+
+def test_checks_path_does_not_run_a_previous_projects_plugin(tmp_path, monkeypatch):
+    """Exercise the production Checks orchestration, not only discovery."""
+    from veritrace import TraceStore, clocks
+    from veritrace import plugin as plugin_mod
+    from veritrace.analysis import checks as checks_mod
+    from veritrace.config import Config
+
+    monkeypatch.setattr(plugin_mod, "USER_DIR", tmp_path / "no-user-plugins")
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    (first / "plugins").mkdir(parents=True)
+    second.mkdir()
+    (first / "plugins" / "first_check.py").write_text(
+        "from veritrace.plugin import Analysis, register\n"
+        "@register\n"
+        "class FirstCheck(Analysis):\n"
+        "    name = 'first-check'\n"
+        "    def run(self, ctx): yield ctx.finding('belongs only to first')\n",
+        encoding="utf-8",
+    )
+    store = TraceStore(str(design_store("fsm")))
+
+    first_report = checks_mod.run_all(
+        store,
+        clock=clocks.resolve(store),
+        config=Config.empty(first),
+        project_root=first,
+    )
+    second_report = checks_mod.run_all(
+        store,
+        clock=clocks.resolve(store),
+        config=Config.empty(second),
+        project_root=second,
+    )
+
+    assert any(f.check == "plugin.first-check" for f in first_report.findings)
+    assert all(f.check != "plugin.first-check" for f in second_report.findings)
+
+
+def test_failed_plugin_file_cannot_leave_a_registered_ghost(tmp_path, monkeypatch):
+    """Registration followed by an import error must roll back the whole file."""
+    from veritrace import plugin as plugin_mod
+
+    monkeypatch.setattr(plugin_mod, "USER_DIR", tmp_path / "no-user-plugins")
+    project = tmp_path / "project"
+    (project / "plugins").mkdir(parents=True)
+    (project / "plugins" / "partial.py").write_text(
+        "from veritrace.plugin import Analysis, Exporter, register\n"
+        "@register\n"
+        "class GhostAnalysis(Analysis):\n"
+        "    name = 'ghost-analysis'\n"
+        "    def run(self, ctx): return iter(())\n"
+        "@register\n"
+        "class GhostExporter(Exporter):\n"
+        "    name = 'ghost-exporter'\n"
+        "    def render(self, ctx): return 'must not run'\n"
+        "raise RuntimeError('failed after registration')\n",
+        encoding="utf-8",
+    )
+
+    found, errors = plugin_mod.discover(project)
+
+    assert found == []
+    assert plugin_mod.exporters() == []
+    assert "failed after registration" in errors["partial.py"]
+
+
+def test_concurrent_project_discovery_and_export_are_context_isolated(
+    tmp_path, monkeypatch
+):
+    """Two API workers cannot replace each other's catalog mid-operation."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from veritrace import plugin as plugin_mod
+
+    monkeypatch.setattr(plugin_mod, "USER_DIR", tmp_path / "no-user-plugins")
+    projects: dict[str, Path] = {}
+    template = (
+        "from veritrace.plugin import Analysis, Exporter, register\n"
+        "@register\n"
+        "class ProjectAnalysis(Analysis):\n"
+        "    name = 'project-analysis'\n"
+        "    description = {label!r}\n"
+        "    def run(self, ctx): return iter(())\n"
+        "@register\n"
+        "class ProjectFormat(Exporter):\n"
+        "    name = 'project-format'\n"
+        "    description = {label!r}\n"
+        "    def render(self, ctx): return {label!r}\n"
+    )
+    for label in ("alpha", "beta"):
+        project = tmp_path / label
+        (project / "plugins").mkdir(parents=True)
+        (project / "plugins" / "project.py").write_text(
+            template.format(label=label), encoding="utf-8"
+        )
+        projects[label] = project
+
+    entered = Barrier(2)
+    imported = Barrier(2)
+    real_import = plugin_mod._import
+
+    def overlapping_import(path):
+        entered.wait(timeout=5)
+        real_import(path)
+        # Both files are now registered before either discover() snapshots its
+        # catalog. A shared process-wide registry deterministically mixes them.
+        imported.wait(timeout=5)
+
+    monkeypatch.setattr(plugin_mod, "_import", overlapping_import)
+
+    def load_and_render(label):
+        found, errors = plugin_mod.discover(projects[label])
+        exporters = plugin_mod.exporters()
+        assert errors == {}
+        assert len(found) == 1
+        assert len(exporters) == 1
+        return found[0].description, plugin_mod.run_exporter(exporters[0])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = {label: pool.submit(load_and_render, label) for label in projects}
+        results = {label: future.result(timeout=10) for label, future in futures.items()}
+
+    assert results == {"alpha": ("alpha", "alpha"), "beta": ("beta", "beta")}
+
+
+def test_declared_plugin_capabilities_reach_the_real_checks_path(tmp_path):
+    """coverage/memory/performance were advertised but never wired by check()."""
+    from veritrace import TraceStore, clocks
+    from veritrace.analysis import checks as checks_mod
+    from veritrace.config import Config
+
+    project = tmp_path / "project"
+    (project / "plugins").mkdir(parents=True)
+    (project / "plugins" / "caps.py").write_text(
+        "from veritrace.plugin import Analysis, register\n"
+        "@register\n"
+        "class Caps(Analysis):\n"
+        "    name = 'caps'\n"
+        "    needs = ['coverage', 'memory', 'performance']\n"
+        "    def run(self, ctx):\n"
+        "        assert ctx.coverage is not None\n"
+        "        assert ctx.memory\n"
+        "        assert ctx.performance is not None\n"
+        "        yield ctx.finding('all capabilities arrived')\n",
+        encoding="utf-8",
+    )
+    store = TraceStore(str(design_store("fifo_buggy")))
+    cfg = Config.empty(project)
+    report = checks_mod.run_all(
+        store,
+        clock=clocks.resolve(store),
+        config=cfg,
+        project_root=project,
+        coverage_report=object(),
+        memory_reports=[object()],
+        performance_report=object(),
+    )
+    assert any(f.check == "plugin.caps" for f in report.findings)
+    assert "plugin:caps" not in report.skipped
+
+
 def test_a_plugin_that_raises_is_a_skip_not_a_broken_tab(tmp_path):
     from veritrace import plugin as plugin_mod
 
@@ -522,3 +746,127 @@ def test_the_command_says_when_there_are_none(tmp_path):
     got = CliRunner().invoke(main, ["plugins", "--root", str(tmp_path)])
     assert got.exit_code == 0, got.output
     assert "no plugins found" in got.output
+
+
+_EXPORTER_FROM_THE_DOCS = '''
+import json
+from veritrace.plugin import Exporter, register
+
+@register
+class SignalJson(Exporter):
+    name = "signal-json"
+    needs = ["trace"]
+    description = "Signal inventory"
+    extension = ".json"
+
+    def render(self, ctx):
+        return json.dumps({
+            "trace_sha256": ctx.metadata["trace_sha256"],
+            "query": ctx.query,
+            "signals": [s.path for s in ctx.signals()],
+        }, sort_keys=True)
+'''
+
+
+def test_exporter_from_documentation_runs_through_real_cli(tmp_path, monkeypatch):
+    """§13.7's third extension point was previously only a sentence in SPEC."""
+    project = tmp_path / "project"
+    (project / "plugins").mkdir(parents=True)
+    (project / "plugins" / "signal_json.py").write_text(
+        _EXPORTER_FROM_THE_DOCS, encoding="utf-8"
+    )
+    trace = make_vtx(project)
+    output = project / "signals.json"
+    monkeypatch.chdir(project)
+
+    got = CliRunner().invoke(
+        main,
+        ["export", str(trace), "--format", "signal-json", "-o", str(output)],
+    )
+
+    assert got.exit_code == 0, got.output
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["query"] is None
+    assert payload["trace_sha256"]
+    assert "tb.clk" in payload["signals"]
+    assert "signal-json ->" in got.output
+
+
+def test_exporter_from_documentation_runs_through_real_api(tmp_path, monkeypatch):
+    """§13.7's exporter is reachable from the public §10.1 route too."""
+    from fastapi.testclient import TestClient
+
+    from veritrace.api import create_app
+
+    project = tmp_path / "project"
+    (project / "plugins").mkdir(parents=True)
+    (project / "plugins" / "signal_json.py").write_text(
+        _EXPORTER_FROM_THE_DOCS, encoding="utf-8"
+    )
+    (project / ".veritrace.toml").write_text("[design]\n", encoding="utf-8")
+    trace = make_vtx(project)
+    monkeypatch.chdir(project)
+
+    with TestClient(create_app(default_trace=trace)) as client:
+        sid = client.get("/", headers={"Accept": "application/json"}).json()[
+            "default_session"
+        ]
+        got = client.post(
+            f"/session/{sid}/export", json={"kind": "signal-json"}
+        )
+
+    assert got.status_code == 200, got.text
+    assert got.headers["content-type"].startswith("application/json")
+    assert "attachment" in got.headers["content-disposition"]
+    payload = got.json()
+    assert payload["trace_sha256"]
+    assert "tb.clk" in payload["signals"]
+
+
+def test_failing_exporter_does_not_clobber_existing_report(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    (project / "plugins").mkdir(parents=True)
+    (project / "plugins" / "broken.py").write_text(
+        "from veritrace.plugin import Exporter, register\n"
+        "@register\n"
+        "class Broken(Exporter):\n"
+        "    name = 'broken'\n"
+        "    needs = ['trace']\n"
+        "    def render(self, ctx): raise RuntimeError('deliberate exporter failure')\n",
+        encoding="utf-8",
+    )
+    trace = make_vtx(project)
+    output = project / "report.txt"
+    output.write_text("previous valid report", encoding="utf-8")
+    monkeypatch.chdir(project)
+
+    got = CliRunner().invoke(
+        main,
+        ["export", str(trace), "--format", "broken", "-o", str(output)],
+    )
+
+    assert got.exit_code != 0
+    assert "deliberate exporter failure" in got.output
+    assert output.read_text(encoding="utf-8") == "previous valid report"
+
+
+def test_plugins_command_lists_exporters(tmp_path):
+    project = tmp_path / "project"
+    (project / "plugins").mkdir(parents=True)
+    (project / "plugins" / "signal_json.py").write_text(
+        _EXPORTER_FROM_THE_DOCS, encoding="utf-8"
+    )
+
+    got = CliRunner().invoke(main, ["plugins", "--root", str(project), "--json"])
+
+    assert got.exit_code == 0, got.output
+    payload = json.loads(got.output)
+    assert payload["plugins"] == []
+    assert payload["exporters"] == [
+        {
+            "name": "signal-json",
+            "needs": ["trace"],
+            "description": "Signal inventory",
+            "extension": ".json",
+        }
+    ]

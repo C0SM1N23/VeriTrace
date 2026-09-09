@@ -131,7 +131,7 @@ test("the injected corruption reaches Checks as an ordinary finding", async ({ p
   // Prompt 12's first acceptance criterion, through the interface: §8.19 says
   // mismatches are findings, so they arrive with the stuck signals.
   await ready(page, corrupted);
-  await page.locator('[data-testid="tab-5"]').click();
+  await page.locator('[data-testid="tab-6"]').click();
   const rows = page.locator('[data-testid="check-row"]', { hasText: "byte(s) 0-1" });
   await expect(rows.first()).toBeVisible();
   await expect(rows.first()).toContainText("dma.s_axi");
@@ -139,7 +139,7 @@ test("the injected corruption reaches Checks as an ordinary finding", async ({ p
 
 test("the same design with the bug compiled out reports no corruption", async ({ page }) => {
   await ready(page, clean);
-  await page.locator('[data-testid="tab-5"]').click();
+  await page.locator('[data-testid="tab-6"]').click();
   await expect(page.locator('[data-testid="checks-tab"]')).toBeVisible();
   await expect(
     page.locator('[data-testid="check-row"]', { hasText: "byte(s)" }),

@@ -60,7 +60,7 @@ test("a plugin's table becomes a tab nobody wired up", async ({ page }) => {
 
 test("a plugin's findings land in the Checks tab", async ({ page }) => {
   await ready(page);
-  await page.locator('[data-testid="tab-5"]').click();
+  await page.locator('[data-testid="tab-6"]').click();
   await expect(page.locator('[data-testid="checks-tab"]')).toBeVisible();
   // §13.7: "Constatarile aparute apar automat in tab-ul Checks."
   const row = page.locator('[data-check="plugin.state_dwell"]').first();
@@ -79,18 +79,15 @@ test("the FSM slot says where the feature went rather than that it is missing", 
   await expect(slot).toHaveAttribute("title", /mode of the Source tab/);
 });
 
-test("the plugins group has a section in Checks", async ({ page }) => {
+test("the plugins group has a section in Checks", async ({ page, request }) => {
   await ready(page);
-  await page.locator('[data-testid="tab-5"]').click();
+  await page.locator('[data-testid="tab-6"]').click();
   await expect(page.locator('[data-testid="checks-tab"]')).toBeVisible();
   // Not present on this design, but the section must exist in the table that
   // maps groups to headings — a group the server can emit and the UI cannot
   // render is a finding that vanishes between the API and the screen.
-  const groups = await page.evaluate(async (s) => {
-    const r = await fetch(`/api/session/${s}/checks`, {
-      headers: { Accept: "application/json" },
-    });
-    return Object.keys((await r.json()).groups ?? {});
-  }, session);
+  const response = await request.get(`${BACKEND}/session/${session}/checks`);
+  expect(response.ok()).toBeTruthy();
+  const groups = Object.keys((await response.json()).groups ?? {});
   expect(groups).toContain("fsm");
 });

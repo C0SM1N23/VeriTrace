@@ -34,12 +34,9 @@ from veritrace.clocks import Clock
 from veritrace.graph.model import (
     Const,
     DesignGraph,
-    Driver,
     DriverKind,
     Kind,
     Ref,
-    Signal,
-    SignalId,
     refs,
     to_text,
 )

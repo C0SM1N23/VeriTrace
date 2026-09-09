@@ -30,7 +30,7 @@ from veritrace.correlate.resolver import correlate
 from veritrace.coverage import code, functional, query as cov_query, report as cov_report
 from veritrace.coverage.code import CoverageError
 from veritrace.graph.elaborate import discover, elaborate
-from veritrace.protocol import engine, pack
+from veritrace.protocol import engine
 
 DESIGNS = Path(__file__).resolve().parents[1] / "designs"
 

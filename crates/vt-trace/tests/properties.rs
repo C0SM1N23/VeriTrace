@@ -53,7 +53,11 @@ fn render_vcd(groups: &[Group]) -> String {
         if *w == 1 {
             s.push_str(&format!("$var wire 1 {} s{i} $end\n", CODES[i]));
         } else {
-            s.push_str(&format!("$var wire {w} {} s{i} [{}:0] $end\n", CODES[i], w - 1));
+            s.push_str(&format!(
+                "$var wire {w} {} s{i} [{}:0] $end\n",
+                CODES[i],
+                w - 1
+            ));
         }
     }
     s.push_str("$upscope $end\n$enddefinitions $end\n");
@@ -83,11 +87,17 @@ fn reference(groups: &[Group]) -> Vec<Vec<(i64, Value)>> {
 }
 
 fn ref_value_at(events: &[(i64, Value)], t: i64) -> Option<Value> {
-    events.iter().filter(|(et, _)| *et <= t).next_back().map(|(_, v)| v.clone())
+    events
+        .iter()
+        .rfind(|(et, _)| *et <= t)
+        .map(|(_, v)| v.clone())
 }
 
 fn ref_value_before(events: &[(i64, Value)], t: i64) -> Option<Value> {
-    events.iter().filter(|(et, _)| *et < t).next_back().map(|(_, v)| v.clone())
+    events
+        .iter()
+        .rfind(|(et, _)| *et < t)
+        .map(|(_, v)| v.clone())
 }
 
 struct Fixture {
@@ -106,7 +116,10 @@ fn build(groups: &[Group]) -> Fixture {
 
 /// Every timestamp in the trace plus the gaps and edges around it.
 fn probe_times(groups: &[Group]) -> Vec<i64> {
-    let mut ts: Vec<i64> = groups.iter().flat_map(|(t, _)| [*t - 1, *t, *t + 1]).collect();
+    let mut ts: Vec<i64> = groups
+        .iter()
+        .flat_map(|(t, _)| [*t - 1, *t, *t + 1])
+        .collect();
     ts.push(-1);
     ts.push(groups.last().map(|(t, _)| *t + 50).unwrap_or(0));
     ts.sort_unstable();
@@ -327,12 +340,23 @@ fn parallel_parse_matches_the_serial_parse() {
     let serial = vcd::parse_reader(std::io::Cursor::new(text.as_bytes())).unwrap();
 
     assert_eq!(parallel.streams.len(), serial.streams.len());
-    assert_eq!((parallel.t_min, parallel.t_max), (serial.t_min, serial.t_max));
-    for (i, (p, s)) in parallel.streams.iter().zip(serial.streams.iter()).enumerate() {
+    assert_eq!(
+        (parallel.t_min, parallel.t_max),
+        (serial.t_min, serial.t_max)
+    );
+    for (i, (p, s)) in parallel
+        .streams
+        .iter()
+        .zip(serial.streams.iter())
+        .enumerate()
+    {
         assert_eq!(p.times, s.times, "stream {i}: times");
         assert_eq!(p.deltas, s.deltas, "stream {i}: delta indices");
         assert_eq!(p.len(), s.len(), "stream {i}: event count");
     }
     // And the values themselves, through the store the rest of the tool reads.
-    assert_eq!(reconstruct::from_trace(&parallel), reconstruct::from_trace(&serial));
+    assert_eq!(
+        reconstruct::from_trace(&parallel),
+        reconstruct::from_trace(&serial)
+    );
 }

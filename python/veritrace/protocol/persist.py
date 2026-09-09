@@ -22,18 +22,18 @@ import hashlib
 import json
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from veritrace._native import read_txn_table, write_txn_table
 from veritrace.clocks import Clock
 from veritrace.perf.model import CyclePerf
-from veritrace.protocol.model import Beat, Extraction, Interface, Transaction, Violation
+from veritrace.protocol.model import Beat, ChannelEvent, Extraction, Interface, Transaction, Violation
 
 #: Bumped when the columns or the assembly semantics change, so an old table is
 #: rebuilt instead of being read with today's assumptions.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 8
 
 #: Columns every table has, whatever the protocol. Kept first and in this order
 #: so a `SELECT *` is readable without knowing the pack.
@@ -82,6 +82,16 @@ def beats_path(trace_path: Path, iface: str) -> Path:
     own — `read_parquet(".../mem.beats.parquet")` is every byte the bus moved.
     """
     return txn_dir(trace_path) / f"{_safe(iface)}.beats.parquet"
+
+
+def events_path(trace_path: Path, iface: str) -> Path:
+    """Accepted channel events with their transaction owner and sampled payload."""
+    return txn_dir(trace_path) / f"{_safe(iface)}.events.parquet"
+
+
+def payload_path(trace_path: Path, iface: str) -> Path:
+    """Lossless transaction/beat payload, separate from readable export columns."""
+    return txn_dir(trace_path) / f"{_safe(iface)}.payload.parquet"
 
 
 #: Columns of the per-cycle profile, in `CyclePerf` field order.
@@ -151,7 +161,12 @@ def to_columns(
     return columns, origin
 
 
-def _stamp(store: Any, iface: Interface) -> dict[str, Any]:
+def _stamp(
+    store: Any,
+    iface: Interface,
+    clock: Clock | None = None,
+    config: Any = None,
+) -> dict[str, Any]:
     """Everything whose change would invalidate the table."""
     pack = iface.pack
     body = ""
@@ -167,6 +182,23 @@ def _stamp(store: Any, iface: Interface) -> dict[str, Any]:
         "pack": pack.slug,
         "pack_sha256": hashlib.sha256(body.encode()).hexdigest()[:16],
         "signals": sorted(iface.signals.values()),
+        # These are analysis inputs just as surely as the payload signals are.
+        # Omitting them let a user correct reset polarity or select another
+        # clock and receive yesterday's transaction table unchanged.
+        "clock": (
+            None
+            if clock is None
+            else {
+                "path": clock.path,
+                "handle": clock.handle,
+                "first": clock.edges[0] if clock.edges else None,
+                "last": clock.edges[-1] if clock.edges else None,
+                "edges": len(clock.edges),
+            }
+        ),
+        "interface_clock": iface.clock,
+        "interface_reset": iface.reset,
+        "reset_active": getattr(config, "reset_active", None),
     }
 
 
@@ -205,21 +237,60 @@ class Cache:
             tmp.replace(self.path)
 
 
-def is_fresh(trace_path: Path, store: Any, iface: Interface) -> bool:
+def is_fresh(
+    trace_path: Path,
+    store: Any,
+    iface: Interface,
+    clock: Clock | None = None,
+    config: Any = None,
+) -> bool:
     """True when the table on disk was built from exactly this input."""
     entry = (Cache.for_trace(trace_path).load().get("interfaces") or {}).get(iface.name)
     if not entry:
         return False
-    return entry.get("stamp") == _stamp(store, iface) and table_path(trace_path, iface.name).is_file()
+    return entry.get("stamp") == _stamp(store, iface, clock, config) and table_path(trace_path, iface.name).is_file()
 
 
 def write(
-    trace_path: Path, store: Any, extraction: Extraction, clock: Clock | None
+    trace_path: Path,
+    store: Any,
+    extraction: Extraction,
+    clock: Clock | None,
+    config: Any = None,
 ) -> Path:
     """Write one interface's table and stamp it. Returns the file written."""
     out = table_path(trace_path, extraction.interface.name)
     columns, origin = to_columns(extraction, clock)
     write_txn_table(str(out), columns)
+
+    # The public table is a columnar projection: heterogeneous numeric/X
+    # columns become strings, absent fields become null, and conflicting field
+    # names get prefixes. None of those transformations may change a reopened
+    # session's semantics, so retain the exact typed dictionaries separately.
+    payloads = [("txn", txn.ref, {"id": txn.id, "fields": txn.fields, "metrics": txn.metrics})
+                for txn in extraction.transactions]
+    payloads.extend(("beat", str(i), asdict(beat)) for i, beat in enumerate(extraction.beats))
+    write_txn_table(str(payload_path(trace_path, extraction.interface.name)), [
+        ("kind", [kind for kind, _, _ in payloads]),
+        ("owner", [owner for _, owner, _ in payloads]),
+        ("payload", [json.dumps(payload) for _, _, payload in payloads]),
+    ])
+
+    events = [(txn.ref, event) for txn in extraction.transactions for event in txn.events]
+    write_txn_table(
+        str(events_path(trace_path, extraction.interface.name)),
+        [
+            ("txn", [ref for ref, _ in events]),
+            ("channel", [e.channel for _, e in events]),
+            ("time", [e.time for _, e in events]),
+            ("assert_time", [e.assert_time for _, e in events]),
+            ("stall", [e.stall for _, e in events]),
+            # JSON preserves both four-state strings and wide integers, plus
+            # absent versus explicitly unknown payload fields, without guessing
+            # their types from the values on other channel rows.
+            ("fields", [json.dumps(e.fields, sort_keys=True) for _, e in events]),
+        ],
+    )
 
     perf = extraction.perf
     if perf is not None and len(perf):
@@ -244,8 +315,10 @@ def write(
     Cache.for_trace(trace_path).update(
         extraction.interface.name,
         {
-            "stamp": _stamp(store, extraction.interface),
+            "stamp": _stamp(store, extraction.interface, clock, config),
             "n_beats": len(extraction.beats),
+            "n_transactions": len(extraction.transactions),
+            "n_txn_events": len(events),
             "file": out.name,
             "columns": origin,
             # The profile's own names, which the columnar file cannot carry:
@@ -271,20 +344,42 @@ def write(
     return out
 
 
-def restore(trace_path: Path, store: Any, iface: Interface) -> Extraction | None:
+def restore(
+    trace_path: Path,
+    store: Any,
+    iface: Interface,
+    clock: Clock | None = None,
+    config: Any = None,
+) -> Extraction | None:
     """Rebuild an extraction from a table that is still valid, or `None`.
 
-    The per-beat events are not restored — nothing outside the assembler reads
-    them — so a caller that needs them asks for a re-extraction explicitly.
+    Channel events are part of the cached result: throughput, burst efficiency,
+    and transaction export consume them after the assembler has finished.
     """
-    if not is_fresh(trace_path, store, iface):
+    if not is_fresh(trace_path, store, iface, clock, config):
         return None
     entry = (Cache.for_trace(trace_path).load().get("interfaces") or {})[iface.name]
     path = table_path(trace_path, iface.name)
     try:
         txns = load_transactions(path, iface.name, entry.get("columns"))
+        if len(txns) != entry["n_transactions"]:
+            return None
+        _restore_events(events_path(trace_path, iface.name), txns, entry["n_txn_events"])
+        expected_beats = int(entry["n_beats"])
+        restored_beats = _restore_beats(trace_path, iface, expected_beats)
+        exact_beats = _restore_payload(payload_path(trace_path, iface.name), txns, expected_beats)
+        restored_perf = _restore_perf(trace_path, iface, entry.get("perf"))
     except Exception:  # noqa: BLE001 - a damaged cache must not close the session
         return None
+    # The cache is one semantic result spread over three columnar files.  A
+    # valid transaction table beside a missing profile/beat table is not a
+    # partial success: reusing it would make Performance or Integrity claim the
+    # design did nothing.  Re-extract from the trace instead.
+    if expected_beats and len(restored_beats) != expected_beats:
+        return None
+    if isinstance(entry.get("perf"), dict) and restored_perf is None:
+        return None
+
     ex = Extraction(
         interface=iface,
         transactions=txns,
@@ -294,8 +389,8 @@ def restore(trace_path: Path, store: Any, iface: Interface) -> Extraction | None
         n_matched=int(entry.get("n_matched") or 0),
         skipped=dict(entry.get("skipped") or {}),
         parquet=str(path),
-        perf=_restore_perf(trace_path, iface, entry.get("perf")),
-        beats=_restore_beats(trace_path, iface, int(entry.get("n_beats") or 0)),
+        perf=restored_perf,
+        beats=exact_beats,
     )
     by_ref = ex.by_ref()
     for v in ex.violations:
@@ -303,6 +398,52 @@ def restore(trace_path: Path, store: Any, iface: Interface) -> Extraction | None
         if txn is not None:
             txn.violations.append(v)
     return ex
+
+
+def _restore_payload(path: Path, transactions: list[Transaction], n_beats: int) -> list[Beat]:
+    cols = read(path)
+    if any(len(cols[name]) != len(transactions) + n_beats for name in ("kind", "owner", "payload")):
+        raise ValueError("incomplete transaction payload cache")
+    by_ref = {txn.ref: txn for txn in transactions}
+    seen: set[str] = set()
+    beats: dict[int, Beat] = {}
+    for kind, ref, raw in zip(cols["kind"], cols["owner"], cols["payload"], strict=True):
+        payload = json.loads(raw)
+        if kind == "beat":
+            index = int(ref)
+            if index in beats or not 0 <= index < n_beats:
+                raise ValueError("invalid beat payload owner")
+            beats[index] = Beat(**payload)
+            continue
+        if kind != "txn":
+            raise ValueError("invalid transaction payload kind")
+        if ref in seen or ref not in by_ref:
+            raise ValueError("invalid transaction payload owner")
+        if not all(isinstance(payload[name], dict) for name in ("fields", "metrics")):
+            raise ValueError("transaction fields and metrics must be objects")
+        txn = by_ref[ref]
+        txn.id, txn.fields, txn.metrics = payload["id"], payload["fields"], payload["metrics"]
+        seen.add(ref)
+    if len(seen) != len(transactions) or len(beats) != n_beats:
+        raise ValueError("incomplete transaction payload cache")
+    return [beats[i] for i in range(n_beats)]
+
+
+def _restore_events(path: Path, transactions: list[Transaction], expected: int) -> None:
+    cols = read(path)
+    required = ("txn", "channel", "time", "assert_time", "stall", "fields")
+    if any(len(cols[name]) != expected for name in required):
+        raise ValueError("incomplete channel-event cache")
+    by_ref = {txn.ref: txn for txn in transactions}
+    for ref, channel, at, asserted, stall, payload in zip(
+        *(cols[name] for name in required), strict=True
+    ):
+        fields = json.loads(payload)
+        if not isinstance(fields, dict):
+            raise ValueError("channel-event payload must be an object")
+        by_ref[ref].events.append(
+            ChannelEvent(channel, int(at), int(asserted), int(stall), fields)
+        )
 
 
 def _restore_beats(trace_path: Path, iface: Interface, expected: int) -> list[Beat]:
@@ -381,10 +522,9 @@ def load_transactions(
 ) -> list[Transaction]:
     """Rebuild `Transaction` objects from a cached table.
 
-    Beats are not stored per row, so the reconstructed transactions carry their
-    metrics and fields but not their individual events. Callers that need the
-    events re-extract; callers that need the table (the UI, the CLI, `txn()`)
-    do not.
+    This is only the readable table projection. Production callers use
+    ``restore``, which rehydrates exact payload types, names and presence from
+    the payload sidecar, followed by the channel events and performance data.
 
     `columns` says which of the non-fixed columns were metrics. Without it the
     two would be told apart by name, which is exactly the guess this argument

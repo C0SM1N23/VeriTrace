@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Any, Iterator
 
-from veritrace.analysis.findings import Finding, Group, Severity
+from veritrace.analysis.findings import Finding, Group, Severity, location_of
 
 #: One check name per rule severity class, so `--fail-on protocol` works and a
 #: project can silence a specific rule via `checks.disable = ["AXI_BRESP"]`.
@@ -25,7 +25,12 @@ CHECK = "protocol_rule"
 _SEVERITY = {"error": Severity.ERROR, "warn": Severity.WARN, "info": Severity.INFO}
 
 
-def scan(analysis: Any, clock: Any = None, config: Any = None) -> Iterator[Finding]:
+def scan(
+    analysis: Any,
+    clock: Any = None,
+    config: Any = None,
+    graph: Any = None,
+) -> Iterator[Finding]:
     """Turn every rule violation in `analysis` into a `Finding`."""
     if analysis is None:
         return
@@ -46,6 +51,7 @@ def scan(analysis: Any, clock: Any = None, config: Any = None) -> Iterator[Findi
                 check=CHECK,
                 title=f"{where}: {v.msg}",
                 signal=signal,
+                loc=location_of(graph, signal),
                 time=v.time,
                 detail=v.msg,
                 why=f"why({signal} @ {v.time})" if signal else None,

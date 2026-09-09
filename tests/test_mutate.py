@@ -7,7 +7,6 @@ one test that needs Icarus says so and skips.
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 import pytest
@@ -15,6 +14,7 @@ import pytest
 from veritrace.mutate.model import Mutation
 from veritrace.mutate.operators import OPERATORS, _perturb, sites
 from veritrace.mutate.run import Suite, _parses, _sample, run
+from veritrace.simulate import find_iverilog
 
 DESIGNS = Path(__file__).resolve().parents[1] / "designs"
 FIFO = DESIGNS / "mutation" / "fifo.sv"
@@ -107,7 +107,7 @@ def test_sample_of_zero_means_everything():
     assert _sample(every, 0, seed=1) == list(every)
 
 
-@pytest.mark.skipif(shutil.which("iverilog") is None, reason="needs Icarus")
+@pytest.mark.skipif(find_iverilog() is None, reason="needs Icarus")
 def test_the_reference_fixture_scores_and_names_its_survivors(tmp_path):
     """§8.28's acceptance criterion, on the design built for it.
 

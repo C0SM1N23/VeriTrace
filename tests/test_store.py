@@ -217,12 +217,46 @@ def test_a_dump_that_changed_without_a_newer_timestamp_is_reconverted(tmp_path):
     assert second.source_sha256 != first.source_sha256
 
 
-def test_a_store_from_before_the_size_was_recorded_is_still_usable(tmp_path):
-    """The size is a new field, and an old store has none.
+def test_same_size_dump_with_exact_preserved_mtime_is_reconverted(tmp_path):
+    """Size and mtime together are not source identity.
 
-    Nothing to compare is not the same as a contradiction: the check falls back
-    to the timestamp rather than reconverting every store ever written.
+    This is the hard stale-cache case on Windows: ``st_ctime`` is creation
+    time there, so even writing different same-length bytes and restoring the
+    exact nanosecond mtime leaves every Python ``stat`` field unchanged. The
+    native verifier uses NTFS ChangeTime (inode/ctime on Unix) and hashes only
+    after that O(1) identity changes.
     """
+    import os
+
+    from veritrace import TraceStore
+    from veritrace import store as store_mod
+
+    template = (
+        "$timescale 1ns $end\n$scope module tb $end\n"
+        "$var reg 4 ! d [3:0] $end\n$upscope $end\n"
+        "$enddefinitions $end\n#0\nb0 !\n#10\nb{value} !\n"
+    )
+    src = tmp_path / "same.vcd"
+    src.write_text(template.format(value="1010"))
+    before_stat = src.stat()
+    first_path = store_mod.ensure(src)
+    first = TraceStore(str(first_path))
+    assert str(first.value_at(0, 10)) == "1010"
+
+    src.write_text(template.format(value="0101"))
+    assert src.stat().st_size == before_stat.st_size
+    os.utime(src, ns=(before_stat.st_atime_ns, before_stat.st_mtime_ns))
+    assert src.stat().st_mtime_ns == before_stat.st_mtime_ns
+
+    second_path = store_mod.ensure(src)
+    second = TraceStore(str(second_path))
+    assert str(second.value_at(0, 10)) == "101"
+    assert second.source_sha256 != first.source_sha256
+    assert second_path != first_path
+
+
+def test_a_legacy_store_without_identity_is_verified_and_upgraded(tmp_path):
+    """A legacy store is hash-verified once, then gets the O(1) identity."""
     import json
 
     from veritrace import store as store_mod
@@ -233,9 +267,12 @@ def test_a_store_from_before_the_size_was_recorded_is_still_usable(tmp_path):
     meta_path = out / "meta.json"
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     del meta["source_bytes"]
+    del meta["source_identity"]
     meta_path.write_text(json.dumps(meta), encoding="utf-8")
 
     assert store_mod._matches_source(out, src) is True
+    upgraded = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert upgraded["source_identity"]["change_token"]
 
 
 def test_cli_convert(tmp_path):
@@ -246,6 +283,54 @@ def test_cli_convert(tmp_path):
     assert result.exit_code == 0, result.output
     assert "6 signals" in result.output
     assert (tmp_path / "out.vtx" / "meta.json").exists()
+
+
+def test_native_conversion_reports_truthful_elapsed_progress(capsys, tmp_path):
+    """A long native parse must not leave the CLI looking frozen (§13.4)."""
+    import time
+
+    from veritrace.cli import _convert_with_progress
+
+    class SlowNative:
+        @staticmethod
+        def convert(_source, _output):
+            time.sleep(0.75)
+            return 17
+
+    events = _convert_with_progress(SlowNative, tmp_path / "large.vcd", tmp_path / "large.vtx")
+
+    assert events == 17
+    progress = capsys.readouterr().err
+    assert "converting large.vcd" in progress
+    assert "elapsed" in progress
+
+
+def test_native_conversion_worker_error_is_not_turned_into_success(tmp_path):
+    from veritrace.cli import _convert_with_progress
+
+    class BrokenNative:
+        @staticmethod
+        def convert(_source, _output):
+            raise ValueError("bad waveform")
+
+    with pytest.raises(ValueError, match="bad waveform"):
+        _convert_with_progress(BrokenNative, tmp_path / "bad.vcd", tmp_path / "bad.vtx")
+
+
+def test_cli_convert_refuses_to_destroy_an_unrelated_output_directory(tmp_path):
+    src = tmp_path / "dump.vcd"
+    src.write_text(SAMPLE_VCD)
+    out = tmp_path / "existing-project"
+    out.mkdir()
+    sentinel = out / "keep.txt"
+    sentinel.write_text("do not delete")
+
+    result = CliRunner().invoke(main, ["convert", str(src), "-o", str(out)])
+
+    assert result.exit_code != 0
+    assert "not a VeriTrace store" in result.output
+    assert sentinel.read_text() == "do not delete"
+    assert not (out / "meta.json").exists()
 
 
 def test_cli_convert_default_output_is_next_to_dump(tmp_path):
@@ -294,8 +379,19 @@ def test_a_store_pointed_at_directly_is_still_checked_against_its_dump(tmp_path)
     # Re-run the simulation, then ask for the store by name rather than by dump.
     src.write_text(vcd.format(v="11110000"))
     again = store_mod.ensure(store)
-    assert again == store
+    # Stores are immutable generations because a live Windows reader mmaps the
+    # old index. The direct-store path must return the new generation while the
+    # already-open old path remains a valid snapshot.
+    assert again != store
     assert str(TraceStore(str(again)).value_at(0, 10)) == "11110000"
+    assert str(TraceStore(str(store)).value_at(0, 10)) == "1010"
+
+    # `trace.default` continues to point at the canonical store.  Once a live
+    # reader forced an immutable generation, reopening that configured path
+    # must reuse it rather than hashing and writing another directory forever.
+    reopened = store_mod.ensure(store)
+    assert reopened == again
+    assert len(list(tmp_path.glob("dump.vcd.*.vtx"))) == 1
 
 
 def test_a_store_with_no_dump_beside_it_is_served_as_it_is(tmp_path):

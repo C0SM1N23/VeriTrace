@@ -23,8 +23,8 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from veritrace.memory.model import ACTIVATING, ACTIVE, IDLE, PRECHARGING, BankSegment, CmdEvent, TimingViolation
-from veritrace.memory.timing import ChipTiming, NS_FIELDS
-from veritrace.clocks import Clock, to_trace_units
+from veritrace.memory.timing import ChipTiming, NS_FIELDS, to_ticks
+from veritrace.clocks import Clock
 
 #: Constraints §8.20 checks that are gaps between two specific commands, or a
 #: sliding window over one command type — every one of the twelve except
@@ -155,16 +155,12 @@ def _to_units(chip: ChipTiming, timescale: str) -> tuple[_Units, list[str]]:
     out = _Units()
     failed: list[str] = []
     for f in NS_FIELDS:
-        v = to_trace_units(getattr(chip, f), "ns", timescale)
+        v = to_ticks(getattr(chip, f), timescale, maximum=f == "tREFI")
         if v is None:
             failed.append(f)
         else:
             setattr(out, f, v)
     return out, failed
-
-
-def _cycles(units: int, period: int | None) -> int:
-    return round(units / period) if period else units
 
 
 def _violation(
@@ -178,22 +174,31 @@ def _violation(
     is_maximum: bool = False,
 ) -> TimingViolation:
     period = clock.period if clock is not None else None
+    regular = period is not None and all(b - a == period for a, b in zip(clock.edges, clock.edges[1:]))
+    # A minimum rounds UP, a maximum DOWN; neither is a nearest-cycle estimate.
+    # Gated clocks have no single conversion of a wall-time bound to cycles.
+    limit_cycles = ((limit // period if is_maximum else -(-limit // period))
+                    if regular else None)
     return TimingViolation(
         constraint=constraint,
         bank=bank,
         at=second.time,
-        measured_cycles=_cycles(gap, period),
-        limit_cycles=_cycles(limit, period),
+        measured_cycles=clock.cycles_between(first.time, second.time) if clock else None,
+        limit_cycles=limit_cycles,
+        measured_ticks=gap,
+        limit_ticks=limit,
         is_maximum=is_maximum,
         first=first,
         second=second,
     )
 
 
-def _same_bank_violations(cmds: list[CmdEvent], bank: int, u: _Units, clock: Clock | None) -> list[TimingViolation]:
+def _same_bank_violations(cmds: list[CmdEvent], bank: int, u: _Units, clock: Clock | None,
+                          observed: set[str] | None = None) -> list[TimingViolation]:
     """tRCD, tRAS, tRC, tWR, tRTP — every constraint measured between two
     commands on the *same* bank, in one linear pass over that bank's stream."""
     out: list[TimingViolation] = []
+    observed = observed if observed is not None else set()
     #: The row currently open, cleared by PRECHARGE — what tRAS/tRCD measure from.
     open_activate: CmdEvent | None = None
     #: The last ACTIVATE regardless of what came after, which is what tRC
@@ -209,10 +214,12 @@ def _same_bank_violations(cmds: list[CmdEvent], bank: int, u: _Units, clock: Clo
     for c in sorted(cmds, key=lambda c: c.time):
         if c.name == "ACTIVATE":
             if last_activate is not None:
+                observed.add("tRC")
                 gap = c.time - last_activate.time
                 if gap < u.tRC:
                     out.append(_violation("tRC", bank, c, last_activate, gap, u.tRC, clock))
             if last_precharge is not None:
+                observed.add("tRP")
                 gap = c.time - last_precharge.time
                 if gap < u.tRP:
                     out.append(_violation("tRP", bank, c, last_precharge, gap, u.tRP, clock))
@@ -221,6 +228,7 @@ def _same_bank_violations(cmds: list[CmdEvent], bank: int, u: _Units, clock: Clo
             last_write = last_read = None
         elif c.name in ("READ", "WRITE"):
             if open_activate is not None and awaiting_first_access:
+                observed.add("tRCD")
                 gap = c.time - open_activate.time
                 if gap < u.tRCD:
                     out.append(_violation("tRCD", bank, c, open_activate, gap, u.tRCD, clock))
@@ -231,14 +239,17 @@ def _same_bank_violations(cmds: list[CmdEvent], bank: int, u: _Units, clock: Clo
                 last_read = c
         elif c.name == "PRECHARGE":
             if open_activate is not None:
+                observed.add("tRAS")
                 gap = c.time - open_activate.time
                 if gap < u.tRAS:
                     out.append(_violation("tRAS", bank, c, open_activate, gap, u.tRAS, clock))
             if last_write is not None:
+                observed.add("tWR")
                 gap = c.time - last_write.time
                 if gap < u.tWR:
                     out.append(_violation("tWR", bank, c, last_write, gap, u.tWR, clock))
             if last_read is not None:
+                observed.add("tRTP")
                 gap = c.time - last_read.time
                 if gap < u.tRTP:
                     out.append(_violation("tRTP", bank, c, last_read, gap, u.tRTP, clock))
@@ -248,10 +259,12 @@ def _same_bank_violations(cmds: list[CmdEvent], bank: int, u: _Units, clock: Clo
     return out
 
 
-def _device_wide_violations(commands: Sequence[CmdEvent], u: _Units, clock: Clock | None) -> list[TimingViolation]:
+def _device_wide_violations(commands: Sequence[CmdEvent], u: _Units, clock: Clock | None,
+                           observed: set[str] | None = None) -> list[TimingViolation]:
     """tRRD, tFAW, tWTR, tRFC, tREFI — every constraint that spans banks or
     has no bank of its own."""
     out: list[TimingViolation] = []
+    observed = observed if observed is not None else set()
     ordered = sorted(commands, key=lambda c: c.time)
     activates = [c for c in ordered if c.name == "ACTIVATE"]
 
@@ -270,17 +283,19 @@ def _device_wide_violations(commands: Sequence[CmdEvent], u: _Units, clock: Cloc
             default=None,
         )
         if nearest is not None:
+            observed.add("tRRD")
             gap = cur.time - nearest.time
             if gap < u.tRRD:
                 out.append(_violation("tRRD", None, cur, nearest, gap, u.tRRD, clock))
         if b is not None:
             last_per_bank[b] = cur
 
-    # tFAW: no 4 ACTIVATEs (any bank) inside a window smaller than tFAW.
-    for i in range(3, len(activates)):
-        gap = activates[i].time - activates[i - 3].time
+    # tFAW permits four ACTIVATEs; it is the fifth that must wait.
+    for i in range(4, len(activates)):
+        observed.add("tFAW")
+        gap = activates[i].time - activates[i - 4].time
         if gap < u.tFAW:
-            out.append(_violation("tFAW", None, activates[i], activates[i - 3], gap, u.tFAW, clock))
+            out.append(_violation("tFAW", None, activates[i], activates[i - 4], gap, u.tFAW, clock))
 
     # tWTR: bus turnaround, last WRITE to the next READ, whichever bank.
     last_write: CmdEvent | None = None
@@ -288,6 +303,7 @@ def _device_wide_violations(commands: Sequence[CmdEvent], u: _Units, clock: Cloc
         if c.name == "WRITE":
             last_write = c
         elif c.name == "READ" and last_write is not None:
+            observed.add("tWTR")
             gap = c.time - last_write.time
             if gap < u.tWTR:
                 out.append(_violation("tWTR", None, c, last_write, gap, u.tWTR, clock))
@@ -299,6 +315,7 @@ def _device_wide_violations(commands: Sequence[CmdEvent], u: _Units, clock: Cloc
         if r.name != "REFRESH" or i + 1 >= len(ordered):
             continue
         nxt = ordered[i + 1]
+        observed.add("tRFC")
         gap = nxt.time - r.time
         if gap < u.tRFC:
             out.append(_violation("tRFC", None, nxt, r, gap, u.tRFC, clock))
@@ -307,6 +324,7 @@ def _device_wide_violations(commands: Sequence[CmdEvent], u: _Units, clock: Cloc
 
     # tREFI: a *maximum* interval between consecutive REFRESHes.
     for prev, cur in zip(refreshes, refreshes[1:]):
+        observed.add("tREFI")
         gap = cur.time - prev.time
         if gap > u.tREFI:
             out.append(_violation("tREFI", None, cur, prev, gap, u.tREFI, clock, is_maximum=True))
@@ -337,6 +355,15 @@ def check_timing(
         "needs a data-bus signal correlated to the command; this pack's [[command]] "
         "table declares none, so read/write latency cannot be measured"
     )
+    skipped["tWR"] = (
+        "the last write data beat is not observed; command-to-PRECHARGE is only "
+        "a lower bound, so violations can be reported but compliance cannot be certified"
+    )
+    if any(c.name in ("READ", "WRITE") and c.fields.get("ap") for c in commands):
+        skipped["auto-precharge"] = (
+            "burst completion is not observed; the bank timeline models explicit "
+            "PRECHARGE only and does not establish the auto-precharge close time"
+        )
 
     # A per-bank command whose bank could not be decoded (X on `ba` that cycle)
     # takes part in no same-bank check. Saying how many were dropped is the
@@ -354,11 +381,15 @@ def check_timing(
 
     out: list[TimingViolation] = []
     by_bank = _by_bank(commands, n_banks)
+    observed: set[str] = set()
     for b, cmds in by_bank.items():
-        out.extend(_same_bank_violations(cmds, b, units, clock))
-    out.extend(_device_wide_violations(commands, units, clock))
+        out.extend(_same_bank_violations(cmds, b, units, clock, observed))
+    out.extend(_device_wide_violations(commands, units, clock, observed))
     out.sort(key=lambda v: v.at)
 
+    for constraint in NS_FIELDS:
+        if constraint not in observed and constraint not in skipped:
+            skipped[constraint] = "no qualifying command pair/window was observed in this trace"
     checked = {c: 0 for c in NS_FIELDS if c not in skipped}
     for v in out:
         checked[v.constraint] = checked.get(v.constraint, 0) + 1

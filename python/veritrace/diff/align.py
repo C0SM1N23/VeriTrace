@@ -16,11 +16,9 @@ the anchors: clock edges, completed handshakes, retired instructions, or marks
 the user placed. Matching them gives a piecewise map, and everything between two
 matched anchors is mapped affinely.
 
-The matching itself is `difflib.SequenceMatcher`. §8.7 says LCS; matching blocks
-*are* the LCS, computed by a stdlib implementation that has been correct for
-twenty years — and `autojunk` is off, because anchor keys repeat by design and
-the heuristic that discards "popular" elements would throw away exactly the
-clock edges being matched on.
+Matching is an exact longest common subsequence, including repeated keys.
+Bit-parallel prefix lengths plus Hirschberg reconstruction avoid a quadratic
+Python object matrix; large inputs never change the matching semantics.
 
 The common axis is an **ordinal**: for the clock strategy it is the cycle
 number, and for the others the index of the anchor plus the fraction of the way
@@ -34,7 +32,7 @@ from __future__ import annotations
 import re
 from bisect import bisect_right
 from dataclasses import dataclass, field
-from difflib import SequenceMatcher
+from fractions import Fraction
 from typing import Any, Sequence
 
 from veritrace.clocks import UNIT_FS
@@ -49,6 +47,14 @@ RETIRE_NAME_RE = re.compile(r"(^|[._])(retire|pc_valid|instr_valid|commit)([._\d
 
 class AlignError(ValueError):
     """The two traces cannot be put on one axis, and why."""
+
+
+def parse_marks(text: str) -> tuple[list[int], list[int]]:
+    """VTQ's quoted A:B,A:B pairs, in the native ticks of each trace."""
+    if not isinstance(text, str) or not re.fullmatch(r"\s*\d+\s*:\s*\d+(?:\s*,\s*\d+\s*:\s*\d+)*\s*", text):
+        raise AlignError('marks must be paired trace ticks, e.g. marks="0:0,100:100000"')
+    pairs = [tuple(int(v.strip()) for v in pair.split(":")) for pair in text.split(",")]
+    return [a for a, _ in pairs], [b for _, b in pairs]
 
 
 def fs_per_tick(timescale: str) -> int:
@@ -142,24 +148,28 @@ class Alignment:
         to the next one. For the clock strategy the integer part is the cycle
         number, which is why `report` can say "c1200" and mean it in both runs.
         """
+        return float(self.ordinal_exact(t, side))
+
+    def ordinal_exact(self, t: int, side: str) -> Fraction:
+        """Affine event position without losing sub-cycle events to rounding."""
         this = self.a if side == "a" else self.b
         pick = 0 if side == "a" else 1
         t_fs = this.to_fs(t)
         times = self._anchor_times(pick)
         if not times:
-            return float(t_fs)
+            return Fraction(t_fs)
         i = bisect_right(times, t_fs) - 1
         if i < 0:
             # Before the first matched anchor: extrapolate backwards on the
             # first interval rather than clamp, so a divergence during reset is
             # still placed rather than piled onto ordinal 0.
             span = (times[1] - times[0]) if len(times) > 1 else this.fs
-            return (t_fs - times[0]) / span if span else 0.0
+            return Fraction(t_fs - times[0], span) if span else Fraction(0)
         if i >= len(times) - 1:
             span = (times[-1] - times[-2]) if len(times) > 1 else this.fs
-            return i + ((t_fs - times[i]) / span if span else 0.0)
+            return i + (Fraction(t_fs - times[i], span) if span else Fraction(0))
         span = times[i + 1] - times[i]
-        return i + ((t_fs - times[i]) / span if span else 0.0)
+        return i + (Fraction(t_fs - times[i], span) if span else Fraction(0))
 
     def time_at(self, ordinal: float, side: str) -> int:
         """The inverse: a native timestamp for a position on the shared axis."""
@@ -237,7 +247,12 @@ def _retire_anchors(side: Side, signal: str | None) -> list[Anchor]:
 
 
 def _manual_anchors(side: Side, times: Sequence[int]) -> list[Anchor]:
-    return [Anchor(side.to_fs(int(t)), f"m{i}") for i, t in enumerate(sorted(times))]
+    lo, hi = side.store.time_range
+    if any(isinstance(t, bool) or not isinstance(t, int) or not lo <= t <= hi for t in times):
+        raise AlignError(f"manual anchors for {side.name} must be integer trace ticks in [{lo}, {hi}]")
+    if any(b <= a for a, b in zip(times, times[1:])):
+        raise AlignError("manual anchors must be strictly increasing, without duplicates")
+    return [Anchor(side.to_fs(t), f"m{i}") for i, t in enumerate(times)]
 
 
 def collect(
@@ -262,16 +277,41 @@ def collect(
 
 # --- matching ---------------------------------------------------------------
 
-#: Past this many anchors the sequence match is skipped in favour of positional
-#: pairing. Only reachable on a strategy whose keys vary; the clock strategy is
-#: positional by construction and has no such limit.
-MAX_MATCHED_ANCHORS = 20000
+def _lcs_prefixes(a: list[str], b: list[str]) -> list[int]:
+    masks: dict[str, int] = {}
+    for j, key in enumerate(b):
+        masks[key] = masks.get(key, 0) | (1 << j)
+    state = 0
+    for key in a:
+        union = state | masks.get(key, 0)
+        state = union & ~(union - ((state << 1) | 1))
+    lengths = [0]
+    for byte in state.to_bytes((len(b) + 7) // 8, "little"):
+        for bit in range(8):
+            lengths.append(lengths[-1] + ((byte >> bit) & 1))
+    return lengths[:len(b) + 1]
+
+
+def _lcs_pairs(a: list[str], b: list[str], ai: int = 0, bi: int = 0) -> list[tuple[int, int]]:
+    if not a or not b:
+        return []
+    if a == b:
+        return [(ai + i, bi + i) for i in range(len(a))]
+    if len(a) == 1:
+        return [(ai, bi + b.index(a[0]))] if a[0] in b else []
+    middle = len(a) // 2
+    forward = _lcs_prefixes(a[:middle], b)
+    reverse = _lcs_prefixes(a[middle:][::-1], b[::-1])
+    split = max(enumerate(zip(forward, reversed(reverse))), key=lambda entry: sum(entry[1]))[0]
+    del forward, reverse
+    return (_lcs_pairs(a[:middle], b[:split], ai, bi)
+            + _lcs_pairs(a[middle:], b[split:], ai + middle, bi + split))
 
 
 def _pair(a: list[Anchor], b: list[Anchor]) -> tuple[list[tuple[int, int]], str]:
     keys_a = [x.key for x in a]
     keys_b = [x.key for x in b]
-    if len(set(keys_a)) <= 1 and len(set(keys_b)) <= 1:
+    if len(set(keys_a + keys_b)) <= 1:
         # Every anchor is the same kind of event — clock edges. Then the n-th of
         # one *is* the n-th of the other, which is what cycle numbering means,
         # and running a sequence match would burn O(n·m) to rediscover it.
@@ -279,18 +319,7 @@ def _pair(a: list[Anchor], b: list[Anchor]) -> tuple[list[tuple[int, int]], str]
         return [(i, i) for i in range(n)], (
             "" if len(a) == len(b) else f"one run is {abs(len(a) - len(b))} anchor(s) longer"
         )
-    if len(a) > MAX_MATCHED_ANCHORS or len(b) > MAX_MATCHED_ANCHORS:
-        n = min(len(a), len(b))
-        return [(i, i) for i in range(n)], (
-            f"too many anchors to match by content ({len(a)} vs {len(b)}); paired by position"
-        )
-    # autojunk=False: anchor keys repeat by design, and the heuristic that drops
-    # elements appearing in more than 1% of a long sequence would discard
-    # precisely the events being aligned on.
-    matcher = SequenceMatcher(None, keys_a, keys_b, autojunk=False)
-    pairs: list[tuple[int, int]] = []
-    for block in matcher.get_matching_blocks():
-        pairs.extend((block.a + k, block.b + k) for k in range(block.size))
+    pairs = _lcs_pairs(keys_a, keys_b)
     dropped = min(len(a), len(b)) - len(pairs)
     return pairs, (f"{dropped} anchor(s) matched nothing on the other side" if dropped else "")
 
@@ -306,6 +335,8 @@ def align(
     times_b: Sequence[int] = (),
 ) -> Alignment:
     """Put two traces on one axis. Timescales are normalised first (§8.7)."""
+    if strategy == "manual" and len(times_a) != len(times_b):
+        raise AlignError("manual alignment needs the same number of paired anchors in both traces")
     a.anchors = collect(a, strategy, protocol_a, signal, times_a)
     b.anchors = collect(b, strategy, protocol_b, signal, times_b)
     if not a.anchors or not b.anchors:

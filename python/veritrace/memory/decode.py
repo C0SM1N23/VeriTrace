@@ -50,10 +50,7 @@ def decode(
 
     in_reset = reset_mask(iface, sampler, config)
     if all(in_reset):
-        # Same guard §8.14's engine applies: either the design really is held
-        # in reset for the whole run, or the polarity was read backwards.
-        # Both would decode nothing, so say what happened and scan anyway.
-        in_reset = [False] * len(edges)
+        return [], {"reset": f"`{iface.reset}` is asserted or unknown for the whole run; no commands sampled"}
 
     rungs = list(pack.commands)
     notes: dict[str, str] = {}
@@ -89,7 +86,7 @@ def decode(
                 except expr.ExprError as e:
                     notes[f"{matched.name}.{arg_name}"] = str(e)
                     fields[arg_name] = None
-            out.append(CmdEvent(time=edges[i], name=matched.name, fields=fields))
+            out.append(CmdEvent(time=edges[i], name=matched.name, fields=fields, cycle=i))
         i += 1
 
     return out, notes

@@ -41,14 +41,25 @@ fn never_returns_more_entries_than_pixels() {
     let fast = s.handle("top.fast").unwrap();
 
     let w = s.wave(fast, 0, n as i64 + 1, 1200).unwrap();
-    assert_eq!(w.mode, WaveMode::MinMax, "a million transitions must be reduced");
+    assert_eq!(
+        w.mode,
+        WaveMode::MinMax,
+        "a million transitions must be reduced"
+    );
     assert!(w.len() <= 1200, "returned {} entries for 1200 px", w.len());
     // The reduction must still cover the window, not truncate it.
-    assert!(w.len() > 1000, "reduction collapsed too far: {} entries", w.len());
+    assert!(
+        w.len() > 1000,
+        "reduction collapsed too far: {} entries",
+        w.len()
+    );
 
     // Total transitions accounted for, none dropped.
     let counted: u32 = w.buckets.iter().map(|b| b.n).sum();
-    assert_eq!(counted as usize, n, "every transition must land in some bucket");
+    assert_eq!(
+        counted as usize, n,
+        "every transition must land in some bucket"
+    );
 }
 
 #[test]
@@ -58,7 +69,12 @@ fn invariant_holds_across_pixel_widths_and_windows() {
     let fast = s.handle("top.fast").unwrap();
 
     for px in [1usize, 2, 7, 100, 1200, 1920, 4096] {
-        for (t0, t1) in [(0i64, n as i64), (0, 1000), (n as i64 / 2, n as i64), (500, 600)] {
+        for (t0, t1) in [
+            (0i64, n as i64),
+            (0, 1000),
+            (n as i64 / 2, n as i64),
+            (500, 600),
+        ] {
             let w = s.wave(fast, t0, t1, px).unwrap();
             assert!(
                 w.len() <= px,
@@ -154,5 +170,8 @@ fn degenerate_window_is_not_an_error() {
     let h = s.handle("top.fast").unwrap();
     assert!(s.wave(h, 50, 50, 100).unwrap().is_empty());
     assert!(s.wave(h, 60, 50, 100).unwrap().is_empty());
-    assert_eq!(s.wave(h, 0, 10, 0).unwrap().len(), 1.min(s.wave(h, 0, 10, 1).unwrap().len()));
+    assert_eq!(
+        s.wave(h, 0, 10, 0).unwrap().len(),
+        1.min(s.wave(h, 0, 10, 1).unwrap().len())
+    );
 }

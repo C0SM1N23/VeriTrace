@@ -234,7 +234,6 @@ def holes_from(report: dict[str, Any], iface: str | None = None) -> list[tuple[s
             continue
         for point in cov.get("points", []):
             labels = [a for axis in point.get("labels", []) for a in axis]
-            hit = {tuple(c["key"]) for c in point.get("cells", []) if c.get("hits")}
             for cell in point.get("cells", []):
                 if cell.get("hits"):
                     continue

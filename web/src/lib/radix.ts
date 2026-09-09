@@ -16,9 +16,14 @@ const RADIX_LABEL: Record<Radix, string> = {
   dec: "dec",
   bin: "bin",
   ascii: "asc",
+  enum: "enum",
 };
 
-export const RADICES: Radix[] = ["hex", "dec", "bin", "ascii"];
+export const RADICES: Radix[] = ["hex", "dec", "bin", "ascii", "enum"];
+
+export function isRadix(value: unknown): value is Radix {
+  return RADICES.includes(value as Radix);
+}
 
 export function radixLabel(r: Radix): string {
   return RADIX_LABEL[r];
@@ -54,7 +59,12 @@ export function expand(bits: string, width: number): string {
 }
 
 /** Format for display in the given radix. */
-export function format(bits: string, width: number, radix: Radix): string {
+export function format(
+  bits: string,
+  width: number,
+  radix: Radix,
+  enumLabels?: Record<string, string>,
+): string {
   if (!bits) return "";
   const full = expand(bits, Math.max(width, bits.length));
 
@@ -76,6 +86,13 @@ export function format(bits: string, width: number, radix: Radix): string {
     }
     case "ascii":
       return toAscii(full);
+    case "enum": {
+      const numeric = BigInt("0b" + full).toString(10);
+      // Symbolic names come from the production FSM extractor.  A literal or
+      // a state register it could not classify still has a truthful decimal
+      // representation — never an undefined/blank waveform label.
+      return enumLabels?.[numeric] ?? numeric;
+    }
   }
 }
 

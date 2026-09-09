@@ -12,6 +12,7 @@ Everything here is optional. A missing file yields `Config.empty()` rather than
 from __future__ import annotations
 
 import fnmatch
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +29,17 @@ DEFAULT_STUCK_CYCLES = 100
 #: §8.18. The same number as the stuck threshold on purpose: "this is not just
 #: busy" should mean one thing across the detectors, not two.
 DEFAULT_DEADLOCK_CYCLES = 100
+
+
+class ConfigError(ValueError):
+    """A readable, user-actionable error in ``.veritrace.toml``.
+
+    TOML only validates syntax.  Without the small schema checks below a value
+    such as ``rtl = "rtl/*.sv"`` is accepted and then iterated character by
+    character, while ``row_height = "wide"`` is silently treated as compact.
+    Both failure modes make a real option look implemented while ignoring what
+    the user wrote, so configuration errors are rejected at the boundary.
+    """
 
 #: §8.10b — how a simulation log announces a failure. The named groups are the
 #: contract: `time` (with an optional `unit`), `hier` and `name` when the log
@@ -72,7 +84,10 @@ class Config:
     primary_clock: str | None = None
     other_clocks: list[str] = field(default_factory=list)
     reset_signal: str | None = None
-    reset_active: str = "low"
+    # ``None`` means infer the polarity from the trace/name.  ``init`` writes an
+    # explicit low/high value, but a hand-written config that omits it must not
+    # silently force every active-high design to active-low.
+    reset_active: str | None = None
 
     # [trace]
     trace: str | None = None
@@ -164,9 +179,40 @@ class Config:
         return {**DEFAULT_LOG_PATTERNS, **self.log_patterns}
 
 
-def _table(data: dict[str, Any], name: str) -> dict[str, Any]:
+def _table(data: dict[str, Any], name: str, *, parent: str = "") -> dict[str, Any]:
     got = data.get(name)
-    return got if isinstance(got, dict) else {}
+    if got is None:
+        return {}
+    if not isinstance(got, dict):
+        dotted = f"{parent}.{name}" if parent else name
+        raise ConfigError(f"{dotted} must be a TOML table")
+    return got
+
+
+def _strings(value: Any, name: str) -> list[str]:
+    """A TOML array of strings, with no string-as-an-iterable surprises."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+        raise ConfigError(f"{name} must be an array of strings")
+    return list(value)
+
+
+def _optional_string(value: Any, name: str) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ConfigError(f"{name} must be a string")
+    return value
+
+
+def _positive_int(value: Any, name: str, default: int) -> int:
+    if value is None:
+        return default
+    # bool is an int in Python, but ``stuck_cycles = true`` is not meaningful.
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigError(f"{name} must be a positive integer")
+    return value
 
 
 def find(start: Path | str = ".") -> Path | None:
@@ -189,7 +235,10 @@ def load(start: Path | str = ".") -> Config | None:
     path = find(start)
     if path is None:
         return None
-    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as e:
+        raise ConfigError(f"cannot read {path}: {e}") from e
 
     design = _table(data, "design")
     clocks = _table(data, "clocks")
@@ -201,35 +250,89 @@ def load(start: Path | str = ".") -> Config | None:
     proto = _table(data, "protocol")
     cov = _table(data, "coverage")
     ing = _table(data, "ingest")
-    defines = _table(design, "defines")
+    defines = _table(design, "defines", parent="design")
+    radix = _table(ui, "radix", parent="ui")
+    patterns = _table(triage, "patterns", parent="triage")
+    ingest_patterns = _table(ing, "patterns", parent="ingest")
+
+    top = _optional_string(design.get("top"), "design.top")
+    primary_clock = _optional_string(clocks.get("primary"), "clocks.primary")
+    reset_signal = _optional_string(reset.get("signal"), "reset.signal")
+    reset_active = _optional_string(reset.get("active"), "reset.active")
+    if reset_active is not None:
+        reset_active = reset_active.lower()
+        if reset_active not in {"low", "high"}:
+            raise ConfigError("reset.active must be 'low' or 'high'")
+
+    row_height = ui.get("row_height", "compact")
+    if not isinstance(row_height, str) or row_height not in {"compact", "comfortable"}:
+        raise ConfigError("ui.row_height must be 'compact' or 'comfortable'")
+
+    allowed_radix = {"hex", "dec", "bin", "ascii", "enum"}
+    if any(not isinstance(k, str) or not isinstance(v, str) for k, v in radix.items()):
+        raise ConfigError("ui.radix must map string globs to radix names")
+    invalid_radix = sorted({str(v) for v in radix.values()} - allowed_radix)
+    if invalid_radix:
+        raise ConfigError(
+            "ui.radix values must be hex, dec, bin, ascii or enum; got "
+            + ", ".join(invalid_radix)
+        )
+
+    if any(not isinstance(k, str) or isinstance(v, (dict, list)) for k, v in defines.items()):
+        raise ConfigError("design.defines must map names to scalar values")
+    if any(not isinstance(k, str) or not isinstance(v, str) for k, v in patterns.items()):
+        raise ConfigError("triage.patterns must map names to regular expressions")
+    for name, pattern in patterns.items():
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            raise ConfigError(f"triage.patterns.{name} is not a valid regex: {e}") from e
+    if any(
+        not isinstance(k, str) or not isinstance(v, str)
+        for k, v in ingest_patterns.items()
+    ):
+        raise ConfigError("ingest.patterns must map names to regular expressions")
+    for name, pattern in ingest_patterns.items():
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            raise ConfigError(f"ingest.patterns.{name} is not a valid regex: {e}") from e
+
+    capture = trace.get("capture", False)
+    if not isinstance(capture, bool):
+        raise ConfigError("trace.capture must be true or false")
 
     return Config(
         root=path.parent,
         path=path,
-        top=design.get("top") or None,
-        rtl=list(design.get("rtl") or []),
-        incdirs=list(design.get("incdirs") or []),
+        top=top,
+        rtl=_strings(design.get("rtl"), "design.rtl"),
+        incdirs=_strings(design.get("incdirs"), "design.incdirs"),
         defines=[f"{k}={v}" for k, v in defines.items()],
-        primary_clock=clocks.get("primary") or None,
-        other_clocks=list(clocks.get("others") or []),
-        reset_signal=reset.get("signal") or None,
-        reset_active=str(reset.get("active") or "low"),
-        trace=trace.get("default") or None,
-        ignore=list(trace.get("ignore") or []),
-        capture=bool(trace.get("capture") or False),
-        row_height=str(ui.get("row_height") or "compact"),
-        radix_globs={str(k): str(v) for k, v in _table(ui, "radix").items()},
-        default_tab=ui.get("default_tab") or None,
-        stuck_cycles=int(checks.get("stuck_cycles", DEFAULT_STUCK_CYCLES)),
-        deadlock_cycles=int(checks.get("deadlock_cycles", DEFAULT_DEADLOCK_CYCLES)),
-        disabled_checks=list(checks.get("disable") or []),
-        log_patterns={str(k): str(v) for k, v in _table(triage, "patterns").items()},
-        protocol_packs=[str(x) for x in (proto.get("packs") or [])],
-        protocol_ignore=[str(x) for x in (proto.get("ignore") or [])],
-        coverage_path=(str(cov.get("path")) if cov.get("path") else None),
-        ingest_cocotb_log=(str(ing.get("cocotb_log")) if ing.get("cocotb_log") else None),
-        ingest_uvm_db=(str(ing.get("uvm_db")) if ing.get("uvm_db") else None),
-        ingest_patterns={str(k): str(v) for k, v in _table(ing, "patterns").items()},
+        primary_clock=primary_clock,
+        other_clocks=_strings(clocks.get("others"), "clocks.others"),
+        reset_signal=reset_signal,
+        reset_active=reset_active,
+        trace=_optional_string(trace.get("default"), "trace.default"),
+        ignore=_strings(trace.get("ignore"), "trace.ignore"),
+        capture=capture,
+        row_height=row_height,
+        radix_globs=dict(radix),
+        default_tab=_optional_string(ui.get("default_tab"), "ui.default_tab"),
+        stuck_cycles=_positive_int(
+            checks.get("stuck_cycles"), "checks.stuck_cycles", DEFAULT_STUCK_CYCLES
+        ),
+        deadlock_cycles=_positive_int(
+            checks.get("deadlock_cycles"), "checks.deadlock_cycles", DEFAULT_DEADLOCK_CYCLES
+        ),
+        disabled_checks=_strings(checks.get("disable"), "checks.disable"),
+        log_patterns=dict(patterns),
+        protocol_packs=_strings(proto.get("packs"), "protocol.packs"),
+        protocol_ignore=_strings(proto.get("ignore"), "protocol.ignore"),
+        coverage_path=_optional_string(cov.get("path"), "coverage.path"),
+        ingest_cocotb_log=_optional_string(ing.get("cocotb_log"), "ingest.cocotb_log"),
+        ingest_uvm_db=_optional_string(ing.get("uvm_db"), "ingest.uvm_db"),
+        ingest_patterns=dict(ingest_patterns),
     )
 
 

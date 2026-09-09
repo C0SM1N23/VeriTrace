@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any, Iterator
 
-from veritrace.analysis.findings import Finding, Group, Severity
+from veritrace.analysis.findings import Finding, Group, Severity, location_of
 
 CHECK = "memory_timing"
 
@@ -26,7 +26,7 @@ def _cyc(n: int) -> str:
     return f"{n} cycle" + ("" if n == 1 else "s")
 
 
-def scan(reports: Any, config: Any = None) -> Iterator[Finding]:
+def scan(reports: Any, config: Any = None, graph: Any = None) -> Iterator[Finding]:
     """Turn every §8.20 `MemoryReport`'s violations into findings."""
     if not reports:
         return
@@ -38,10 +38,11 @@ def scan(reports: Any, config: Any = None) -> Iterator[Finding]:
         cs_n = r.signals.get("cs_n")
         for v in r.violations:
             direction = "exceeded" if v.is_maximum else "was too short"
+            measured = _cyc(v.measured_cycles) if v.limit_cycles is not None else f"{v.measured_ticks} ticks"
+            limit = _cyc(v.limit_cycles) if v.limit_cycles is not None else f"{v.limit_ticks} ticks"
             title = (
                 f"{r.iface}: {v.constraint} {direction} "
-                f"({_cyc(v.measured_cycles)}, {'max' if v.is_maximum else 'min'} "
-                f"{_cyc(v.limit_cycles)})"
+                f"({measured}, {'max' if v.is_maximum else 'min'} {limit})"
             )
             bank_note = f"bank {v.bank}" if v.bank is not None else "device-wide"
             first = f"{v.first.name}@{v.first.time}" if v.first else "?"
@@ -52,6 +53,7 @@ def scan(reports: Any, config: Any = None) -> Iterator[Finding]:
                 check=CHECK,
                 title=title,
                 signal=cs_n,
+                loc=location_of(graph, cs_n),
                 time=v.at,
                 detail=f"{bank_note}: {first} -> {second}",
                 why=f"why({cs_n} @ {v.at})" if cs_n else None,

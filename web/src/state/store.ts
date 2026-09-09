@@ -21,16 +21,18 @@ import {
   fetchLayout,
   fetchMachines,
   fetchMemory,
+  setMemoryTiming,
   fetchPerformance,
   fetchRoot,
   fetchSessions,
   fetchSignals,
   fetchSource,
-  fetchStatus,
+  waitForSession,
   fetchSubtrace,
   fetchTransactions,
   putLayout,
   runQuery,
+  streamQuery,
   // Same reason as `requestRepro`: the store action owns the name.
   runDiff as runDiffRequest,
   runTxnQuery,
@@ -44,6 +46,7 @@ import type {
   CmdEvent,
   CoverageReport,
   DiffReport,
+  Hole,
   Layout,
   Machine,
   MemoryReport,
@@ -60,6 +63,7 @@ import type {
   TxnReport,
   WhyResult,
 } from "../lib/types";
+import { isRadix } from "../lib/radix";
 import { clampView, panBy, zoomAt, type View } from "../lib/time";
 
 const PERSIST_DEBOUNCE_MS = 400;
@@ -72,8 +76,8 @@ const TAB_BY_NAME: Record<string, number> = {
   causal: 2,
   source: 3,
   fsm: 4,
-  checks: 5,
-  diff: 6,
+  diff: 5,
+  checks: 6,
   coverage: 7,
   transactions: 8,
   performance: 9,
@@ -105,6 +109,8 @@ export interface WaveState {
   causalError: string | null;
   causalBusy: boolean;
   activeNode: string | null;
+  /** Card under the pointer; Wave pulses the same signal (§11.4). */
+  hoveredCausal: string | null;
   // §8.2, §8.3, §11.5 — the minimised chain, the testbench, and the replay.
   subtrace: SubtraceResult | null;
   subtraceBusy: boolean;
@@ -121,6 +127,7 @@ export interface WaveState {
   sourceBusy: boolean;
   checks: ChecksReport | null;
   checksBusy: boolean;
+  checksError: string | null;
   // §8.13-8.14, TAB 8.
   txn: TxnReport | null;
   txnBusy: boolean;
@@ -180,6 +187,8 @@ export interface WaveState {
   queryText: string;
   /** Queries this session has run, most recent first — §9.4's history. */
   queryHistory: string[];
+  /** Named VTQ aliases (`@deadlock = ...`), persisted with the session. */
+  savedQueries: Record<string, string>;
   /** §11.4's `⌘B` marks, persisted with the layout (P5). */
   bookmarks: Bookmark[];
   /**
@@ -208,6 +217,9 @@ export interface WaveState {
   /** Path of the run being compared against. */
   diffOther: string;
   diffStrategy: string;
+  diffAnchor: string;
+  diffMarksA: string;
+  diffMarksB: string;
   /** §11.4: "ignore this signal" — globs excluded from the comparison. */
   diffIgnore: string[];
   /** Which divergence `n`/`p` are on. */
@@ -229,6 +241,7 @@ export interface WaveState {
   inspectorOpen: boolean;
   activeTab: number;
   ready: boolean;
+  loading: boolean;
   error: string | null;
 
   load: () => Promise<void>;
@@ -245,6 +258,8 @@ export interface WaveState {
   moveRow: (from: number, to: number) => void;
   removeRow: (index: number) => void;
   addSignal: (handle: number) => void;
+  /** Merge metadata fetched lazily by the hierarchy tree into the local index. */
+  registerSignals: (signals: SignalMeta[]) => void;
   /** Add many signals at once, optionally under a group header (§11.3). */
   addSignals: (handles: number[], group?: string) => number;
   addGroup: (name: string) => void;
@@ -258,6 +273,8 @@ export interface WaveState {
   setHelp: (open: boolean) => void;
   toggleTree: () => void;
   toggleInspector: () => void;
+  /** §11.7: collapse or restore both side columns as one keyboard action. */
+  toggleSidePanels: () => void;
   setTab: (n: number) => void;
   stepEdge: (dir: 1 | -1) => Promise<void>;
   runWhy: (signalPath: string, t: number) => Promise<void>;
@@ -266,6 +283,7 @@ export interface WaveState {
   restoreQuery: (vtq: string) => Promise<void>;
   openSource: (file: string, line?: number) => Promise<void>;
   selectCausal: (node: CausalNode) => void;
+  setHoveredCausal: (path: string | null) => void;
   clearCausal: () => void;
   loadSubtrace: () => Promise<void>;
   setReplay: (on: boolean) => void;
@@ -284,6 +302,7 @@ export interface WaveState {
   setPerfWindow: (w: { t0: number; t1: number } | null) => void;
   openTransactionRef: (ref: string) => Promise<void>;
   loadMemory: () => Promise<void>;
+  applyMemoryTiming: (iface: string, choice: { chip?: string; toml?: string }) => Promise<void>;
   selectMemIface: (name: string) => Promise<void>;
   setMemFilter: (q: string) => void;
   /** Focus Wave on a set of signals, remembering what it replaced. */
@@ -310,11 +329,12 @@ export interface WaveState {
   loadMachines: () => Promise<void>;
   setFsmOpen: (open: boolean) => void;
   selectMachine: (signal: string) => void;
-  setFsmScrub: (cycle: number | null) => void;
+  setFsmScrub: (time: number | null) => void;
   loadDiffSessions: () => Promise<void>;
   setDiffOther: (trace: string) => void;
   setDiffStrategy: (s: string) => void;
-  runDiff: () => Promise<void>;
+  setDiffAnchors: (value: Partial<Pick<WaveState, "diffAnchor" | "diffMarksA" | "diffMarksB">>) => void;
+  runDiff: (focus?: number) => Promise<void>;
   ignoreSignal: (path: string) => Promise<void>;
   stepDivergence: (delta: number) => void;
   gotoDivergence: (index: number) => void;
@@ -330,6 +350,8 @@ export interface WaveState {
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 /** Set by tests to observe that a save actually reached the server. */
 let persistCount = 0;
+let perfRequest = 0;
+let perfWindowInFlight: { t0: number; t1: number } | null = null;
 
 export function layoutFrom(s: WaveState): Layout {
   return {
@@ -346,7 +368,11 @@ export function layoutFrom(s: WaveState): Layout {
     rowH: s.rowH,
     // The question, not the answer: the tree is derivable from it, and this is
     // the one field §13.8's `.vtsession` is really about.
-    query: s.causal?.query ?? "",
+    query: s.queryText,
+    queryHistory: s.queryHistory,
+    savedQueries: s.savedQueries,
+    diffOptions: { other: s.diffOther, strategy: s.diffStrategy, anchor: s.diffAnchor,
+      marksA: s.diffMarksA, marksB: s.diffMarksB, ignore: s.diffIgnore },
   };
 }
 
@@ -401,6 +427,17 @@ function seedRows(signals: SignalMeta[]): Row[] {
     .map((s) => ({ kind: "signal", handle: s.handle, path: s.path }) as Row);
 }
 
+function virtualHandle(path: string): number {
+  // Stable FNV-1a, kept negative so it cannot collide with a native trace
+  // handle (which is an array index).
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < path.length; i++) {
+    hash ^= path.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return -(Math.abs(hash | 0) + 1);
+}
+
 /** Guess the primary clock: the narrowest, busiest 1-bit signal named like one. */
 function guessClock(signals: SignalMeta[]): SignalMeta | null {
   const ones = signals.filter((s) => s.width === 1 && s.n_events > 2);
@@ -432,6 +469,7 @@ export const useWave = create<WaveState>((set, get) => ({
   causalError: null,
   causalBusy: false,
   activeNode: null,
+  hoveredCausal: null,
   subtrace: null,
   subtraceBusy: false,
   subtraceError: null,
@@ -445,6 +483,7 @@ export const useWave = create<WaveState>((set, get) => ({
   sourceBusy: false,
   checks: null,
   checksBusy: false,
+  checksError: null,
   txn: null,
   txnBusy: false,
   txnIface: null,
@@ -467,6 +506,7 @@ export const useWave = create<WaveState>((set, get) => ({
   focusLabel: "",
   queryText: "",
   queryHistory: [],
+  savedQueries: {},
   bookmarks: [],
   note: "",
   machines: [],
@@ -481,6 +521,9 @@ export const useWave = create<WaveState>((set, get) => ({
   diffSessions: [],
   diffOther: "",
   diffStrategy: "cycle",
+  diffAnchor: "",
+  diffMarksA: "",
+  diffMarksB: "",
   diffIgnore: [],
   diffIndex: 0,
   coverage: null,
@@ -495,9 +538,14 @@ export const useWave = create<WaveState>((set, get) => ({
   inspectorOpen: true,
   activeTab: 1,
   ready: false,
+  loading: false,
   error: null,
 
   load: async () => {
+    // StrictMode mounts effects twice in development. A second bootstrap used
+    // to arrive after a user's click and reset their selected tab and rows.
+    if (get().loading || get().ready) return;
+    set({ loading: true, error: null });
     try {
       const root = await fetchRoot();
       // `?session=<id>` opens a trace other than the one the server was
@@ -507,8 +555,12 @@ export const useWave = create<WaveState>((set, get) => ({
       const requested = new URLSearchParams(location.search).get("session");
       const session = requested || root.default_session;
       if (!session) throw new Error("server has no trace open");
-      const [status, signals, layout] = await Promise.all([
-        fetchStatus(session),
+      // POST /session starts a background job. Reading signals/layout before
+      // it is ready returns 409 and used to permanently fail the whole page.
+      const status = await waitForSession(session, (progress) => {
+        set({ note: `${progress.phase}: ${Math.round(progress.progress * 100)}%` });
+      });
+      const [signals, layout] = await Promise.all([
         fetchSignals(session),
         fetchLayout(session),
       ]);
@@ -518,14 +570,38 @@ export const useWave = create<WaveState>((set, get) => ({
       const known = new Set(signals.map((s) => s.handle));
       // Drop rows whose signal no longer exists (the dump may have changed).
       const rows = saved.filter((r) => r.kind === "group" || known.has(r.handle));
+      const configuredRadix = Object.fromEntries(
+        Object.entries(layout.radix ?? {}).filter((entry): entry is [string, Radix] =>
+          isRadix(entry[1]),
+        ),
+      );
+      const restoredHistory = (Array.isArray(layout.queryHistory) ? layout.queryHistory : [])
+        .filter((q): q is string => typeof q === "string" && q.trim().length > 0)
+        .slice(0, 50);
+      const restoredSaved = Object.fromEntries(
+        Object.entries(layout.savedQueries ?? {}).filter(
+          ([name, q]) => /^[A-Za-z_][\w.-]*$/.test(name) && typeof q === "string" && q.trim(),
+        ),
+      );
+      const restoredQuery = typeof layout.query === "string" ? layout.query.trim() : "";
 
-      const clock = guessClock(signals);
-      let clockPeriod: number | null = null;
-      let clockOrigin = 0;
-      if (clock && status.t1 > status.t0 && clock.n_events > 1) {
-        // Two edges per cycle.
-        clockPeriod = ((status.t1 - status.t0) / clock.n_events) * 2;
-        clockOrigin = status.t0;
+      // The backend has already resolved the configured/graph/heuristic clock
+      // and measured its real rising edges.  Re-guessing it from a transition
+      // count loses both the configured selection and non-uniform endpoints,
+      // and made cycle labels disagree with VTQ's `@cN` resolution.  Keep the
+      // old estimate only as compatibility for an older server that has no
+      // domain payload at all.
+      const primaryClock = status.clock_domains?.find((domain) => domain.primary);
+      let clockPeriod = primaryClock?.period ?? null;
+      let clockOrigin = primaryClock?.origin ?? status.t0;
+      if (!primaryClock) {
+        const clock = guessClock(signals);
+        if (clock && status.t1 > status.t0 && clock.n_events > 1) {
+          // Two transitions per cycle. This cannot recover a phase, so it is a
+          // compatibility approximation, never preferred over server data.
+          clockPeriod = ((status.t1 - status.t0) / clock.n_events) * 2;
+          clockOrigin = status.t0;
+        }
       }
 
       set({
@@ -534,13 +610,26 @@ export const useWave = create<WaveState>((set, get) => ({
         signals,
         signalsByHandle: new Map(signals.map((s) => [s.handle, s])),
         rows: rows.length > 0 ? rows : seedRows(signals),
-        radix: layout.radix ?? {},
+        radix: configuredRadix,
         bounds,
         view: layout.zoom ? clampView(layout.zoom, bounds) : bounds,
         cursor: layout.cursors?.length ? layout.cursors[0] : null,
         markers: layout.cursors?.length ? layout.cursors.slice(1) : [],
         rulerMode: layout.rulerMode === "cycle" ? "cycle" : "time",
         rowH: layout.rowH === 28 ? 28 : 20,
+        queryText: restoredQuery,
+        queryHistory: restoredHistory,
+        savedQueries: restoredSaved,
+        diff: null,
+        diffIndex: 0,
+        diffOther: typeof layout.diffOptions?.other === "string" ? layout.diffOptions.other : "",
+        diffStrategy: ["cycle", "handshake", "retire", "manual"].includes(layout.diffOptions?.strategy ?? "")
+          ? layout.diffOptions!.strategy : "cycle",
+        diffAnchor: typeof layout.diffOptions?.anchor === "string" ? layout.diffOptions.anchor : "",
+        diffMarksA: typeof layout.diffOptions?.marksA === "string" ? layout.diffOptions.marksA : "",
+        diffMarksB: typeof layout.diffOptions?.marksB === "string" ? layout.diffOptions.marksB : "",
+        diffIgnore: Array.isArray(layout.diffOptions?.ignore)
+          ? layout.diffOptions.ignore.filter((v): v is string => typeof v === "string") : [],
         // P5: bookmarks come back with everything else. Filtered to the marks
         // this trace can still place — a shared session (§13.8) may carry marks
         // for signals that are not in your dump, and a mark on nothing is worse
@@ -559,16 +648,41 @@ export const useWave = create<WaveState>((set, get) => ({
         activeTab: TAB_BY_NAME[status.default_tab] ?? 1,
         ready: true,
         error: null,
+        note: status.layout_error
+          ? `${status.layout_error}. Defaults are shown; the original will be backed up on save.`
+          : "",
       });
       // Always, not only on the Checks tab: §13.7's plugin tables arrive with
       // the checks, and the tab strip cannot show them before they are here.
       // The report is computed when the session opens, so this is one read.
       void get().loadChecks();
       // P5 and §13.8: the question is part of the screen, so it is asked again.
-      const restored = typeof layout.query === "string" ? layout.query.trim() : "";
-      if (restored && status.has_rtl) void get().restoreQuery(restored);
+      if (/^why\s*\(/i.test(restoredQuery) && status.has_rtl && !new URLSearchParams(location.search).has("signal")) {
+        void get().restoreQuery(restoredQuery);
+      }
+      // Cross-run causal links carry B's identity and native time, not A's state.
+      const navigation = new URLSearchParams(location.search);
+      const linkedSignal = signals.find((v) => v.path === navigation.get("signal"));
+      const linkedTime = Number(navigation.get("time"));
+      if (linkedSignal && navigation.has("time") && Number.isSafeInteger(linkedTime) &&
+          linkedTime >= bounds.t0 && linkedTime <= bounds.t1) {
+        get().jumpTo(linkedTime, [linkedSignal.path]);
+        if (navigation.get("tab") === "3") {
+          get().setTab(3);
+          const file = navigation.get("file");
+          const line = Number(navigation.get("line"));
+          if (file && Number.isSafeInteger(line) && line > 0) void get().openSource(file, line);
+        }
+      }
+      // Enum radix names come from the real FSM extractor.  Load them eagerly
+      // only when a configured/saved row asks for enum display.
+      if (status.has_rtl && Object.values(configuredRadix).includes("enum")) {
+        void get().loadMachines();
+      }
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e), ready: false });
+    } finally {
+      set({ loading: false });
     }
   },
 
@@ -634,6 +748,21 @@ export const useWave = create<WaveState>((set, get) => ({
     set({ rows: [...get().rows, { kind: "signal", handle, path: sig.path }] });
     schedulePersist(get);
   },
+  registerSignals: (metas) => {
+    if (!metas.length) return;
+    const s = get();
+    const byHandle = new Map(s.signalsByHandle);
+    const known = new Set(s.signals.map((sig) => sig.handle));
+    const signals = [...s.signals];
+    for (const meta of metas) {
+      byHandle.set(meta.handle, meta);
+      if (!known.has(meta.handle)) {
+        known.add(meta.handle);
+        signals.push(meta);
+      }
+    }
+    set({ signals, signalsByHandle: byHandle });
+  },
   /**
    * The bulk half of §11.3's tree, and the reason it exists.
    *
@@ -698,6 +827,13 @@ export const useWave = create<WaveState>((set, get) => ({
   setHelp: (open) => set({ helpOpen: open }),
   toggleTree: () => set({ treeOpen: !get().treeOpen }),
   toggleInspector: () => set({ inspectorOpen: !get().inspectorOpen }),
+  toggleSidePanels: () => {
+    const s = get();
+    // If either side is visible the chord clears the workspace; if both are
+    // already hidden it restores the complete three-column layout.
+    const open = !s.treeOpen && !s.inspectorOpen;
+    set({ treeOpen: open, inspectorOpen: open });
+  },
 
   setTab: (n) => set({ activeTab: n }),
 
@@ -735,8 +871,25 @@ export const useWave = create<WaveState>((set, get) => ({
       note: "",
     });
     try {
-      const res = await runQuery(s.session, text);
-      set({ causal: res, causalBusy: false, activeNode: nodeId(res.root) });
+      const res = await streamQuery(s.session, text, (partial) => {
+        if (partial.progress) {
+          set({ note: `${partial.progress.phase}: ${Math.round(partial.progress.elapsed_ms)} ms elapsed` });
+        }
+        if (!partial.node) return;
+        // The node is complete (its children have already been emitted), so it
+        // is an honest partial causal answer rather than synthetic progress.
+        set({
+          causal: {
+            query: text,
+            signal: partial.node.signal,
+            time: partial.node.time,
+            root: partial.node,
+            stats: { nodes: 0, ms: 0, truncated: false },
+          },
+          activeNode: nodeId(partial.node),
+        });
+      }) as WhyResult;
+      set({ causal: res, causalBusy: false, activeNode: nodeId(res.root), note: "" });
       get().rememberQuery(text);
       schedulePersist(get);
       const loc = res.root.loc;
@@ -772,7 +925,38 @@ export const useWave = create<WaveState>((set, get) => ({
    */
   selectCausal: (node) => {
     const s = get();
-    const handle = s.signals.find((x) => x.path === node.signal)?.handle ?? null;
+    let handle = s.signals.find((x) => x.path === node.signal)?.handle ?? null;
+    if (node.derived && (handle === null || s.signalsByHandle.get(handle)?.derived)) {
+      handle = handle ?? virtualHandle(node.signal);
+      while (
+        s.signalsByHandle.has(handle) &&
+        s.signalsByHandle.get(handle)?.path !== node.signal
+      ) {
+        handle -= 1;
+      }
+      const leaf = node.signal.split(".").at(-1) ?? node.signal;
+      get().registerSignals([
+        {
+          handle,
+          path: node.signal,
+          name: leaf,
+          scope: node.signal.includes(".") ? node.signal.slice(0, node.signal.lastIndexOf(".")) : "",
+          width: Math.max(node.width, 1),
+          kind: "derived",
+          stream_id: -1,
+          msb: null,
+          lsb: null,
+          array_index: null,
+          n_events: 1,
+          derived: true,
+          sample_time: node.time,
+          sample_value: node.value,
+        },
+      ]);
+      if (!s.rows.some((row) => row.kind === "signal" && row.path === node.signal)) {
+        set({ rows: [...get().rows, { kind: "signal", handle, path: node.signal }] });
+      }
+    }
     set({
       activeNode: nodeId(node),
       cursor: node.time,
@@ -787,10 +971,42 @@ export const useWave = create<WaveState>((set, get) => ({
     if (node.loc) void get().openSource(node.loc.file, node.loc.line);
   },
 
+  setHoveredCausal: (path) => set({ hoveredCausal: path }),
+
   /** Run a query typed into the query bar verbatim. */
   runQueryText: async (text) => {
     const s = get();
     if (!s.session) return;
+
+    const define = /^\s*@([A-Za-z_][\w.-]*)\s*=\s*(.+?)\s*$/.exec(text);
+    if (define) {
+      const [, name, query] = define;
+      set({
+        savedQueries: { ...s.savedQueries, [name]: query },
+        queryText: text.trim(),
+        note: `Saved @${name}. Run it by typing @${name}.`,
+      });
+      get().rememberQuery(text);
+      schedulePersist(get);
+      return;
+    }
+    const alias = /^\s*@([A-Za-z_][\w.-]*)\s*$/.exec(text);
+    if (alias) {
+      const query = s.savedQueries[alias[1]];
+      if (!query) {
+        set({ queryText: text.trim(), note: `No saved query named @${alias[1]}.` });
+        return;
+      }
+      if (/^\s*@/.test(query)) {
+        set({ note: `@${alias[1]} points to another alias; save the VTQ command itself.` });
+        return;
+      }
+      await get().runQueryText(query);
+      get().rememberQuery(text);
+      set({ queryText: text.trim() });
+      schedulePersist(get);
+      return;
+    }
 
     // §9.2 lists `subtrace(...)` and `repro(...)` beside `why(...)`, and they
     // are the same question asked one step further: minimise the chain, or
@@ -807,13 +1023,129 @@ export const useWave = create<WaveState>((set, get) => ({
       return;
     }
 
-    set({ ...askingAgain(), causalBusy: true, activeTab: 2, queryText: text, note: "" });
+    set({ ...askingAgain(), causalBusy: true, queryText: text, note: "" });
     try {
-      const res = await runQuery(s.session, text);
-      set({ causal: res, causalBusy: false, activeNode: nodeId(res.root), cursor: res.time });
+      const causalQuery = /^\s*why(?:_not)?\s*\(/i.test(text);
+      if (causalQuery) set({ activeTab: 2 });
+      const res = await streamQuery(s.session, text, (partial) => {
+        if (partial.progress) {
+          set({ note: `${partial.progress.phase}: ${Math.round(partial.progress.elapsed_ms)} ms elapsed` });
+        }
+        if (!causalQuery || !partial.node) return;
+        set({
+          causal: {
+            query: text,
+            signal: partial.node.signal,
+            time: partial.node.time,
+            root: partial.node,
+            stats: { nodes: 0, ms: 0, truncated: false },
+          },
+          activeNode: nodeId(partial.node),
+          cursor: partial.node.time,
+        });
+      });
       get().rememberQuery(text);
       schedulePersist(get);
-      if (res.root.loc) void get().openSource(res.root.loc.file, res.root.loc.line);
+      const result = res as unknown as Record<string, unknown>;
+      if (result.root && typeof result.root === "object") {
+        const why = res as WhyResult;
+        set({
+          causal: why,
+          causalBusy: false,
+          activeTab: 2,
+          activeNode: nodeId(why.root),
+          cursor: why.time,
+          note: "",
+        });
+        if (why.root.loc) void get().openSource(why.root.loc.file, why.root.loc.line);
+        return;
+      }
+
+      // Non-why VTQ is still the global bar. Route its real result to the
+      // panel that can consume it instead of treating every JSON shape as a
+      // causal tree (which used to throw on `res.root`).
+      set({ causalBusy: false, causal: null, note: "" });
+      const rawSignalRows = Array.isArray(result.signals)
+        ? (result.signals as { handle?: number; path?: string }[]).filter(
+            (row) => row && typeof row.handle === "number" && typeof row.path === "string",
+          )
+        : [];
+      if (rawSignalRows.length) {
+        const complete = rawSignalRows.filter(
+          (row): row is SignalMeta =>
+            typeof (row as Partial<SignalMeta>).width === "number" &&
+            typeof (row as Partial<SignalMeta>).name === "string",
+        );
+        get().registerSignals(complete);
+        get().focusRows(
+          rawSignalRows.map((sig) => ({
+            kind: "signal",
+            handle: sig.handle as number,
+            path: sig.path as string,
+          })),
+          text,
+        );
+        set({ activeTab: 1, note: `${rawSignalRows.length} matching signal(s).` });
+      } else if (Array.isArray(result.nodes)) {
+        const paths = new Set(
+          (result.nodes as { path?: string }[]).map((n) => n.path).filter(Boolean),
+        );
+        const rows = get().signals
+          .filter((sig) => paths.has(sig.path))
+          .map((sig) => ({ kind: "signal", handle: sig.handle, path: sig.path }) as Row);
+        get().focusRows(rows, text);
+        set({ activeTab: 1, note: `${rows.length} cone signal(s) loaded into Wave.` });
+      } else if (Array.isArray(result.transactions)) {
+        set({
+          txnRows: result.transactions as Transaction[],
+          txnBusy: false,
+          activeTab: 8,
+          note: `${result.transactions.length} transaction(s).`,
+        });
+      } else if (Array.isArray(result.machines)) {
+        const machines = result.machines as Machine[];
+        set({
+          machines,
+          fsmOpen: true,
+          fsmSignal: machines[0]?.signal ?? null,
+          activeTab: 3,
+          note: `${machines.length} state machine(s).`,
+        });
+      } else if (Array.isArray(result.findings)) {
+        set({ activeTab: 6, note: `${result.findings.length} finding(s); see Checks.` });
+      } else if (Array.isArray(result.holes)) {
+        const holes = result.holes as Hole[];
+        // An FSM edge can be the first route into Coverage.  In that case the
+        // ordinary report has not been fetched yet; selecting a key without
+        // storing the corresponding Hole leaves the Inspector pointing at
+        // nothing.  Load the production report first, then add query-local
+        // holes without losing functional/code coverage.
+        const coverage = get().coverage ?? (await fetchCoverage(s.session));
+        let merged = coverage;
+        if (holes.length) {
+          const byKey = new Map(
+            coverage.holes.map((hole) => [
+              `${hole.file}:${hole.line}:${hole.label}`,
+              hole,
+            ]),
+          );
+          for (const hole of holes) {
+            byKey.set(`${hole.file}:${hole.line}:${hole.label}`, hole);
+          }
+          merged = { ...coverage, holes: [...byKey.values()] };
+        }
+        const first = holes[0];
+        set({
+          coverage: merged,
+          covHole: first ? `${first.file}:${first.line}:${first.label}` : null,
+          activeTab: 7,
+          note: `${holes.length} uncovered point(s).`,
+        });
+      } else if (Array.isArray(result.interfaces)) {
+        set({ activeTab: 8, note: `${result.interfaces.length} interface result(s).` });
+      } else {
+        set({ note: `${String(result.kind ?? "query")} completed.` });
+      }
     } catch (e) {
       set({
         causal: null,
@@ -840,7 +1172,7 @@ export const useWave = create<WaveState>((set, get) => ({
     const s = get();
     if (!s.session) return;
     try {
-      const res = await runQuery(s.session, text);
+      const res = (await streamQuery(s.session, text)) as WhyResult;
       set({ causal: res, activeNode: nodeId(res.root) });
     } catch {
       /* silent by design — see above */
@@ -955,10 +1287,11 @@ export const useWave = create<WaveState>((set, get) => ({
   runTxn: async (vtq) => {
     const s = get();
     if (!s.session) return;
-    set({ txnBusy: true, txnError: null });
+    set({ txnBusy: true, txnError: null, queryText: vtq });
     try {
       const r = await runTxnQuery(s.session, vtq);
       set({ txnRows: r.transactions, txnBusy: false });
+      get().rememberQuery(vtq);
     } catch (e) {
       set({ txnBusy: false, txnError: e instanceof Error ? e.message : String(e) });
     }
@@ -993,16 +1326,22 @@ export const useWave = create<WaveState>((set, get) => ({
 
   loadPerformance: async () => {
     const s = get();
-    if (!s.session || s.perfBusy) return;
+    if (!s.session) return;
+    const window = s.perfWindow;
+    if (s.perfBusy && window === perfWindowInFlight) return;
+    perfWindowInFlight = window;
+    const request = ++perfRequest;
     set({ perfBusy: true, perfError: null });
     try {
-      const report = await fetchPerformance(s.session);
+      const report = await fetchPerformance(s.session, window);
+      if (request !== perfRequest) return;
       set({
         perf: report,
         perfBusy: false,
         perfIface: get().perfIface ?? report.interfaces[0]?.iface ?? null,
       });
     } catch (e) {
+      if (request !== perfRequest) return;
       set({ perfBusy: false, perfError: e instanceof Error ? e.message : String(e) });
     }
   },
@@ -1039,6 +1378,7 @@ export const useWave = create<WaveState>((set, get) => ({
       set({ view: clampView({ t0: w.t0, t1: w.t1 }, s.bounds), cursor: w.t0 });
       schedulePersist(get);
     }
+    void get().loadPerformance();
   },
 
   // --- TAB 10, Memory (§8.20, §11.4b) ---------------------------------
@@ -1049,23 +1389,37 @@ export const useWave = create<WaveState>((set, get) => ({
     set({ memoryBusy: true, memoryError: null });
     try {
       const report = await fetchMemory(s.session);
+      if (get().session !== s.session) return;
       set({ memory: report, memoryBusy: false });
-      const first = report.interfaces[0]?.iface ?? null;
-      if (first && !get().memIface) await get().selectMemIface(first);
+      const selected = get().memIface ?? report.interfaces[0]?.iface;
+      if (selected) await get().selectMemIface(selected);
     } catch (e) {
       set({ memoryBusy: false, memoryError: e instanceof Error ? e.message : String(e) });
     }
   },
 
+  applyMemoryTiming: async (iface, choice) => {
+    const s = get();
+    if (!s.session || s.memoryBusy) return;
+    set({ memoryBusy: true, memoryError: null });
+    try {
+      const report = await setMemoryTiming(s.session, iface, choice);
+      if (get().session !== s.session) return;
+      set({ memory: report, memoryBusy: false, checks: null, coverage: null });
+    } catch (e) {
+      if (get().session === s.session) set({ memoryBusy: false, memoryError: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
   selectMemIface: async (name) => {
     const s = get();
-    set({ memIface: name, memCommands: [] });
+    set({ memIface: name, memCommands: [], memoryError: null });
     if (!s.session) return;
     try {
       const got = await fetchCommands(s.session, name);
-      set({ memCommands: got.commands });
+      if (get().session === s.session && get().memIface === name) set({ memCommands: got.commands });
     } catch (e) {
-      set({ memoryError: e instanceof Error ? e.message : String(e) });
+      if (get().session === s.session && get().memIface === name) set({ memoryError: e instanceof Error ? e.message : String(e) });
     }
   },
 
@@ -1097,6 +1451,7 @@ export const useWave = create<WaveState>((set, get) => ({
     // Most recent first, and asking the same thing twice does not fill the
     // history with one question. Capped: this is a session's recall, not a log.
     set({ queryHistory: [q, ...s.queryHistory.filter((x) => x !== q)].slice(0, 50) });
+    schedulePersist(get);
   },
 
   addBookmark: () => {
@@ -1208,13 +1563,12 @@ export const useWave = create<WaveState>((set, get) => ({
     if (m?.loc) void get().openSource(m.loc.file, m.loc.line);
   },
 
-  setFsmScrub: (cycle) => {
-    const s = get();
-    set({ fsmScrub: cycle });
-    if (cycle !== null && s.clockPeriod) {
+  setFsmScrub: (time) => {
+    set({ fsmScrub: time });
+    if (time !== null) {
       // §8.8 step 6: scrubbing moves the shared cursor, so Wave and Source
       // follow the state the diagram is lighting up.
-      set({ cursor: Math.round(s.clockOrigin + cycle * s.clockPeriod) });
+      set({ cursor: time });
     }
   },
 
@@ -1236,20 +1590,38 @@ export const useWave = create<WaveState>((set, get) => ({
     }
   },
 
-  setDiffOther: (trace) => set({ diffOther: trace, diff: null, diffIndex: 0 }),
-  setDiffStrategy: (strategy) => set({ diffStrategy: strategy, diff: null, diffIndex: 0 }),
+  setDiffOther: (trace) => { set({ diffOther: trace, diff: null, diffIndex: 0 }); schedulePersist(get); },
+  setDiffStrategy: (strategy) => { set({ diffStrategy: strategy, diff: null, diffIndex: 0 }); schedulePersist(get); },
+  setDiffAnchors: (value) => { set({ ...value, diff: null, diffIndex: 0 }); schedulePersist(get); },
 
-  runDiff: async () => {
+  runDiff: async (focus) => {
     const s = get();
     if (!s.session || !s.diffOther || s.diffBusy) return;
     set({ diffBusy: true, diffError: null });
     try {
+      const times = (text: string): number[] => {
+        const tokens = text.trim().split(/[\s,;]+/).filter(Boolean);
+        if (!tokens.length || tokens.some((v) => !/^\d+$/.test(v) || !Number.isSafeInteger(Number(v))))
+          throw new Error("Manual anchors must be whole trace ticks, separated by commas or whitespace.");
+        return tokens.map(Number);
+      };
       const got = await runDiffRequest(s.session, s.diffOther, {
         strategy: s.diffStrategy,
+        anchor: s.diffAnchor || null,
+        times_a: s.diffStrategy === "manual" ? times(s.diffMarksA) : [],
+        times_b: s.diffStrategy === "manual" ? times(s.diffMarksB) : [],
         ignore: s.diffIgnore,
+        focus: focus !== undefined ? s.diff?.divergences[focus]?.signal : null,
       });
-      set({ diff: got, diffBusy: false, diffIndex: 0 });
-      if (got.divergences.length) get().gotoDivergence(0);
+      if (get().session !== s.session) return;
+      if (get().diffOther !== s.diffOther || get().diffStrategy !== s.diffStrategy ||
+          get().diffMarksA !== s.diffMarksA || get().diffMarksB !== s.diffMarksB || get().diffAnchor !== s.diffAnchor ||
+          get().diffIgnore !== s.diffIgnore) {
+        set({ diffBusy: false });
+        return;
+      }
+      set({ diff: got, diffBusy: false, diffIndex: focus ?? 0 });
+      if (got.divergences.length) get().gotoDivergence(focus ?? 0);
     } catch (e) {
       set({ diffBusy: false, diffError: e instanceof Error ? e.message : String(e) });
     }
@@ -1259,15 +1631,22 @@ export const useWave = create<WaveState>((set, get) => ({
   ignoreSignal: async (path) => {
     if (get().diffIgnore.includes(path)) return;
     set({ diffIgnore: [...get().diffIgnore, path] });
+    schedulePersist(get);
     await get().runDiff();
   },
 
   gotoDivergence: (index) => {
     const s = get();
     const list = s.diff?.divergences ?? [];
-    if (!list.length) return;
+    if (!list.length || s.diffBusy) return;
     const i = Math.max(0, Math.min(index, list.length - 1));
     const d = list[i];
+    // Commit the selection only once its own wave and causal trees arrive.
+    // Failed requests must not label the previous answer with a new signal.
+    if (s.diff?.focus !== d.signal) {
+      void get().runDiff(i);
+      return;
+    }
     set({ diffIndex: i });
     // §11.6: choosing a divergence moves every other panel to it, in *this*
     // trace's own time — the shared axis is for comparing, not for navigating.
@@ -1276,7 +1655,7 @@ export const useWave = create<WaveState>((set, get) => ({
       cursor: d.time_a,
       view: clampView({ t0: d.time_a - span, t1: d.time_a + span }, s.bounds),
     });
-    const sig = s.signals.find((x) => x.path.endsWith(d.signal));
+    const sig = s.signals.find((x) => x.path === d.signal || x.path.endsWith(`.${d.signal}`));
     if (sig) set({ selected: sig.handle });
   },
 
@@ -1331,13 +1710,12 @@ export const useWave = create<WaveState>((set, get) => ({
 
   loadChecks: async () => {
     const s = get();
-    if (!s.session) return;
-    set({ checksBusy: true });
+    if (!s.session || s.checksBusy) return;
+    set({ checksBusy: true, checksError: null });
     try {
       set({ checks: await fetchChecks(s.session), checksBusy: false });
     } catch (e) {
-      console.warn("checks failed", e);
-      set({ checksBusy: false });
+      set({ checksBusy: false, checksError: e instanceof Error ? e.message : String(e) });
     }
   },
 
@@ -1375,6 +1753,16 @@ export const useWave = create<WaveState>((set, get) => ({
 /** Stable identity for a causal node: one signal at one time. */
 export function nodeId(n: CausalNode): string {
   return `${n.signal}@${n.time}`;
+}
+
+/** Symbolic state names for enum radix, sourced from the RTL/FSM extractor. */
+export function enumLabelsFor(
+  machines: Machine[],
+  path: string,
+): Record<string, string> | undefined {
+  const machine = machines.find((m) => m.signal === path);
+  if (!machine) return undefined;
+  return Object.fromEntries(machine.states.map((state) => [String(state.value), state.name]));
 }
 
 // Exposed for the end-to-end tests and for poking at state from the console.

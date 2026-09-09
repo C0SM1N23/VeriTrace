@@ -11,12 +11,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 from veritrace import TraceStore, convert
 from veritrace.analysis.whytrace import Reason, WhyTracer
 from veritrace.correlate.resolver import correlate
 from veritrace.graph.elaborate import discover, elaborate
 from veritrace.ingest import capture as cap
+from veritrace.cli import main
 
 DESIGNS = Path(__file__).resolve().parents[1] / "designs"
 
@@ -129,3 +131,53 @@ def test_an_unknown_format_is_refused_by_name(tmp_path):
     p.write_text(VIVADO, encoding="utf-8")
     with pytest.raises(ValueError, match="unknown capture format"):
         cap.read(p, fmt="chipscope")
+
+
+def test_serve_opens_csv_directly_as_an_honest_capture(tmp_path, monkeypatch):
+    """The exact §8.11b command reaches a live API session, not an import detour."""
+    csv_path = tmp_path / "ila.csv"
+    csv_path.write_text(VIVADO, encoding="utf-8")
+    served = {}
+
+    def run_server(app, **_kwargs):
+        served["app"] = app
+
+    monkeypatch.setattr("uvicorn.run", run_server)
+    got = CliRunner().invoke(
+        main,
+        [
+            "serve",
+            str(csv_path),
+            "--format",
+            "vivado-ila",
+            "--scope",
+            "tb",
+            "--no-browser",
+        ],
+    )
+
+    assert got.exit_code == 0, got.output
+    app = served["app"]
+    session = app.state.registry.get(app.state.default_session_id)
+    status = session.status()
+    assert status["capture"] is True
+    assert status["n_signals"] == 3
+    assert session.store.find("tb.dut.full") is not None
+    assert cap.marker_path(session.trace_path).is_file()
+
+
+def test_import_capture_marker_survives_a_later_session_open(tmp_path):
+    from veritrace.api.sessions import Session
+
+    csv_path = tmp_path / "ila.csv"
+    csv_path.write_text(VIVADO, encoding="utf-8")
+    out = tmp_path / "ila.vcd"
+    got = CliRunner().invoke(
+        main,
+        ["import-capture", str(csv_path), "--format", "vivado-ila", "-o", str(out)],
+    )
+    assert got.exit_code == 0, got.output
+    assert cap.marker_path(out).is_file()
+
+    session = Session.open(out)
+    assert session.status()["capture"] is True

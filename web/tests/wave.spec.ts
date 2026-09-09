@@ -289,7 +289,11 @@ test.describe("layout persistence", () => {
 
     // Give the debounced save time to land, then confirm it actually reached
     // the server rather than trusting the timer.
-    await page.waitForFunction(() => ((window as any).__vtSaves ?? 0) > 0, null, { timeout: 5000 });
+    const sid = (await (await request.get(`${BACKEND}/`)).json()).default_session;
+    await expect.poll(async () => {
+      const saved = await (await request.get(`${BACKEND}/session/${sid}/layout`)).json();
+      return { rows: saved.signals, radix: saved.radix, view: saved.zoom, cursor: saved.cursors[0] };
+    }).toEqual({ rows: before.rows, radix: before.radix, view: before.view, cursor: before.cursor });
 
     await page.reload();
     await expect(page.locator('[data-testid="signal-row"]').first()).toBeVisible();
@@ -331,7 +335,11 @@ test.describe("layout persistence", () => {
     const moved = await order();
     expect(moved).not.toEqual(original);
 
-    await page.waitForFunction(() => ((window as any).__vtSaves ?? 0) > 0, null, { timeout: 5000 });
+    const sid = (await (await request.get(`${BACKEND}/`)).json()).default_session;
+    await expect.poll(async () => {
+      const saved = await (await request.get(`${BACKEND}/session/${sid}/layout`)).json();
+      return saved.signals.map((row: { path?: string }) => row.path);
+    }).toEqual(moved);
     await page.reload();
     await expect(page.locator('[data-testid="signal-row"]').first()).toBeVisible();
     expect(await order()).toEqual(moved);

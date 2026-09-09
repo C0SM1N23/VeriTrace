@@ -94,6 +94,8 @@ def run_all(
     memory_reports: Any = None,
     integrity_report: Any = None,
     project_root: Any = None,
+    coverage_report: Any = None,
+    performance_report: Any = None,
 ) -> Report:
     """Run every applicable check.
 
@@ -139,7 +141,7 @@ def run_all(
     run(
         Group.PROTOCOL.value,
         None if analysis is not None else "protocol extraction was not run",
-        lambda: protocol.scan(analysis, clock, config),
+        lambda: protocol.scan(analysis, clock, config, graph),
     )
     # §8.9's one structural row: a `ready` computed from `valid` in the same
     # cycle. It needs the graph and not the trace — a run where the two never
@@ -155,14 +157,14 @@ def run_all(
     run(
         Group.LIVENESS.value,
         None if liveness_report is not None else "the liveness scan was not run",
-        lambda: liveness.scan(liveness_report, clock, config),
+        lambda: liveness.scan(liveness_report, clock, config, graph),
     )
     # §8.20, same terms again: no memory interfaces is a result, no scan at
     # all is a skip.
     run(
         Group.MEMORY.value,
         None if memory_reports is not None else "the memory scan was not run",
-        lambda: memory.scan(memory_reports, config),
+        lambda: memory.scan(memory_reports, config, graph),
     )
     # §8.19, on the same terms once more: a design whose packs declare no
     # `[integrity]` produces an empty report with its reasons on it, which is a
@@ -170,7 +172,7 @@ def run_all(
     run(
         Group.INTEGRITY.value,
         None if integrity_report is not None else "the data-integrity scan was not run",
-        lambda: integrity.scan(integrity_report, config),
+        lambda: integrity.scan(integrity_report, config, graph),
     )
     # §8.8. Needs the graph and nothing else: the whole point of these checks is
     # that they find a dead state the stimulus never reached, so a session with
@@ -196,7 +198,19 @@ def run_all(
     run(
         Group.PLUGIN.value,
         None,
-        lambda: _plugins(store, graph, elaboration, clock, config, analysis, report, project_root),
+        lambda: _plugins(
+            store,
+            graph,
+            elaboration,
+            clock,
+            config,
+            analysis,
+            report,
+            project_root,
+            coverage_report,
+            memory_reports,
+            performance_report,
+        ),
     )
     run(
         Group.PARAMETERS.value,
@@ -208,7 +222,82 @@ def run_all(
     return report
 
 
-def _plugins(store, graph, elaboration, clock, config, analysis, report, project_root=None) -> Iterator[Finding]:
+def run_static(
+    graph: Any,
+    elaboration: Any,
+    config: Any = None,
+    project_root: Any = None,
+) -> Report:
+    """Run the checks that genuinely have enough input without a waveform.
+
+    ``check --static`` is the §8.10c entry point for a user who has only RTL.
+    Feeding ``None`` into :func:`run_all` would let trace-dependent detectors
+    raise internally and label themselves ``failed``; worse, a detector that
+    happened to tolerate it could look as if it had checked a run that does
+    not exist.  This path names the unavailable groups explicitly and executes
+    only graph/elaboration checks plus graph-only plugins.
+    """
+    report = Report()
+    started = _time.perf_counter()
+    disabled = expand_checks(getattr(config, "disabled_checks", ()) or ())
+
+    no_trace = "static mode has no waveform evidence"
+    report.skipped.update(
+        {
+            Group.STUCK.value: no_trace,
+            Group.X_SOURCES.value: no_trace,
+            Group.PROTOCOL.value: "static mode has no trace from which to detect interfaces",
+            f"{Group.PROTOCOL.value}.handshake": (
+                "static mode has no trace from which to detect protocol interfaces"
+            ),
+            Group.LIVENESS.value: no_trace,
+            Group.MEMORY.value: no_trace,
+            Group.INTEGRITY.value: no_trace,
+        }
+    )
+
+    def collect(name: str, fn: Callable[[], Iterator[Finding]]) -> None:
+        try:
+            report.findings.extend(f for f in fn() if f.check not in disabled)
+        except Exception as exc:  # noqa: BLE001 - preserve the other static checks
+            report.skipped[name] = f"failed: {exc}"
+
+    collect(Group.FSM.value, lambda: fsmchecks.scan(graph, elaboration, None, config))
+    collect(
+        Group.LINT.value,
+        lambda: lint.scan(graph, elaboration.diagnostics, None, None, config),
+    )
+    collect(Group.PARAMETERS.value, lambda: params.scan(elaboration, config))
+    collect(
+        Group.PLUGIN.value,
+        lambda: _plugins(
+            None,
+            graph,
+            elaboration,
+            None,
+            config,
+            None,
+            report,
+            project_root,
+        ),
+    )
+    report.elapsed_ms = (_time.perf_counter() - started) * 1000.0
+    return report
+
+
+def _plugins(
+    store,
+    graph,
+    elaboration,
+    clock,
+    config,
+    analysis,
+    report,
+    project_root=None,
+    coverage_report=None,
+    memory_reports=None,
+    performance_report=None,
+) -> Iterator[Finding]:
     """§13.7's plugins, discovered and run like any other detector.
 
     The tables they produce travel on the report rather than being dropped:
@@ -234,6 +323,9 @@ def _plugins(store, graph, elaboration, clock, config, analysis, report, project
         clock=clock,
         config=config,
         protocol=analysis,
+        coverage=coverage_report,
+        memory=memory_reports,
+        performance=performance_report,
     )
     report.plugin_tables.extend(got.tables)
     report.skipped.update({f"plugin:{name}": why for name, why in got.skipped.items()})

@@ -45,16 +45,15 @@ BUDGETS_MS = {
     "b": {"stuck": 3000.0, "extract": None, "why": 300.0},
 }
 
-#: §4.2's own shapes: tier A is ~5k signals, tier B ~50k.
-SHAPE = {"a": (5_000, 1_500), "b": (50_000, 1_500)}
+#: §4.2's own shapes: 5k/50k signals and 10^7/10^8 transitions.
+#: `_generate` changes one tenth of the signals every other step, so 40k
+#: steps reaches the named event count in both tiers.  A smaller default made
+#: the CI job green on roughly four percent of the workload it claimed to gate.
+SHAPE = {"a": (5_000, 40_000), "b": (50_000, 40_000)}
 
-#: What §4.2 names for each tier: 10^7 transitions at A, 10^8 at B.
-#:
-#: The default `SHAPE` above generates well under both, because the generator is
-#: Python and a hundred million events takes long enough that nobody would run
-#: it. That is a defensible default and an indefensible silence — a scan timed on
-#: a twenty-fifth of the trace the budget describes is not that budget checked.
-#: So the shortfall is printed, and `--steps` exists to close it when it matters.
+#: What §4.2 names for each tier: 10^7 transitions at A, 10^8 at B. The default
+#: shape reaches these values; `--steps` may deliberately make a quicker local
+#: smoke run, but that run is non-gating unless `--allow-smaller` is explicit.
 NOMINAL_EVENTS = {"a": 10_000_000, "b": 100_000_000}
 
 #: §4.2 asks about `why()` "cu 200 de noduri". The reference designs top out at
@@ -116,13 +115,18 @@ def _generate(path: Path, n_signals: int, n_steps: int) -> None:
     """
     rng = random.Random(7)
     with path.open("w", newline="\n") as f:
-        f.write("$timescale 1ns $end\n$scope module tb $end\n")
+        f.write(
+            "$timescale 1ns $end\n"
+            "$scope module tb $end\n"
+            "$scope module dut $end\n"
+            "$scope module fabric $end\n"
+            "$scope module bank $end\n"
+        )
         f.write(f"$var reg 1 {_ident(0)} clk $end\n")
         for i in range(1, n_signals):
-            if i % 250 == 0:
-                f.write(f"$upscope $end\n$scope module u_blk{i // 250} $end\n")
             f.write(f"$var reg 8 {_ident(i)} sig{i} [7:0] $end\n")
-        f.write("$upscope $end\n$upscope $end\n$enddefinitions $end\n")
+        f.write("$upscope $end\n" * 4)
+        f.write("$enddefinitions $end\n")
         f.write(f"#0\n0{_ident(0)}\n")
         for i in range(1, n_signals):
             f.write(f"b0 {_ident(i)}\n")
@@ -143,11 +147,19 @@ def _timed(fn) -> tuple[float, object]:
 
 
 def _rss_mb() -> float | None:
-    """Resident set size, when something can report it. Never a hard dependency."""
+    """Current resident set size without making the benchmark optional in CI."""
     try:
         import psutil
     except ImportError:
-        return None
+        # The benchmark jobs run on Linux. `/proc` reports current RSS (unlike
+        # `resource.ru_maxrss`, which is a peak and makes before/after retention
+        # meaningless), so Tier B's 1.5 GB gate remains real without adding a
+        # runtime dependency to VeriTrace itself.
+        try:
+            fields = Path("/proc/self/statm").read_text(encoding="ascii").split()
+            return int(fields[1]) * int(__import__("os").sysconf("SC_PAGE_SIZE")) / 1e6
+        except (OSError, ValueError, IndexError, AttributeError):
+            return None
     return psutil.Process().memory_info().rss / 1e6
 
 
@@ -211,45 +223,57 @@ def measure_extraction(budget: float | None) -> Row:
     )
 
 
-def measure_why(budget: float | None) -> Row:
-    """§8.1 on the biggest question the reference designs contain.
+def _why_fixture(root: Path) -> tuple[Path, Path, str]:
+    """A real elaborated 200-leaf causal question for §4.2's named shape."""
+    count = WHY_NODES
+    rtl = root / "why_bench.sv"
+    vcd = root / "why_bench.vcd"
+    names = [f"s{i}" for i in range(count)]
+    rtl.write_text(
+        "module why_bench(\n  input logic "
+        + ", ".join(names)
+        + ",\n  output logic out\n);\n"
+        + "  assign out = "
+        + " | ".join(names)
+        + ";\nendmodule\n",
+        encoding="utf-8",
+    )
+    lines = [
+        "$timescale 1ns $end",
+        "$scope module why_bench $end",
+    ]
+    for i, name in enumerate([*names, "out"]):
+        lines.append(f"$var wire 1 {_ident(i)} {name} $end")
+    lines += ["$upscope $end", "$enddefinitions $end", "#0"]
+    lines += [f"0{_ident(i)}" for i in range(count + 1)]
+    vcd.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return rtl, vcd, "why_bench.out"
 
-    The question comes from `designs/cpu_top/expected.toml` rather than being
-    invented here, so the benchmark and the golden suite ask the same thing —
-    a timing number for a query nobody checks the answer of is worth little.
-    """
-    import tomllib
 
+def measure_why(root: Path, budget: float | None) -> Row:
+    """§8.1 over at least 200 nodes through parser, Slang and correlation."""
     from veritrace import TraceStore, clocks
     from veritrace import store as store_mod
-    from veritrace.analysis import vtq
     from veritrace.analysis.whytrace import WhyTracer
     from veritrace.config import Config
     from veritrace.correlate.resolver import correlate
-    from veritrace.graph.elaborate import discover, elaborate
+    from veritrace.graph.elaborate import elaborate
 
-    root = DESIGNS / "cpu_top"
-    path = store_mod.ensure(root / "dump.vcd")
+    rtl, vcd, target = _why_fixture(root)
+    path = store_mod.ensure(vcd)
     store = TraceStore(str(path))
-    el = elaborate(discover(root))
-    # Without this every `trace_handle` is None and the walk has no values to
-    # read — it would measure a graph traversal rather than why-trace.
+    el = elaborate([rtl], top="why_bench", analyse=False)
     correlate(el.graph, {s.path: s.handle for s in store.signals()}, el.aliases)
     clocks.resolve(store, el.graph, Config.empty())
 
-    spec = tomllib.loads((root / "expected.toml").read_text(encoding="utf-8"))
-    q = vtq.parse(spec["why"][0]["question"])
-    ms, result = _timed(lambda: WhyTracer(el.graph, store).why(q.signal, q.time))
+    ms, result = _timed(lambda: WhyTracer(el.graph, store).why(target, 0))
     n = result.nodes
-    note = f"{n} nodes on {q.signal.rsplit('.', 1)[-1]}"
     if n < WHY_NODES:
-        # Said outright rather than left to be inferred: a green line here does
-        # not mean §4.2's row has been met, only that a smaller question was.
-        note += (
-            f" — §4.2 budgets {WHY_NODES} nodes and the reference designs do not "
-            "contain a question that large, so this is a floor, not the budget"
+        raise RuntimeError(
+            f"the why benchmark built {n} nodes, below §4.2's {WHY_NODES}; "
+            "the timing would not prove the named workload"
         )
-    return Row(f"why() ({n} nodes)", ms, budget, note)
+    return Row(f"why() ({n} nodes)", ms, budget, "real VCD + Slang + correlated graph")
 
 
 def main() -> int:
@@ -260,6 +284,11 @@ def main() -> int:
                     help="Where to build the synthetic trace (default: a temp dir).")
     ap.add_argument("--steps", type=int, default=None,
                     help="Clock steps to generate. Raise it to reach §4.2's event count.")
+    ap.add_argument(
+        "--allow-smaller",
+        action="store_true",
+        help="Allow --steps below the specified workload for a local smoke run.",
+    )
     args = ap.parse_args()
 
     budgets = BUDGETS_MS[args.tier]
@@ -307,7 +336,7 @@ def main() -> int:
             )
         if budgets["extract"] is not None:
             report.rows.append(measure_extraction(budgets["extract"]))
-        report.rows.append(measure_why(budgets["why"]))
+        report.rows.append(measure_why(work, budgets["why"]))
     finally:
         if args.keep is None:
             shutil.rmtree(work, ignore_errors=True)
@@ -322,7 +351,8 @@ def main() -> int:
                 f"  NOTE: §4.2 tier {args.tier.upper()} describes "
                 f"{NOMINAL_EVENTS[args.tier]:,} transitions and this trace has "
                 f"{c['fraction_of_spec']:.0%} of them — the numbers below are a "
-                "floor, not the budget checked. Raise --steps to close the gap."
+                "non-gating smoke shape, not the budget. Remove the smaller "
+                "--steps override for the real gate."
             )
         print(f"  {'operation':<38} {'measured':>10} {'budget':>9}")
         print("  " + "-" * 60)
@@ -335,6 +365,8 @@ def main() -> int:
         print()
 
     over = [r.name for r in report.rows if r.over]
+    if report.context.get("short_of_spec") and not args.allow_smaller:
+        over.append("generated workload is smaller than §4.2")
     if over:
         # Fatal, which is what §4.2 asks for: *"praguri verificate in CI la
         # fiecare commit, cu build care pica daca sunt depasite"*. This returned

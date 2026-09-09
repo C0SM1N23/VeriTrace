@@ -261,8 +261,20 @@ class Signal:
 
     @property
     def is_reconstructible(self) -> bool:
-        """Not in the trace, but derivable from its drivers (§7.3)."""
-        return self.trace_handle is None and bool(self.drivers)
+        """Undumped combinational value that can be evaluated at one instant.
+
+        A sequential register or memory has history. Evaluating its assignment
+        expression from the inputs visible *now* is not reconstruction of that
+        history; it is a plausible-looking fabrication. Section 7.3 only
+        permits the combinational ``tmp = a & b`` case, while §5.6 explicitly
+        requires an undumped array to be reported as unavailable.
+        """
+        return (
+            self.trace_handle is None
+            and self.kind is not Kind.MEM
+            and bool(self.drivers)
+            and all(not driver.is_sequential for driver in self.drivers)
+        )
 
     @property
     def is_tie_off(self) -> bool:

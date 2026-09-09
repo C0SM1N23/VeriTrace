@@ -4,10 +4,9 @@
 //
 // It drives a real JEDEC command bus (CS#/RAS#/CAS#/WE#, BA, A) through a
 // scripted sequence, and the whole point of it is `VIOLATE`: with that
-// parameter set, four of the delays are deliberately one cycle short of the
-// MT48LC16M16A2 minimum — one from each of the four categories Prompt 11's
-// acceptance criterion names (tRCD, tRP, tRFC, tFAW). With it clear the same
-// RTL is conformant, so "no violations found" is as checkable as "four found".
+// parameter set, three delays violate tRCD, tRP and tRFC. A fourth shortened
+// gap ends at the fourth ACTIVATE: that is legal for tFAW, which restricts the
+// fifth ACTIVATE. The original golden incorrectly expected four violations.
 //
 // Written as a flat step counter rather than an FSM on purpose: the exact
 // cycle numbers *are* the thing under test, so they should be readable
@@ -21,9 +20,9 @@
 //     tRRD 15 ns -> 2 steps     tRFC 66 ns -> 7 steps
 //     tFAW 75 ns -> 8 steps
 //
-// The four injected gaps are each exactly `- BUG` short of those. Every other
+// The shortened gaps are each exactly `- BUG` short of those. Every other
 // gap in the sequence was checked by hand to sit clear of *every* constraint,
-// so the run produces the four intended violations and no collateral ones —
+// so the run produces three intended violations and no collateral ones —
 // which is what makes the acceptance test able to assert an exact set.
 //
 module sdram_ctrl #(
@@ -76,7 +75,7 @@ module sdram_ctrl #(
   //   VIOLATION 1 — tRCD: ACTIVATE b0 -> READ b0
   //   VIOLATION 2 — tRP : PRECHARGE b0 -> ACTIVATE b0
   //   VIOLATION 3 — tRFC: REFRESH -> ACTIVATE
-  //   VIOLATION 4 — tFAW: the 4th ACTIVATE inside the rolling window
+  //   LEGAL tFAW CASE: the 4th ACTIVATE inside the rolling window
   //
   localparam int S_ACT0 = 4;                        // ACTIVATE b0, row 0x1A4
   localparam int S_RD0  = S_ACT0 + T_RCD - BUG;     // (1) tRCD
@@ -90,11 +89,12 @@ module sdram_ctrl #(
 
   // Four ACTIVATEs to four banks. The first three are tRRD apart; the fourth
   // lands inside tFAW of the first when the bug is injected, and just outside
-  // it when it is not — while staying clear of tRRD either way.
+  // it when it is not — while staying clear of tRRD either way. Both cases
+  // satisfy tFAW: a fifth activation would be needed to exceed its limit.
   localparam int S_FAW0 = S_PRE2 + T_RP;
   localparam int S_FAW1 = S_FAW0 + T_RRD;
   localparam int S_FAW2 = S_FAW1 + T_RRD;
-  localparam int S_FAW3 = S_FAW0 + T_FAW - BUG;     // (4) tFAW
+  localparam int S_FAW3 = S_FAW0 + T_FAW - BUG;     // legal fourth ACTIVATE
 
   localparam int N_STEPS = S_FAW3 + 12;
 

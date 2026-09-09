@@ -6,6 +6,10 @@ const BACKEND = process.env.VERITRACE_BACKEND ?? "http://127.0.0.1:8765";
 
 export default defineConfig({
   plugins: [react()],
+  // FsmMode is a lazy entry. Without an explicit dependency hint, Vite first
+  // discovers elk-api only when that mode opens and reloads the page after
+  // optimising it, losing the user's first click in development.
+  optimizeDeps: { include: ["elkjs/lib/elk-api.js"] },
   // The wave socket cannot go through the proxy (see `WS_ORIGIN` in
   // `api/client.ts`), so it needs the backend's real origin at build time. Baked
   // in from the same constant the proxy uses: when the two were allowed to drift

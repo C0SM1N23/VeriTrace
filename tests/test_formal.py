@@ -191,9 +191,9 @@ def test_reachability_tells_dead_code_from_a_missing_test(tmp_path):
 @has_yosys
 def test_synth_diff_finds_an_injected_mismatch(tmp_path):
     """§8.29's criterion: an incomplete sensitivity list, proved rather than suspected."""
-    import shutil
+    from veritrace.simulate import find_iverilog
 
-    if shutil.which("iverilog") is None:
+    if find_iverilog() is None:
         pytest.skip("needs Icarus as well")
     from veritrace.synth import diff as synth
     from veritrace.synth.yosys import dut_of

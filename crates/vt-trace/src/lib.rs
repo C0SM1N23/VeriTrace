@@ -14,7 +14,7 @@ pub mod txn;
 pub mod value;
 pub mod vcd;
 
-#[cfg(feature = "fst")]
+#[cfg(all(feature = "fst", not(windows)))]
 pub mod fst;
 
 pub use model::{Kind, Scope, Signal, SignalId, Time, Trace};
@@ -44,7 +44,7 @@ pub enum Error {
     #[error("unknown signal: {0}")]
     UnknownSignal(String),
 
-    #[cfg(feature = "fst")]
+    #[cfg(all(feature = "fst", not(windows)))]
     #[error("fst error: {0}")]
     Fst(String),
 }

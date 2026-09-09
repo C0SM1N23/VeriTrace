@@ -45,8 +45,8 @@ def find_rtl_files(root: Path) -> list[Path]:
     return sorted(matches)
 
 
-def guess_top_module(files: list[Path]) -> str | None:
-    """Top module = the one declared but never instantiated by another."""
+def top_modules(files: list[Path]) -> list[str]:
+    """Every module that is not instantiated by another source module."""
     modules: set[str] = set()
     sources: dict[Path, str] = {}
     for f in files:
@@ -61,8 +61,18 @@ def guess_top_module(files: list[Path]) -> str | None:
             if mod_name in modules and mod_name not in VERILOG_KEYWORDS:
                 instantiated.add(mod_name)
 
-    candidates = sorted(modules - instantiated)
-    return candidates[0] if candidates else None
+    return sorted(modules - instantiated)
+
+
+def guess_top_module(files: list[Path]) -> str | None:
+    """The unambiguous top module, or ``None`` when a choice is required.
+
+    Lexicographically choosing one of two independent roots can compile and
+    simulate perfectly while exercising the wrong design.  Ambiguity is user
+    input, not something a deterministic sort can make true.
+    """
+    candidates = top_modules(files)
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def guess_clock(files: list[Path]) -> str | None:
@@ -174,11 +184,12 @@ class _Group(click.Group):
     """
 
     def invoke(self, ctx: click.Context):  # noqa: ANN201 - click's own signature
+        from veritrace.config import ConfigError
         from veritrace.graph.elaborate import TopNotFound
 
         try:
             return super().invoke(ctx)
-        except TopNotFound as e:
+        except (TopNotFound, ConfigError) as e:
             raise click.ClickException(str(e)) from e
 
 
@@ -189,7 +200,7 @@ def main() -> None:
     _speak_utf8()
 
 
-def _resolve_rtl(rtl: tuple[Path, ...], top: str | None) -> tuple[list[Path], list[str], list[str], str | None]:
+def _resolve_rtl(rtl: tuple[Path, ...], top: str | None, config=None) -> tuple[list[Path], list[str], list[str], str | None]:
     """RTL sources from the command line, falling back to `.veritrace.toml`.
 
     A config is only allowed to fill in `top`, `incdirs` and `defines` when it
@@ -210,7 +221,10 @@ def _resolve_rtl(rtl: tuple[Path, ...], top: str | None) -> tuple[list[Path], li
     incdirs: list[str] = []
     defines: list[str] = []
 
-    conf = cfg.load()
+    conf = config
+    if conf is None and rtl:
+        conf = cfg.load(rtl[0] if rtl[0].is_dir() else rtl[0].parent)
+    conf = conf or cfg.load()
     if conf is not None and (not files or _config_covers(conf, files)):
         if not files:
             files = conf.rtl_files()
@@ -295,6 +309,8 @@ class Context:
     def memory_reports(self, chip: str | None = None) -> object:
         """§8.20's memory analysis, once per command run."""
         from veritrace.memory import report as mem_report
+        from veritrace.api.sessions import LayoutFile
+        from veritrace.store import identity
 
         if self.memory is None:
             analysis = self.transactions()
@@ -302,7 +318,9 @@ class Context:
                 self.trace_path.parent if self.trace_path else None
             )
             self.memory = mem_report.build_all(
-                self.store, analysis.packs, self.clock, self.config, root, chip
+                self.store, analysis.packs, self.clock, self.config, root, chip,
+                choices=(LayoutFile.for_trace(identity(self.trace_path)).load().get("memoryTiming")
+                         if self.trace_path is not None and chip is None else None),
             )
         return self.memory
 
@@ -338,6 +356,8 @@ class Context:
                     getattr(self.config, "root", None)
                     or (self.trace_path.parent if self.trace_path else None)
                 ),
+                coverage_report=self.coverage_report(),
+                performance_report=self.performance,
             )
         return self.checks
 
@@ -357,6 +377,7 @@ class Context:
                 coverage_path=coverage_path,
                 project_root=root,
                 source=source,
+                elaboration=self.elaboration,
             )
         return self.coverage
 
@@ -372,7 +393,10 @@ def _load(
     from veritrace.correlate.resolver import correlate
     from veritrace.graph.elaborate import elaborate
 
-    files, incdirs, defines, top = _resolve_rtl(rtl, top)
+    trace = _default_trace(trace, flag="a trace path")
+    rtl_config = cfg.load(rtl[0] if rtl[0].is_dir() else rtl[0].parent) if rtl else None
+    config = rtl_config or cfg.load() or cfg.load_or_empty(trace.parent)
+    files, incdirs, defines, top = _resolve_rtl(rtl, top, config)
     if need_rtl and not files:
         # §7.4 makes "no RTL" a supported mode, but not for these commands.
         raise click.ClickException(
@@ -383,7 +407,6 @@ def _load(
     # and §4.3's whole point is that the trace is named once, in the config, so
     # a command with no argument finds the one recorded there rather than
     # asking for it again.
-    trace = _default_trace(trace, flag="a trace path")
     ctx = Context(
         store=TraceStore(str(trace)),
         # The project you are standing in decides its own settings; the trace's
@@ -391,7 +414,7 @@ def _load(
         # way round lets a trace's *location* pick the packs, the ignore list and
         # the ingest log — which is how a cocotb log named in the project config
         # went unread because the waveform lived one directory over.
-        config=cfg.load() or cfg.load_or_empty(trace.parent),
+        config=config,
         trace_path=trace,
     )
     if files:
@@ -664,6 +687,15 @@ def correlate(
     help="RTL file or directory, for why-trace and source view. Repeatable.",
 )
 @click.option("--top", default=None, help="Top module (default: inferred).")
+@click.option(
+    "--format",
+    "capture_format",
+    type=click.Choice(list(_CAPTURE_FORMATS)),
+    default=None,
+    help="Open every TRACE as a Vivado ILA or SignalTap CSV capture (§8.11b).",
+)
+@click.option("--scope", default="", help="Prefix capture probes with this RTL scope.")
+@click.option("--timescale", default="1ns", help="Display unit assigned to one capture sample.")
 def serve(
     traces: tuple[Path, ...],
     host: str,
@@ -671,6 +703,9 @@ def serve(
     browser: bool,
     rtl: tuple[Path, ...],
     top: str | None,
+    capture_format: str | None,
+    scope: str,
+    timescale: str,
 ) -> None:
     """Serve one or more traces over HTTP and WebSocket.
 
@@ -682,6 +717,7 @@ def serve(
     \b
       veritrace serve dump.vtx --rtl src/
       veritrace serve good.vcd bad.vcd --rtl src/   # both runs, for TAB 5
+      veritrace serve ila.csv --format vivado-ila --rtl src/
 
     A second trace is opened as a session of its own (§10.1) and becomes the
     other side of the Diff tab — which is the only way §8.7's comparison has a
@@ -691,11 +727,18 @@ def serve(
 
     from veritrace.api import create_app
 
-    trace = _default_trace(traces[0] if traces else None, flag="a trace path")
+    if capture_format and not traces:
+        raise click.ClickException("--format needs at least one capture CSV path")
+    opened = (
+        tuple(_prepare_capture(path, capture_format, scope, timescale) for path in traces)
+        if capture_format
+        else traces
+    )
+    trace = _default_trace(opened[0] if opened else None, flag="a trace path")
     files, _incdirs, _defines, top = _resolve_rtl(rtl, top)
     app = create_app(default_trace=trace, rtl=[str(f) for f in files], top=top)
     session_id = app.state.default_session_id
-    for extra in traces[1:]:
+    for extra in opened[1:]:
         try:
             other = app.state.registry.open(extra, [str(f) for f in files], top)
             click.echo(f"  also open: {extra}    session {other.session_id}")
@@ -749,6 +792,31 @@ def serve(
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
+def _prepare_capture(path: Path, fmt: str, scope: str, timescale: str) -> Path:
+    """Convert a board CSV through the normal VCD/store production path."""
+    import hashlib
+
+    from veritrace import store as store_mod
+    from veritrace.ingest import capture as cap_mod
+
+    source = Path(path)
+    digest = hashlib.sha256()
+    digest.update(source.read_bytes())
+    digest.update(f"\0{fmt}\0{scope}\0{timescale}".encode())
+    work = source.parent / WORK_DIR / "captures"
+    work.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", source.stem) or "capture"
+    vcd = work / f"{safe}-{digest.hexdigest()[:16]}.vcd"
+    captured = cap_mod.read(source, fmt=fmt, scope=scope)
+    rendered = cap_mod.to_vcd(captured, timescale)
+    if not vcd.is_file() or vcd.read_text(encoding="utf-8", errors="replace") != rendered:
+        tmp = vcd.with_suffix(vcd.suffix + f".{os.getpid()}.tmp")
+        tmp.write_text(rendered, encoding="utf-8")
+        tmp.replace(vcd)
+    cap_mod.mark(vcd, captured, timescale)
+    return store_mod.ensure(vcd)
+
+
 @main.command()
 @click.argument(
     "trace", type=click.Path(path_type=Path), required=False, default=None
@@ -800,6 +868,69 @@ def why(trace, query, rtl, top, as_json, output, **flags):
         click.echo(note + "\n", err=True)
     if headline:
         click.echo(headline + "\n")
+    _print_chain(result.root, ctx.clock)
+    click.echo(f"\n{result.nodes} nodes in {result.elapsed_ms:.1f} ms")
+
+
+@main.command("why-not")
+@click.argument("trace", type=click.Path(path_type=Path), required=False, default=None)
+@click.argument("query", required=False)
+@rtl_options
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def why_not(trace, query, rtl, top, as_json):
+    """Explain why a requested value did not occur (§11.4).
+
+    Example: ``veritrace why-not dump.vcd --rtl rtl "dut.ready == 1 @ c20"``.
+    """
+    from veritrace.analysis import vtq
+    from veritrace.analysis.whytrace import WhyTracer, bv_from_bits
+
+    trace, query = _trace_and_query(trace, query)
+    query = _need_query("why-not", query)
+    try:
+        parsed = vtq.parse(query)
+    except vtq.QueryError as e:
+        raise click.ClickException(str(e)) from e
+    if parsed.txn is not None:
+        raise click.ClickException("why-not asks about a signal value, not a transaction")
+    if parsed.value is None or parsed.op != "==":
+        raise click.ClickException("why-not needs the wanted value, using `signal == value`")
+
+    ctx = _load(trace, rtl, top, need_rtl=True)
+    signal = resolve_signal(ctx.graph, parsed.signal, ctx.store)
+    sig = ctx.graph.get(signal)
+    if sig is None:
+        raise click.ClickException(f"unknown signal: {signal}")
+    bits = vtq.literal_bits(parsed.value, sig.width)
+    if bits is None:
+        raise click.ClickException(f"cannot read {parsed.value!r} as a {sig.width}-bit value")
+    at = _at(
+        ctx,
+        None
+        if parsed.time is None
+        else f"c{parsed.time}"
+        if parsed.is_cycle
+        else str(parsed.time),
+    )
+    start = ctx.store.time_range[0] if getattr(ctx.config, "capture", False) else None
+    result = WhyTracer(
+        ctx.graph, ctx.store, txn_index=ctx.txn_index, capture_start=start
+    ).why_not(signal, at, bv_from_bits(bits, sig.width))
+
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "query": query,
+                    "signal": signal,
+                    "time": at,
+                    "expected": bits,
+                    **result.to_dict(),
+                },
+                indent=2,
+            )
+        )
+        return
     _print_chain(result.root, ctx.clock)
     click.echo(f"\n{result.nodes} nodes in {result.elapsed_ms:.1f} ms")
 
@@ -1053,6 +1184,12 @@ def stuck(trace, rtl, top, cycles, as_json, output, **flags):
     "trace", type=click.Path(exists=True, path_type=Path), required=False, default=None
 )
 @rtl_options
+@click.option(
+    "--static",
+    "static_only",
+    is_flag=True,
+    help="Analyse RTL without a waveform; trace-dependent checks are reported as unavailable.",
+)
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 @click.option(
     "--fail-on",
@@ -1060,14 +1197,52 @@ def stuck(trace, rtl, top, cycles, as_json, output, **flags):
     help="Exit non-zero if any of these fire. Names or groups: "
     "stuck,x,lint,cdc,protocol,deadlock,memory,integrity.",
 )
-def check(trace, rtl, top, as_json, fail_on):
+def check(trace, rtl, top, static_only, as_json, fail_on):
     """Every automatic finding: stuck, X sources, lint, parameters (§13, §13.9).
 
     With `--fail-on` this is the CI gate: a failing build carries the cause in
     its log rather than a dump nobody will open.
     """
-    ctx = _load(trace, rtl, top)
-    report = ctx.check_report()
+    if static_only:
+        if trace is not None:
+            raise click.ClickException("--static does not take a trace path; pass only --rtl.")
+        from veritrace import config as cfg
+        from veritrace.analysis import checks as checks_mod
+        from veritrace.graph.elaborate import elaborate
+
+        files, incdirs, defines, top = _resolve_rtl(rtl, top)
+        if not files:
+            raise click.ClickException(
+                "Static checks need RTL. Pass --rtl <file|dir>, or configure design.rtl."
+            )
+        conf = cfg.load()
+        if conf is None or not _config_covers(conf, files):
+            parents = [str(path.resolve().parent) for path in files]
+            conf = cfg.Config.empty(Path(os.path.commonpath(parents)))
+        try:
+            elaboration = elaborate(files, incdirs, defines, top)
+        except Exception as exc:  # noqa: BLE001 - malformed RTL must be a clean CLI error
+            raise click.ClickException(f"RTL elaboration failed: {exc}") from exc
+        if elaboration.errors:
+            details = "\n".join(f"  {diag}" for diag in elaboration.errors[:8])
+            more = (
+                f"\n  ... and {len(elaboration.errors) - 8} more error(s)"
+                if len(elaboration.errors) > 8
+                else ""
+            )
+            raise click.ClickException(
+                f"RTL elaboration reported {len(elaboration.errors)} error(s):\n{details}{more}"
+            )
+        report = checks_mod.run_static(
+            elaboration.graph,
+            elaboration,
+            conf,
+            project_root=conf.root,
+        )
+        ctx = None
+    else:
+        ctx = _load(trace, rtl, top)
+        report = ctx.check_report()
 
     if as_json:
         click.echo(
@@ -1077,14 +1252,22 @@ def check(trace, rtl, top, as_json, fail_on):
                     # §7.2: the rate the findings were produced under. A gate
                     # reading this file can tell "clean" from "matched nothing".
                     "correlation": (
-                        ctx.correlation.to_dict(limit=20) if ctx.correlation else None
+                        ctx.correlation.to_dict(limit=20)
+                        if ctx is not None and ctx.correlation
+                        else None
                     ),
                 },
                 indent=2,
             )
         )
     else:
-        click.echo(_format_report(report, ctx.clock, ctx.correlation))
+        click.echo(
+            _format_report(
+                report,
+                ctx.clock if ctx is not None else None,
+                ctx.correlation if ctx is not None else None,
+            )
+        )
 
     _gate(report, fail_on)
 
@@ -1145,19 +1328,25 @@ def run(
     generated module is compiled alongside it, and your sources are never
     touched.
     """
+    from veritrace import config as cfg
     from veritrace import simulate
 
-    roots = list(sources) or [Path.cwd()]
+    source_root = (sources[0] if sources and sources[0].is_dir()
+                   else sources[0].parent if sources else Path.cwd())
+    conf = cfg.load(source_root) or cfg.load()
+    configured_run = not sources and conf is not None and bool(conf.rtl)
+    roots = (conf.rtl_files() if configured_run else list(sources)) or [Path.cwd()]
     # A `.f` filelist is passed through to the compiler rather than expanded:
     # it is the portable way a project already describes its build, `+incdir+`
     # and all, and re-implementing that parser here would be a second opinion
     # about what the project contains.
     filelists = [r.resolve() for r in roots if r.is_file() and r.suffix.lower() == ".f"]
-    files: list[Path] = list(filelists)
+    files: list[Path] = []
     for r in roots:
-        if r in filelists or (r.is_file() and r.suffix.lower() == ".f"):
-            continue
-        files.extend([r] if r.is_file() else find_rtl_files(r))
+        if r.is_file():
+            files.append(r)
+        else:
+            files.extend(find_rtl_files(r))
     files = list(dict.fromkeys(f.resolve() for f in files))
     if not files:
         raise click.ClickException(
@@ -1167,7 +1356,7 @@ def run(
     # Where the project's own flow runs from, and therefore where `$readmemh`
     # and a filelist's relative paths resolve. A filelist names it exactly;
     # otherwise it is the directory that was pointed at.
-    run_dir = (filelists[0].parent if filelists else (
+    run_dir = (conf.root if configured_run else filelists[0].parent if filelists else (
         roots[0] if roots[0].is_dir() else roots[0].parent
     )).resolve()
 
@@ -1176,16 +1365,36 @@ def run(
     # no notion of a command file, and a graph built from nothing would turn
     # every `why()` into "no RTL loaded" on exactly the projects that have their
     # build written down properly.
-    rtl: list[Path] = [f for f in files if f.suffix.lower() != ".f"]
-    for fl in filelists:
-        named, dirs, defs = simulate.read_filelist(fl)
+    rtl: list[Path] = []
+    for source in files:
+        if source.suffix.lower() != ".f":
+            rtl.append(source)
+            continue
+        named, dirs, defs = simulate.read_filelist(source)
         rtl += named
         incdirs = tuple(incdirs) + tuple(str(d) for d in dirs)
         defines = tuple(defines) + tuple(defs)
     rtl = list(dict.fromkeys(rtl))
 
-    top = top or guess_top_module([f for f in rtl if f.is_file()])
+    # §4.3 exists so these are written once.  They used to reach elaboration in
+    # analysis commands but stop before the real Icarus process in `run`, which
+    # made a configured project compile differently from the graph used to
+    # explain it.  Explicit CLI values come last and therefore override a
+    # same-named configured define.
+    if conf is not None and (configured_run or _config_covers(conf, rtl)):
+        incdirs = tuple(str(conf.root / d) for d in conf.incdirs) + tuple(incdirs)
+        defines = tuple(conf.defines) + tuple(defines)
+        top = top or conf.top
+
+    candidates = top_modules([f for f in rtl if f.is_file()])
+    top = top or (candidates[0] if len(candidates) == 1 else None)
     if not top:
+        if len(candidates) > 1:
+            raise click.ClickException(
+                "Multiple uninstantiated top modules found: "
+                + ", ".join(candidates)
+                + ". Name the intended one with --top."
+            )
         raise click.ClickException(
             "Could not work out the top module: every module in these sources is "
             "instantiated by another one. Name it with --top."
@@ -1215,20 +1424,37 @@ def run(
     say(f"{len(files)} source file(s), top module {top!r}")
     try:
         got = simulate.icarus(
-            files, top, work, list(defines), list(incdirs), timeout, run_dir
+            files, top, work, list(defines), list(incdirs), timeout, run_dir,
+            # A failing assertion often leaves the most useful waveform of the
+            # whole run. Analyse it and print the findings, but preserve the
+            # failure as the command's final exit status below.
+            allow_testbench_failure=True,
         )
     except simulate.SimulationError as e:
         raise click.ClickException(str(e)) from e
     say(f"simulated with Icarus Verilog in {got.seconds:.1f} s")
+    if got.simulation_failed:
+        say(
+            "  simulation reported a testbench failure ($error/$fatal); "
+            "analysing its waveform before failing"
+        )
+        # Preserve the simulator's actual assertion text.  A generic red exit
+        # status without the message and source/time it printed forces the
+        # user to hunt for sim.log before they can act on the failure.
+        if got.failure_output:
+            say(got.failure_output)
     # §12's header wants the simulation command, and nothing else in the tool
     # ever learns it. Written beside the waveform so `export` — run minutes or
     # days later, in another process — can put it in the report.
-    _remember_command(got.dump, got.command)
+    _remember_simulation(got, rtl)
     if got.injected:
         say("  no $dumpfile in your sources, so the whole design was dumped")
     for w in got.warnings[:3]:
         say(f"  {w.strip()}")
 
+    # JSON changes presentation only. The next process must inherit the same
+    # source order, includes, defines and top used by this compiler invocation.
+    _write_config_if_missing(base, top, rtl, got, incdirs, defines, quiet=as_json)
     ctx = _load(got.dump, tuple(rtl) or tuple(roots), top)
     say(f"waveform: {_rel(got.dump)} ({ctx.store.n_signals} signals)")
     if ctx.correlation is not None:
@@ -1242,15 +1468,29 @@ def run(
     report = ctx.check_report()
 
     if as_json:
-        click.echo(json.dumps({"dump": str(got.dump), "top": top, **report.to_dict()}, indent=2))
+        click.echo(
+            json.dumps(
+                {
+                    "dump": str(got.dump),
+                    "top": top,
+                    "simulation_failed": got.simulation_failed,
+                    "simulation_error": got.failure_output or None,
+                    **report.to_dict(),
+                },
+                indent=2,
+            )
+        )
     else:
         click.echo("")
         click.echo(_format_report(report, ctx.clock))
-        _write_config_if_missing(base, top, files, got)
         click.echo("")
         click.echo(f"  veritrace serve {_rel(ctx.trace_path)} --rtl {_rel(rtl_hint)}")
 
     _gate(report, fail_on)
+    if got.simulation_failed:
+        # `$error` is a failed test even though Icarus returns zero.  This comes
+        # after report generation so the failed CI job still carries the cause.
+        raise SystemExit(1)
     if then_serve:
         # The real `serve` command, invoked rather than reimplemented, so the
         # banner, the browser and the RTL handling stay in one place.
@@ -1279,18 +1519,8 @@ def _under(path: Path, root: Path) -> str:
         return Path(path).resolve().as_posix()
 
 
-def _source_globs(files: list[Path], root: Path) -> list[Path]:
-    """One glob per directory the sources came from.
-
-    `**/*.sv` from the project root would sweep in `.veritrace/` and any vendor
-    tree beside it; naming the directories that actually hold RTL keeps the next
-    run reading the same files this one did.
-    """
-    dirs = sorted({f.resolve().parent for f in files})
-    return [d / "*.sv" for d in dirs] + [d / "*.v" for d in dirs]
-
-
-def _write_config_if_missing(base: Path, top: str, files: list[Path], got) -> None:
+def _write_config_if_missing(base: Path, top: str, files: list[Path], got,
+                             incdirs=(), defines=(), *, quiet: bool = False) -> None:
     """Keep `init`'s promise without asking for a second command (§13.4b).
 
     Written at the **project root as the user means it**: the working directory
@@ -1308,7 +1538,9 @@ def _write_config_if_missing(base: Path, top: str, files: list[Path], got) -> No
     here = Path.cwd().resolve()
     root = here if base.resolve().is_relative_to(here) else base.resolve()
     out = root / ".veritrace.toml"
-    if out.exists() or (base / ".veritrace.toml").exists():
+    from veritrace.config import find
+
+    if out.exists() or find(base) is not None:
         return
     clock = guess_clock(files) or "clk"
     reset = guess_reset(files) or ("rst_n", "low")
@@ -1317,18 +1549,28 @@ def _write_config_if_missing(base: Path, top: str, files: list[Path], got) -> No
     # directory instead is how `rtl/dump.vcd` became `rtl/rtl/dump.vcd`.
     config = build_config(
         top,
-        [_under(d, root) for d in _source_globs(files, root)],
+        [_under(f, root) for f in files],
         clock,
         reset[0],
         reset[1],
         _under(got.dump, root),
     )
+    config["design"]["incdirs"] = [_under((base / d).resolve(), root) for d in incdirs]
+    config["design"]["defines"] = {
+        name: value if separator else "1"
+        for definition in defines
+        for name, separator, value in [definition.partition("=")]
+    }
     try:
-        with out.open("wb") as fh:
+        with out.open("xb") as fh:
             tomli_w.dump(config, fh)
-    except OSError:
-        return  # a read-only tree is not a reason to fail a run
-    click.echo(f"\nWrote {_rel(out)} - later commands need no arguments.")
+    except FileExistsError:
+        return  # Another caller configured the project in the meantime.
+    except OSError as exc:
+        click.echo(f"Warning: could not save project configuration {out}: {exc}", err=True)
+        return
+    if not quiet:
+        click.echo(f"\nWrote {_rel(out)} - later commands need no arguments.")
 
 
 @main.command()
@@ -1553,8 +1795,6 @@ def memory(trace, query, rtl, top, as_json, chip):
 
 
 def _format_memory(reports, clock) -> str:
-    from veritrace import clocks as _clocks
-
     if not reports:
         return (
             "no memory interfaces detected\n"
@@ -1583,12 +1823,17 @@ def _format_memory(reports, clock) -> str:
             out.append(f"    ! {name} {word} {len(group)} time(s)")
             for v in group[:5]:
                 where = f"bank {v.bank}  " if v.bank is not None else ""
-                first = f"{v.first.name}@{_clocks.format_time(v.first.time, clock)}" if v.first else "?"
-                second = f"{v.second.name}@{_clocks.format_time(v.second.time, clock)}" if v.second else "?"
+                def command_at(command):
+                    return f"c{command.cycle}" if command.cycle is not None else str(command.time)
+                first = f"{v.first.name}@{command_at(v.first)}" if v.first else "?"
+                second = f"{v.second.name}@{command_at(v.second)}" if v.second else "?"
                 bound = "max" if v.is_maximum else "min"
+                measurement = (f"{v.measured_cycles} cycles, {bound} {v.limit_cycles}"
+                               if v.limit_cycles is not None
+                               else f"{v.measured_ticks} ticks, {bound} {v.limit_ticks} ticks")
+                at = command_at(v.second) if v.second else str(v.at)
                 out.append(
-                    f"        {_clocks.format_time(v.at, clock)}  {where}{first} -> {second}"
-                    f"  ({v.measured_cycles} cycles, {bound} {v.limit_cycles})"
+                    f"        {at}  {where}{first} -> {second}  ({measurement})"
                 )
             if len(group) > 5:
                 out.append(f"        ... and {len(group) - 5} more")
@@ -2154,9 +2399,11 @@ def _default_trace(trace: Path | None, flag: str = "--trace") -> Path:
     conf = cfg.load()
     if conf is not None and conf.trace:
         recorded = (conf.root / conf.trace).resolve()
-        # Prefer a store next to the recorded dump, then the dump itself —
-        # which `_ensure_store` converts.
-        for path in (recorded.with_name(recorded.name + ".vtx"), recorded):
+        # Start from the raw dump when it is still present. `store.ensure` can
+        # then select the immutable generation produced by a rerun while an old
+        # UI still memory-maps the canonical store (especially important on
+        # Windows, where replacing that directory is forbidden).
+        for path in (recorded, recorded.with_name(recorded.name + ".vtx")):
             if path.exists():
                 return _ensure_store(path)
     raise click.ClickException(
@@ -2194,7 +2441,7 @@ def convert(source: Path, output: Path | None) -> None:
         )
 
     try:
-        n_events = _native.convert(str(source), str(out))
+        n_events = _convert_with_progress(_native, source, out)
     except ValueError as e:
         # A dump the engine cannot read is a message, not a stack trace: the
         # reader already says which half failed and what to do instead.
@@ -2345,6 +2592,47 @@ def _rtl_sources(ctx: "Context", rtl: tuple[Path, ...], top: str | None) -> list
 @click.argument("query", required=False)
 @rtl_options
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def subtrace(trace, query, rtl, top, as_json):
+    """Print the minimal causal subtrace for one question (§8.2).
+
+    \b
+      veritrace subtrace dump.vcd "top.dut.full @ c46" --rtl rtl/ --json
+    """
+    from veritrace.repro import narrate
+
+    trace, query = _trace_and_query(trace, query)
+    query = _need_query("subtrace", query)
+    ctx = _load(trace, rtl, top, need_rtl=True)
+    signal, at, headline, result = _ask(ctx, query)
+    sub = _minimise(ctx, result)
+    payload = {
+        "query": query,
+        "signal": signal,
+        "time": at,
+        "headline": headline,
+        "title": narrate.headline(sub),
+        "symptom": narrate.symptom_paragraph(sub, query),
+        "steps": narrate.steps(sub),
+        **sub.to_dict(),
+    }
+    if as_json:
+        click.echo(json.dumps(payload, indent=2))
+        return
+    click.echo(payload["title"])
+    click.echo(payload["symptom"])
+    for step in payload["steps"]:
+        when = f"c{step['cycle']}" if step["cycle"] is not None else f"t={step['time']}"
+        marker = "ROOT" if step["is_root_cause"] else "    "
+        click.echo(
+            f"{marker} {when:>9}  {step['signal']} = {step['value']}  {step['text']}"
+        )
+
+
+@main.command()
+@click.argument("trace", type=click.Path(path_type=Path), required=False, default=None)
+@click.argument("query", required=False)
+@rtl_options
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 @click.option(
     "-o",
     "--output",
@@ -2433,8 +2721,20 @@ def repro(trace, query, rtl, top, as_json, output, mode, validate, timeout):
 
 @main.command("export")
 @click.argument("trace", type=click.Path(path_type=Path), required=False, default=None)
-@click.option("--why", "query", required=True, help='The question, e.g. "top.ctrl.ready == 0 @ c1247".')
+@click.option(
+    "--why",
+    "query",
+    required=False,
+    help='Optional causal question; required by the built-in HTML report.',
+)
 @rtl_options
+@click.option(
+    "--format",
+    "format_name",
+    default="html",
+    show_default=True,
+    help="Built-in 'html' or the name of a discovered exporter plugin (§13.7).",
+)
 @click.option(
     "-o",
     "--output",
@@ -2448,8 +2748,8 @@ def repro(trace, query, rtl, top, as_json, output, mode, validate, timeout):
     default=True,
     help="Include the generated testbench, validated by running it (§8.3).",
 )
-def export_report(trace, query, rtl, top, output, with_repro):
-    """Write a standalone HTML bug report (§12).
+def export_report(trace, query, rtl, top, format_name, output, with_repro):
+    """Write a standalone HTML or plugin-defined report (§12/§13.7).
 
     \b
       veritrace export dump.vcd --why "why(top.ctrl.ready)" -o bug.html
@@ -2457,10 +2757,15 @@ def export_report(trace, query, rtl, top, output, with_repro):
     One file, no network: it opens the same on a machine that has never heard of
     this tool, which is the only form a bug report attached to a ticket can take.
     """
+    if format_name.lower() != "html":
+        _export_with_plugin(trace, query, rtl, top, format_name, Path(output))
+        return
+
     from veritrace.api.sessions import sha256_files
     from veritrace.export import report as report_mod
     from veritrace.repro import testbench
 
+    query = _need_query("export --format html", query)
     ctx = _load(_default_trace(trace, flag="a trace path"), rtl, top, need_rtl=True)
     _signal, _at, headline, result = _ask(ctx, query)
     sub = _minimise(ctx, result)
@@ -2490,13 +2795,15 @@ def export_report(trace, query, rtl, top, output, with_repro):
         ctx.store,
         ctx.clock,
         query=headline or query,
-        sources={p.name: p for p in sources},
+        sources={p.resolve().as_posix(): p for p in
+                 [*sources, *getattr(ctx.elaboration, "sources", [])]},
         repro=built,
         findings=ctx.check_report(),
         trace_path=ctx.trace_path,
         rtl_sha256=sha256_files(sources) if sources else None,
         top=getattr(ctx.graph, "top", "") or "",
         command=_recall_command(ctx.trace_path),
+        annotations=_report_annotations(ctx),
     )
     report_mod.write(page, Path(output))
     size = f"{page.bytes / 1024:.0f} KB"
@@ -2509,6 +2816,144 @@ def export_report(trace, query, rtl, top, output, with_repro):
         )
 
 
+def _convert_with_progress(native, source: Path, output: Path) -> int:
+    """Run native conversion with truthful elapsed-time progress after 200 ms."""
+    import threading
+    import time
+
+    result: dict[str, object] = {}
+    done = threading.Event()
+
+    def worker() -> None:
+        try:
+            result["events"] = native.convert(str(source), str(output))
+        except BaseException as exc:  # re-raised on the command thread
+            result["error"] = exc
+        finally:
+            done.set()
+
+    started = time.monotonic()
+    thread = threading.Thread(target=worker, name="veritrace-convert", daemon=True)
+    thread.start()
+    if not done.wait(0.2):
+        click.echo(f"converting {source.name} …", err=True)
+        while not done.wait(0.5):
+            click.echo(f"  converting · {time.monotonic() - started:.1f}s elapsed", err=True)
+    thread.join()
+    error = result.get("error")
+    if isinstance(error, BaseException):
+        raise error
+    return int(result["events"])
+
+
+def _report_annotations(ctx: Context) -> list[str]:
+    """Read the versionable project notes included by §12's appendix."""
+    from veritrace import notes
+
+    root = Path(getattr(ctx.config, "root", None) or ctx.trace_path.parent)
+    out: list[str] = []
+    for path in notes.discover(root):
+        try:
+            out.extend(str(note) for note in notes.read(path))
+        except OSError as exc:
+            click.echo(f"  warning: could not read annotation file {path}: {exc}", err=True)
+    return out
+
+
+def _export_with_plugin(
+    trace: Path | None,
+    query: str | None,
+    rtl: tuple[Path, ...],
+    top: str | None,
+    format_name: str,
+    output: Path,
+) -> None:
+    """Run a §13.7 exporter through the same production context as checks.
+
+    Rendering completes before the destination is touched, and the finished
+    artifact replaces it atomically.  A crashing plugin therefore cannot turn
+    an old, valid report into a truncated file that looks newly generated.
+    """
+    import tempfile
+
+    from veritrace import config as cfg
+    from veritrace import plugin as plugin_mod
+
+    conf = cfg.load()
+    project = conf.root if conf is not None else Path.cwd()
+    plugin_mod.clear()
+    _analyses, errors = plugin_mod.discover(project)
+    matches = [cls for cls in plugin_mod.exporters() if cls.name == format_name]
+    if not matches:
+        available = ", ".join(["html", *(cls.name for cls in plugin_mod.exporters())])
+        failed = f"; plugin load errors: {errors}" if errors else ""
+        raise click.ClickException(
+            f"unknown export format {format_name!r}; available: {available}{failed}"
+        )
+    exporter = matches[0]
+
+    needs = set(exporter.needs)
+    ctx = _load(
+        _default_trace(trace, flag="a trace path"),
+        rtl,
+        top,
+        need_rtl=("graph" in needs or query is not None),
+    )
+    causal = None
+    rendered_query = query
+    if query is not None:
+        _signal, _at_time, headline, causal = _ask(ctx, query)
+        rendered_query = headline or query
+
+    protocol = ctx.transactions() if needs & {"transactions", "coverage", "memory", "performance"} else None
+    performance = ctx.measure() if "performance" in needs else None
+    memory = ctx.memory_reports() if "memory" in needs else None
+    coverage = ctx.coverage_report() if "coverage" in needs else None
+    try:
+        artifact = plugin_mod.run_exporter(
+            exporter,
+            store=ctx.store,
+            graph=ctx.graph,
+            elaboration=ctx.elaboration,
+            clock=ctx.clock,
+            config=ctx.config,
+            protocol=protocol,
+            coverage=coverage,
+            memory=memory,
+            performance=performance,
+            query=rendered_query,
+            causal=causal,
+            metadata={
+                "trace_path": str(ctx.trace_path) if ctx.trace_path is not None else "",
+                "trace_sha256": getattr(ctx.store, "source_sha256", ""),
+                "top": getattr(ctx.graph, "top", "") if ctx.graph is not None else "",
+            },
+        )
+    except plugin_mod.PluginError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    payload = artifact.encode("utf-8") if isinstance(artifact, str) else artifact
+    output = output.resolve()
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=f".{output.name}.", dir=output.parent)
+    except OSError as exc:
+        raise click.ClickException(f"cannot create {output}: {exc}") from exc
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, output)
+    except OSError as exc:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise click.ClickException(f"cannot write {output}: {exc}") from exc
+    click.echo(f"{exporter.name} -> {output}  ({len(payload)} bytes)", err=True)
+
+
 @main.command()
 @click.option(
     "--root",
@@ -2518,7 +2963,7 @@ def export_report(trace, query, rtl, top, output, with_repro):
 )
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 def plugins(root, as_json):
-    """What analysis plugins are installed, and what could not load (§13.7).
+    """What analysis/exporter plugins are installed, and what could not load (§13.7).
 
     Looked for in `~/.veritrace/plugins/` and in `plugins/` beside your
     `.veritrace.toml`. No install step: a plugin is a file, versioned with the
@@ -2534,6 +2979,7 @@ def plugins(root, as_json):
 
     plugin_mod.clear()
     found, errors = plugin_mod.discover(base)
+    exporters = plugin_mod.exporters()
     paths = plugin_mod.search_path(base)
 
     if as_json:
@@ -2550,6 +2996,15 @@ def plugins(root, as_json):
                             "description": c.description,
                         }
                         for c in found
+                    ],
+                    "exporters": [
+                        {
+                            "name": c.name,
+                            "needs": list(c.needs),
+                            "description": c.description,
+                            "extension": c.extension,
+                        }
+                        for c in exporters
                     ],
                     "errors": dict(errors),
                 },
@@ -2569,6 +3024,17 @@ def plugins(root, as_json):
                 click.echo(f"    {cls.description}")
     else:
         click.echo("\nno plugins found")
+
+    if exporters:
+        click.echo(f"\n{len(exporters)} exporter(s):")
+        for cls in exporters:
+            needs = ", ".join(cls.needs) or "nothing"
+            suffix = f" · {cls.extension}" if cls.extension else ""
+            click.echo(f"  {cls.name:<24} needs {needs}{suffix}")
+            if cls.description:
+                click.echo(f"    {cls.description}")
+    else:
+        click.echo("\nno exporters found")
 
     if errors:
         click.echo(f"\n{len(errors)} file(s) could not be loaded:")
@@ -2942,9 +3408,12 @@ def _format_fsm(machines, findings, has_trace: bool) -> str:
     help="Glob of signals to leave out. Repeatable — counters and timestamps "
     "legitimately differ.",
 )
-@click.option("--limit", default=12, type=int, help="How many divergences to list.")
+@click.option("--limit", default=12, type=click.IntRange(min=1), help="How many divergences to list.")
+@click.option("--mark", "marks", type=(int, int), multiple=True,
+              help="Paired trace ticks A B for --align manual. Repeat in increasing order.")
+@click.option("--focus", default=None, help="Diverging signal to inspect in the causal chains and wave window.")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
-def diff(trace_a, trace_b, rtl, top, strategy, anchor, ignore, limit, as_json):
+def diff(trace_a, trace_b, rtl, top, strategy, anchor, ignore, limit, marks, focus, as_json):
     """Where two runs part company (§8.7).
 
     \b
@@ -2959,6 +3428,8 @@ def diff(trace_a, trace_b, rtl, top, strategy, anchor, ignore, limit, as_json):
 
     ctx_a = _load(trace_a, rtl, top)
     ctx_b = _load(trace_b, rtl, top)
+    if marks and strategy != "manual":
+        raise click.ClickException("--mark requires --align manual")
     try:
         side_a = diff_mod.side(trace_a.name, ctx_a.store, ctx_a.clock)
         side_b = diff_mod.side(trace_b.name, ctx_b.store, ctx_b.clock)
@@ -2969,14 +3440,21 @@ def diff(trace_a, trace_b, rtl, top, strategy, anchor, ignore, limit, as_json):
             protocol_a=ctx_a.transactions() if strategy == "handshake" else None,
             protocol_b=ctx_b.transactions() if strategy == "handshake" else None,
             signal=anchor,
+            times_a=[a for a, _b in marks],
+            times_b=[b for _a, b in marks],
         )
     except diff_mod.AlignError as e:
         raise click.ClickException(str(e)) from e
 
     patterns = list(ignore) + list(getattr(ctx_a.config, "ignore", []) or [])
-    report = diff_mod.compare(alignment, patterns)
+    try:
+        report = diff_mod.compare(alignment, patterns, limit=limit)
+        if focus is not None:
+            diff_mod.select_focus(report, focus)
+    except diff_mod.AlignError as e:
+        raise click.ClickException(str(e)) from e
     report.txn_divergences = diff_mod.compare_transactions(
-        alignment, ctx_a.transactions(), ctx_b.transactions()
+        alignment, ctx_a.transactions(), ctx_b.transactions(), limit=limit
     )
     if report.first is not None and ctx_a.graph is not None:
         diff_mod.explain(report, ctx_a.graph, ctx_b.graph)
@@ -3151,6 +3629,14 @@ def _clip(text: str, width: int = 30) -> str:
 
 @main.command("synth-diff")
 @rtl_options
+@click.option(
+    "--synth",
+    "synthesiser",
+    type=click.Choice(["yosys"]),
+    default="yosys",
+    show_default=True,
+    help="Synthesis backend. Yosys is the supported free backend (§8.29).",
+)
 @click.option("--tb", "tb", multiple=True, required=True, type=click.Path(path_type=Path),
               help="Testbench file(s). The same ones drive both runs. Repeatable.")
 @click.option("--dut", default=None, help="Instance to synthesise (default: the top's only child).")
@@ -3159,7 +3645,7 @@ def _clip(text: str, width: int = 30) -> str:
 @click.option("--limit", default=12, type=int, help="How many divergences to list.")
 @click.option("--timeout", default=300.0, type=float, help="Seconds per simulation.")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
-def synth_diff(rtl, top, tb, dut, rtl_trace, limit, timeout, as_json):
+def synth_diff(rtl, top, synthesiser, tb, dut, rtl_trace, limit, timeout, as_json):
     """Prove a sim/synth mismatch instead of suspecting one (§8.29).
 
     \b
@@ -3173,6 +3659,12 @@ def synth_diff(rtl, top, tb, dut, rtl_trace, limit, timeout, as_json):
     from veritrace.graph.elaborate import elaborate
     from veritrace.synth import diff as synth_mod
     from veritrace.synth.yosys import dut_of
+
+    # The choice is intentionally singular today, but it is consumed here so
+    # the documented option is an executable contract rather than ignored CLI
+    # decoration.
+    if synthesiser != "yosys":  # pragma: no cover - guarded by Click
+        raise click.ClickException(f"unsupported synthesis backend: {synthesiser}")
 
     files, incdirs, defines, top = _resolve_rtl(rtl, top)
     benches = [Path(t).resolve() for t in tb]
@@ -3666,13 +4158,22 @@ def wavedrom(trace, rtl, top, signals, window, svg, light, output):
 
 
 @main.command()
-@click.argument("report", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument(
+    "report", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=False
+)
 @click.argument("trace", type=click.Path(path_type=Path), required=False, default=None)
 @rtl_options
+@click.option(
+    "--report",
+    "report_option",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Vivado report; equivalent to the positional REPORT argument.",
+)
 @click.option("--limit", default=10, type=int, help="How many paths to list.")
 @click.option("--violated", is_flag=True, help="Only paths that missed timing.")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
-def timing(report, trace, rtl, top, limit, violated, as_json):
+def timing(report, trace, rtl, top, report_option, limit, violated, as_json):
     """Vivado's critical paths, over your RTL and your run (§8.30).
 
     \b
@@ -3684,6 +4185,17 @@ def timing(report, trace, rtl, top, limit, violated, as_json):
     path that never toggles is a false priority, and nothing else will tell you.
     """
     from veritrace import timing as timing_mod
+
+    if report_option is not None:
+        # Click fills optional positional arguments from the left. Therefore in
+        # `timing --report x.rpt dump.vcd`, the remaining positional arrives in
+        # ``report`` even though it is semantically TRACE; shift it across.
+        if trace is not None:
+            raise click.ClickException("too many positional paths with --report")
+        trace = report
+        report = report_option
+    if report is None:
+        raise click.ClickException("a Vivado timing report is required (REPORT or --report)")
 
     parsed = timing_mod.load(report)
     if not parsed.paths:
@@ -3911,10 +4423,20 @@ def record(trace, rtl, top, db_path, tag, seed, simulator, simulator_version, co
             "--seed is mandatory (§13.6): a recorded run without its seed cannot be "
             "reproduced, and a regression nobody can reproduce is a story."
         )
+    provenance = _recall_simulation(ctx.trace_path)
+    simulator = simulator or provenance.get("simulator")
+    simulator_version = simulator_version or provenance.get("simulator_version")
+    command = command or provenance.get("command", "")
     if not simulator or not simulator_version:
         raise click.ClickException(
             "--simulator and --simulator-version are mandatory (§13.6): the same RTL "
-            "and the same seed can fail on one simulator and pass on another."
+            "and the same seed can fail on one simulator and pass on another. "
+            "They are inferred automatically for a waveform made by `veritrace run`."
+        )
+    if not command:
+        raise click.ClickException(
+            "--command is mandatory: `reproduce` must execute the real simulation, "
+            "not invent one. It is inferred automatically after `veritrace run`."
         )
 
     root = getattr(ctx.config, "root", None) or Path.cwd()
@@ -3926,9 +4448,10 @@ def record(trace, rtl, top, db_path, tag, seed, simulator, simulator_version, co
         tag=tag,
         commit_sha=regress.git_commit(root),
         command=command,
-        work_dir=str(Path.cwd()),
+        work_dir=str(provenance.get("run_dir") or Path.cwd()),
         trace_path=str(ctx.trace_path),
-        top=top or "",
+        top=top or str(provenance.get("top") or ""),
+        sim_seconds=float(provenance.get("seconds") or 0.0),
     )
     _collect(ctx, run)
 
@@ -3959,12 +4482,13 @@ def _collect(ctx: "Context", run) -> None:
         })
 
     report = ctx.check_report()
-    for group in getattr(report, "groups", []) or []:
+    for group, findings in report.by_group().items():
         by: dict[str, int] = {}
-        for f in getattr(group, "findings", []) or []:
-            by[str(getattr(f, "severity", "info"))] = by.get(str(getattr(f, "severity", "info")), 0) + 1
+        for f in findings:
+            severity = getattr(f.severity, "label", str(f.severity))
+            by[severity] = by.get(severity, 0) + 1
         for severity, n in by.items():
-            run.findings.append((str(getattr(group, "name", group)), severity, n))
+            run.findings.append((group.value, severity, n))
 
     cov = ctx.coverage_report() if hasattr(ctx, "coverage_report") else None
     code = getattr(cov, "code", None)
@@ -4046,9 +4570,11 @@ def history(sql, db_path, limit, as_json):
 @click.option("--db", "db_path", type=click.Path(path_type=Path), default=None,
               help="The DuckDB file (default: regressions.duckdb at the project root).")
 @rtl_options
+@click.option("--dry-run", is_flag=True, help="Verify and print the plan without executing it.")
+@click.option("--timeout", default=3600.0, type=float, help="Seconds the replay may run.")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
-def reproduce(run_id, db_path, rtl, top, as_json):
-    """Rebuild the exact command a recorded run used (§13.6).
+def reproduce(run_id, db_path, rtl, top, dry_run, timeout, as_json):
+    """Execute the exact command a recorded run used (§13.6).
 
     \b
       veritrace reproduce --run-id 4821 --rtl rtl/
@@ -4076,19 +4602,43 @@ def reproduce(run_id, db_path, rtl, top, as_json):
     finally:
         con.close()
 
+    if not as_json:
+        click.echo(f"run {out.run_id}: {out.simulator} {out.simulator_version}, seed {out.seed}")
+        if out.work_dir:
+            click.echo(f"  cd {out.work_dir}")
+        click.echo(f"  {out.command or '(no command was recorded)'}")
+        if out.identical:
+            click.echo(f"\nRTL hash: {out.rtl_then[:12]}… — identical to the original run.")
+        else:
+            click.echo(f"\n{out.caveat}")
+            if out.rtl_now:
+                click.echo(f"  then {out.rtl_then[:12]}…  now {out.rtl_now[:12]}…")
+
+    replay = None
+    if not dry_run:
+        try:
+            replay = regress.execute(out, timeout)
+        except regress.ReproductionError as e:
+            raise click.ClickException(str(e)) from e
+        # Keep JSON parseable; human mode behaves like the command was run in
+        # the foreground and carries both of its streams visibly.
+        if replay.stdout:
+            click.echo(replay.stdout, nl=not replay.stdout.endswith("\n"), err=as_json)
+        if replay.stderr:
+            click.echo(replay.stderr, nl=not replay.stderr.endswith("\n"), err=True)
+
     if as_json:
-        click.echo(json.dumps(out.to_dict(), indent=2))
-        return
-    click.echo(f"run {out.run_id}: {out.simulator} {out.simulator_version}, seed {out.seed}")
-    if out.work_dir:
-        click.echo(f"  cd {out.work_dir}")
-    click.echo(f"  {out.command or '(no command was recorded)'}")
-    if out.identical:
-        click.echo(f"\nRTL hash: {out.rtl_then[:12]}… — identical to the original run.")
+        payload = out.to_dict()
+        payload["executed"] = replay is not None
+        payload["result"] = replay.to_dict() if replay is not None else None
+        click.echo(json.dumps(payload, indent=2))
+    elif replay is None:
+        click.echo("\ndry run: command was not executed")
     else:
-        click.echo(f"\n{out.caveat}")
-        if out.rtl_now:
-            click.echo(f"  then {out.rtl_then[:12]}…  now {out.rtl_now[:12]}…")
+        click.echo(f"\nreplay exited {replay.returncode}")
+
+    if replay is not None and replay.returncode != 0:
+        raise SystemExit(replay.returncode or 1)
 
 
 @main.command()
@@ -4102,10 +4652,31 @@ def reproduce(run_id, db_path, rtl, top, as_json):
               help="`veritrace formal --json` output.")
 @click.option("--synth", "synth_json", type=click.Path(exists=True, path_type=Path), default=None,
               help="`veritrace synth-diff --json` output.")
+@click.option(
+    "--history",
+    "history_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Use the latest run in this §13.6 DuckDB file; live inputs take precedence.",
+)
 @click.option("--fail-under", type=float, default=None,
               help="Exit non-zero if any category with a target misses it.")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
-def scorecard(trace, rtl, top, plan_path, mutation, formal_json, synth_json, fail_under, as_json):
+@click.option("-o", "--output", type=click.Path(path_type=Path), default=None,
+              help="Write the report; .html produces a standalone HTML scorecard.")
+def scorecard(
+    trace,
+    rtl,
+    top,
+    plan_path,
+    mutation,
+    formal_json,
+    synth_json,
+    history_path,
+    fail_under,
+    as_json,
+    output,
+):
     """Every metric in one report (§8.36).
 
     \b
@@ -4119,8 +4690,28 @@ def scorecard(trace, rtl, top, plan_path, mutation, formal_json, synth_json, fai
     from veritrace import plan as plan_mod
     from veritrace.report import scorecard as card_mod
 
-    ctx = _load(trace, rtl, top)
-    coverage = ctx.coverage_report() if hasattr(ctx, "coverage_report") else None
+    from veritrace import regress
+
+    # A scorecard can be built from CI artefacts alone.  Previously even the
+    # documented `--history`/`--plan` forms unconditionally called `_load` and
+    # failed while looking for a waveform they do not require.
+    offline_input = any((history_path, plan_path, mutation, formal_json, synth_json))
+    ctx = None if trace is None and offline_input else _load(trace, rtl, top)
+
+    snapshot = None
+    history_inputs: dict[str, object] = {}
+    if history_path is not None:
+        try:
+            snapshot = regress.scorecard_snapshot(history_path)
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(str(exc)) from exc
+        history_inputs = _scorecard_history_inputs(snapshot, card_mod)
+
+    coverage = (
+        ctx.coverage_report()
+        if ctx is not None
+        else history_inputs.get("coverage")
+    )
     targets = {"line": 90.0, "functional": 80.0, "mutation": 70.0}
     if fail_under is not None:
         targets = {k: fail_under for k in targets}
@@ -4133,34 +4724,56 @@ def scorecard(trace, rtl, top, plan_path, mutation, formal_json, synth_json, fai
         raw = json.loads(Path(formal_json).read_text(encoding="utf-8"))
         formal_reports = [card_mod.Loaded(r) for r in (raw if isinstance(raw, list) else [raw])]
 
+    checks = ctx.check_report() if ctx is not None else history_inputs.get("checks")
+    protocol = ctx.transactions() if ctx is not None else history_inputs.get("protocol")
+    mutation_report = load(mutation) or history_inputs.get("mutation")
+    history_run = snapshot.get("run", {}) if snapshot is not None else {}
+    root = (
+        getattr(ctx.config, "root", None)
+        if ctx is not None
+        else Path.cwd()
+    )
+
     card = card_mod.build(
-        checks=ctx.check_report(),
+        checks=checks,
         coverage=coverage,
-        protocol=ctx.transactions(),
-        mutation=load(mutation),
+        protocol=protocol,
+        mutation=mutation_report,
         formal=formal_reports,
         synth=load(synth_json),
-        design=top or getattr(ctx.config, "top", "") or "",
-        commit=__import__("veritrace.regress", fromlist=["git_commit"]).git_commit(
-            getattr(ctx.config, "root", None) or Path.cwd()
+        design=(
+            top
+            or (getattr(ctx.config, "top", "") if ctx is not None else "")
+            or str(history_run.get("top") or "")
+        ),
+        commit=(
+            regress.git_commit(root)
+            if ctx is not None
+            else str(history_run.get("commit_sha") or "")
         ),
         targets=targets,
     )
+    if snapshot is not None:
+        card.history_path = str(snapshot["path"])
+        card.history_runs = int(snapshot["run_count"])
+        card.run_id = int(snapshot["run_id"])
 
     plan_obj = None
     if plan_path:
         plan_obj = plan_mod.link(
             plan_mod.load(plan_path), coverage=coverage,
-            formal=formal_reports, checks=ctx.check_report(),
+            formal=formal_reports, checks=checks,
         )
 
     if as_json:
         payload = card.to_dict()
         if plan_obj:
             payload["plan"] = plan_obj.to_dict()
-        click.echo(json.dumps(payload, indent=2))
+        _write(json.dumps(payload, indent=2), output, "scorecard")
+    elif output is not None and output.suffix.lower() in {".html", ".htm"}:
+        _write(_scorecard_html(card, plan_obj), output, "scorecard")
     else:
-        click.echo(_format_scorecard(card, plan_obj))
+        _write(_format_scorecard(card, plan_obj), output, "scorecard")
 
     if fail_under is not None and card.failing:
         raise SystemExit(1)
@@ -4173,7 +4786,12 @@ def _format_scorecard(card, plan_obj) -> str:
     head = f"VERITRACE SCORECARD — {card.design or 'this design'}"
     if card.commit:
         head += f" @ {card.commit}"
-    out = [head, ""]
+    out = [head]
+    if card.history_path:
+        out.append(
+            f"history: latest run {card.run_id} of {card.history_runs} from {card.history_path}"
+        )
+    out.append("")
     for row in card.rows:
         target = f"target {row.target}" if row.target else ""
         out.append(f"  {MARK[row.status]} {row.category:22} {row.value:>14}   {target}")
@@ -4186,6 +4804,129 @@ def _format_scorecard(card, plan_obj) -> str:
     if plan_obj is not None:
         out += ["", _format_plan(plan_obj)]
     return "\n".join(out)
+
+
+def _scorecard_history_inputs(snapshot: dict, card_mod) -> dict[str, object]:
+    """Adapt normalised DuckDB rows to the same objects a live scorecard reads."""
+    coverage_rows = snapshot.get("coverage", [])
+    line_rows = [row for row in coverage_rows if row.get("kind") == "line"]
+    functional_rows = [row for row in coverage_rows if row.get("kind") == "functional"]
+    coverage = None
+    if line_rows or functional_rows:
+        covered = sum(int(row.get("covered") or 0) for row in line_rows)
+        total = sum(int(row.get("total") or 0) for row in line_rows)
+        coverage = card_mod.Loaded(
+            {
+                "code": (
+                    {
+                        "covered": covered,
+                        "total": total,
+                        "source": snapshot["path"],
+                    }
+                    if line_rows
+                    else None
+                ),
+                "functional": [
+                    {
+                        "iface": row.get("scope") or "all interfaces",
+                        "points": [
+                            {
+                                "cells": [1],
+                                "covered": int(row.get("covered") or 0),
+                                "total": int(row.get("total") or 0),
+                            }
+                        ],
+                    }
+                    for row in functional_rows
+                ],
+            }
+        )
+
+    transactions = list(snapshot.get("transactions", []))
+    protocol = (
+        card_mod.Loaded(
+            {
+                "extractions": [
+                    {
+                        "n_transactions": int(row.get("n_transactions") or 0),
+                        "n_violations": int(row.get("violations") or 0),
+                    }
+                    for row in transactions
+                ]
+            }
+        )
+        if transactions
+        else None
+    )
+
+    counts: dict[str, int] = {}
+    for row in snapshot.get("findings", []):
+        group = str(row.get("group") or "")
+        counts[group] = counts.get(group, 0) + int(row.get("n") or 0)
+    checks = card_mod.Loaded({"counts_by_group": counts}) if counts else None
+
+    mutation_rows = [row for row in coverage_rows if row.get("kind") == "mutation"]
+    mutation = None
+    if mutation_rows:
+        row = mutation_rows[-1]
+        score = row.get("score")
+        mutation = card_mod.Loaded(
+            {
+                "score": score,
+                "killed": int(row.get("covered") or 0),
+                "scored": int(row.get("total") or 0),
+                "seed": snapshot.get("run", {}).get("seed"),
+                "invalid": [],
+            }
+        )
+
+    return {
+        "coverage": coverage,
+        "protocol": protocol,
+        "checks": checks,
+        "mutation": mutation,
+    }
+
+
+def _scorecard_html(card, plan_obj=None) -> str:
+    """Small standalone sign-off artefact for §8.36's documented ``-o``."""
+    import html
+
+    title = f"VeriTrace scorecard — {card.design or 'this design'}"
+    rows = "".join(
+        "<tr>"
+        f'<td class="{row.status}">{html.escape(row.status.upper())}</td>'
+        f"<th>{html.escape(row.category)}</th>"
+        f"<td>{html.escape(row.value)}</td>"
+        f"<td>{html.escape(row.detail)}</td>"
+        f"<td>{html.escape(row.target)}</td>"
+        "</tr>"
+        for row in card.rows
+    )
+    history = ""
+    if card.history_path:
+        history = (
+            f"<p>Latest recorded run <strong>{card.run_id}</strong> of "
+            f"{card.history_runs}, from <code>{html.escape(card.history_path)}</code>.</p>"
+        )
+    plan = (
+        f"<h2>Verification plan</h2><pre>{html.escape(_format_plan(plan_obj))}</pre>"
+        if plan_obj is not None
+        else ""
+    )
+    return f"""<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>{html.escape(title)}</title>
+<style>
+body{{font:14px system-ui,sans-serif;max-width:1100px;margin:40px auto;color:#20242a}}
+table{{border-collapse:collapse;width:100%}}th,td{{padding:8px;border-bottom:1px solid #ccd1d8;text-align:left}}
+.ok{{color:#176b36}}.bad{{color:#a61b1b}}.warn{{color:#8a5a00}}.absent{{color:#68707a}}
+code,pre{{font-family:ui-monospace,monospace}}pre{{white-space:pre-wrap;background:#f4f5f6;padding:16px}}
+</style><body><h1>{html.escape(title)}</h1>
+<p>Commit: <code>{html.escape(card.commit or 'not recorded')}</code></p>{history}
+<table><thead><tr><th>Status</th><th>Category</th><th>Value</th><th>Qualification</th><th>Target</th></tr></thead>
+<tbody>{rows}</tbody></table>{plan}
+<p>{len(card.covered)} of {len(card.rows)} categories measured. This report does not claim that the design is unconditionally verified.</p>
+</body></html>"""
 
 
 def _format_plan(plan_obj) -> str:
@@ -4210,6 +4951,7 @@ def _format_plan(plan_obj) -> str:
 
 #: Where `run` leaves the command it used, and `export` looks for it.
 COMMAND_FILE = "sim.command"
+PROVENANCE_FILE = "sim.provenance.json"
 
 
 def _remember_command(dump: Path, command: str) -> None:
@@ -4219,6 +4961,32 @@ def _remember_command(dump: Path, command: str) -> None:
         (Path(dump).parent / COMMAND_FILE).write_text(command + "\n", encoding="utf-8")
     except OSError:
         pass  # a read-only work directory must not fail the run
+
+
+def _remember_simulation(result, rtl: list[Path]) -> None:
+    """Persist facts captured by the process that produced the waveform."""
+    from veritrace.regress import sha256_of
+
+    _remember_command(result.dump, result.command)
+    data = {
+        "schema": 1,
+        "command": result.command,
+        "run_dir": str(result.run_dir or ""),
+        "simulator": result.simulator,
+        "simulator_version": result.simulator_version,
+        "top": result.top,
+        "seconds": result.seconds,
+        "trace": str(result.dump),
+        "rtl_sha256": sha256_of(rtl) if rtl else "",
+        "simulation_failed": result.simulation_failed,
+    }
+    path = Path(result.dump).parent / PROVENANCE_FILE
+    try:
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        # The simulation itself is still evidence, but losing the metadata is
+        # visible now instead of becoming a surprise at `record` time.
+        click.echo(f"  warning: could not write simulation provenance {path}: {exc}", err=True)
 
 
 def _recall_command(trace: Path | None) -> str:
@@ -4236,6 +5004,20 @@ def _recall_command(trace: Path | None) -> str:
         except OSError:
             continue
     return ""
+
+
+def _recall_simulation(trace: Path | None) -> dict:
+    if trace is None:
+        return {}
+    for base in {Path(trace).parent, Path(str(trace).removesuffix(".vtx")).parent}:
+        try:
+            value = json.loads((base / PROVENANCE_FILE).read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                return value
+        except (OSError, ValueError):
+            continue
+    command = _recall_command(trace)
+    return {"command": command} if command else {}
 
 
 def _project_root(trace: Path | None) -> Path:
@@ -4351,6 +5133,7 @@ def import_capture(capture, fmt, scope, timescale, output):
     got = cap_mod.read(capture, fmt=fmt, scope=scope)
     out = Path(output) if output else Path(capture).with_suffix(".vcd")
     out.write_text(cap_mod.to_vcd(got, timescale), encoding="utf-8")
+    cap_mod.mark(out, got, timescale)
 
     click.echo(f"{out}")
     click.echo(f"  {len(got.names)} probe(s), {got.n_samples} sample(s), one per {timescale} tick")

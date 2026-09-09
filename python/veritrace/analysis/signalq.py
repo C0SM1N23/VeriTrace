@@ -41,12 +41,11 @@ COMMANDS = (
     "lint",
     "changed",
     "handshake",
-    "uncovered",
 )
 
 #: Commands that read the RTL graph rather than only the dump (§7.4 makes a
 #: dump with no RTL a supported mode, so these have to say why they cannot run).
-NEEDS_RTL = ("cone", "fanout", "xtrace", "fsm", "lint", "uncovered")
+NEEDS_RTL = ("cone", "fanout", "xtrace", "fsm", "lint")
 
 
 class Session:
@@ -161,7 +160,10 @@ def _cone(session: Any, call: Call, restrict: set[str] | None = None) -> dict[st
     from veritrace.analysis import cone as cone_mod
 
     signal = _signal(session, call)
-    depth = int(call.kwargs.get("depth", 4))
+    # §9.3 uses the compact `cone(ready, 4)` form while §9.2 also documents
+    # `depth=3`.  The positional value used to parse and then disappear; a
+    # query for depth 1 silently ran at the default depth 4.
+    depth = int(call.kwargs.get("depth", call.args[1] if len(call.args) > 1 else 4))
     direction = "fanout" if call.name == "fanout" else str(call.kwargs.get("direction", "fanin"))
     active = call.kwargs.get("active") in (True, "true", "True", 1)
     window = _window(session, call) if active else None
@@ -183,21 +185,9 @@ def _cone(session: Any, call: Call, restrict: set[str] | None = None) -> dict[st
 
 
 def _stuck(session: Any, call: Call, restrict: set[str] | None = None) -> dict[str, Any]:
-    """§8.4 at a threshold the question chose.
-
-    §10.1 spells the arguments `after=` and `min_duration=`; the detector has
-    one threshold, and `min_duration` is the one that names it. `after=` narrows
-    nothing the scan can express — it always measures back from the end of the
-    run — so it is refused rather than accepted and ignored.
-    """
+    """§8.4 over the observation window and threshold the question chose."""
     from veritrace.analysis import stuck as stuck_mod
 
-    if "after" in call.kwargs:
-        raise QueryError(
-            "`stuck(after=...)` is not supported: the detector measures back from "
-            "the end of the run, so a start time would be accepted and ignored. "
-            "Use `stuck(min_duration=cN)`."
-        )
     raw = call.kwargs.get("min_duration") or (call.args[0] if call.args else None)
     cycles = None
     if raw is not None:
@@ -205,8 +195,18 @@ def _stuck(session: Any, call: Call, restrict: set[str] | None = None) -> dict[s
         cycles = int(text[1:]) if text[:1].lower() == "c" else int(text, 0)
     if session.clock is None:
         raise QueryError("no clock could be identified, so cycles have no meaning")
+    t0, _t1 = session.store.time_range
+    raw_after = call.kwargs.get("after")
+    after = _at(session, raw_after, t0) if raw_after is not None else None
     found = sorted(
-        stuck_mod.scan(session.store, session.clock, session.graph, session.config, cycles),
+        stuck_mod.scan(
+            session.store,
+            session.clock,
+            session.graph,
+            session.config,
+            cycles,
+            after,
+        ),
         key=lambda f: f.sort_key,
     )
     if restrict is not None:
@@ -216,8 +216,9 @@ def _stuck(session: Any, call: Call, restrict: set[str] | None = None) -> dict[s
             session.config, "stuck_cycles", stuck_mod.DEFAULT_CYCLES
         ),
         "n_cycles": session.clock.n_cycles,
+        "after": after,
         "unreachable": stuck_mod.too_short(
-            session.store, session.clock, session.config, cycles
+            session.store, session.clock, session.config, cycles, after
         ),
         "findings": [f.to_dict() for f in found],
     }
@@ -404,36 +405,6 @@ def _handshake(session: Any, call: Call, restrict: set[str] | None = None) -> di
     return {"prefix": prefix, "interfaces": out}
 
 
-def _uncovered(session: Any, call: Call, restrict: set[str] | None = None) -> dict[str, Any]:
-    """§8.12's holes for one file, with the conditions that would close them."""
-    coverage = getattr(session, "coverage", None)
-    if coverage is None:
-        raise QueryError(
-            "no coverage for this session. Import a database with --coverage, or "
-            "extract transactions for §8.21's functional coverage."
-        )
-    want = str(call.args[0]) if call.args else ""
-    holes = [
-        h
-        for h in getattr(coverage, "holes", []) or []
-        if not want or (h.loc and h.loc.file.endswith(want))
-    ]
-    return {
-        "file": want,
-        "holes": [
-            {
-                "file": h.loc.file if h.loc else None,
-                "line": h.loc.line if h.loc else None,
-                "what": h.what,
-                "conditions": [
-                    {"text": c.text, "holds": c.holds, "detail": c.detail} for c in h.conditions
-                ],
-            }
-            for h in holes
-        ],
-    }
-
-
 _DISPATCH: dict[str, Callable[..., dict[str, Any]]] = {
     "find": _find,
     "cone": _cone,
@@ -446,7 +417,6 @@ _DISPATCH: dict[str, Callable[..., dict[str, Any]]] = {
     "lint": _lint,
     "changed": _changed,
     "handshake": _handshake,
-    "uncovered": _uncovered,
 }
 
 #: Commands that can stand after a `|`, and so accept an incoming signal set.
@@ -467,8 +437,10 @@ def _signal_set(result: dict[str, Any]) -> set[str] | None:
         if isinstance(rows, list):
             paths = {r.get("path") or r.get("signal") for r in rows if isinstance(r, dict)}
             paths.discard(None)
-            if paths:
-                return paths  # type: ignore[return-value]
+            # An empty SignalSet is still a SignalSet. Treating it as an
+            # incompatible result made `find(no_match) | stuck(...)` error
+            # instead of correctly returning no findings.
+            return paths  # type: ignore[return-value]
     return None
 
 

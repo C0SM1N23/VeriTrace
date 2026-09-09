@@ -102,7 +102,9 @@ impl SignalId {
         if self.hier.is_empty() {
             return self.name.clone();
         }
-        let mut s = String::with_capacity(self.hier.iter().map(|h| h.len() + 1).sum::<usize>() + self.name.len());
+        let mut s = String::with_capacity(
+            self.hier.iter().map(|h| h.len() + 1).sum::<usize>() + self.name.len(),
+        );
         for h in &self.hier {
             s.push_str(h);
             s.push('.');
@@ -150,14 +152,24 @@ impl Signal {
 pub enum ValueColumn {
     /// `b` stays empty until the first X/Z is seen, which is how the store
     /// decides between the 2-state and 4-state encodings of §6.3.
-    Bits { width: u32, words: usize, a: Vec<u64>, b: Vec<u64> },
+    Bits {
+        width: u32,
+        words: usize,
+        a: Vec<u64>,
+        b: Vec<u64>,
+    },
     Real(Vec<f64>),
     Str(Vec<String>),
 }
 
 impl ValueColumn {
     pub fn new_bits(width: u32) -> ValueColumn {
-        ValueColumn::Bits { width, words: words_for(width).max(1), a: Vec::new(), b: Vec::new() }
+        ValueColumn::Bits {
+            width,
+            words: words_for(width).max(1),
+            a: Vec::new(),
+            b: Vec::new(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -188,10 +200,7 @@ impl ValueColumn {
     /// `a` and `b` in step after a parallel parse.
     pub fn append(&mut self, other: &mut ValueColumn) {
         match (self, other) {
-            (
-                ValueColumn::Bits { words, a, b, .. },
-                ValueColumn::Bits { a: oa, b: ob, .. },
-            ) => {
+            (ValueColumn::Bits { words, a, b, .. }, ValueColumn::Bits { a: oa, b: ob, .. }) => {
                 let self_rows = a.len() / *words;
                 let other_rows = oa.len() / *words;
                 if !ob.is_empty() && b.is_empty() {
@@ -264,7 +273,11 @@ impl ValueColumn {
                         s
                     }
                 };
-                Value::Bits { width: *width, a: av, b: bv }
+                Value::Bits {
+                    width: *width,
+                    a: av,
+                    b: bv,
+                }
             }
             ValueColumn::Real(col) => Value::Real(col.get(row).copied().unwrap_or(0.0)),
             ValueColumn::Str(col) => Value::Str(col.get(row).cloned().unwrap_or_default()),
@@ -314,8 +327,8 @@ impl ValueColumn {
                 }
                 let off = row * words + (i / 64) as usize;
                 let sh = i % 64;
-                let pa = a.get(off).map_or(false, |w| w >> sh & 1 == 1);
-                let pb = b.get(off).map_or(false, |w| w >> sh & 1 == 1);
+                let pa = a.get(off).is_some_and(|w| w >> sh & 1 == 1);
+                let pb = b.get(off).is_some_and(|w| w >> sh & 1 == 1);
                 match (pa, pb) {
                     (false, false) => Bit::Zero,
                     (true, false) => Bit::One,
@@ -347,7 +360,11 @@ impl EventStream {
             Kind::String => ValueColumn::Str(Vec::new()),
             _ => ValueColumn::new_bits(width),
         };
-        EventStream { times: Vec::new(), deltas: Vec::new(), values }
+        EventStream {
+            times: Vec::new(),
+            deltas: Vec::new(),
+            values,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -406,7 +423,10 @@ pub struct Timescale {
 
 impl Default for Timescale {
     fn default() -> Self {
-        Timescale { num: 1, unit_exp: -9 }
+        Timescale {
+            num: 1,
+            unit_exp: -9,
+        }
     }
 }
 
@@ -443,7 +463,7 @@ impl std::fmt::Display for Timescale {
 }
 
 /// A fully parsed waveform, before it is written to a `.vtx` store.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Trace {
     pub timescale: Timescale,
     pub date: Option<String>,
@@ -455,24 +475,12 @@ pub struct Trace {
     pub t_max: Time,
 }
 
-impl Default for Trace {
-    fn default() -> Self {
-        Trace {
-            timescale: Timescale::default(),
-            date: None,
-            version: None,
-            scopes: Vec::new(),
-            signals: Vec::new(),
-            streams: Vec::new(),
-            t_min: 0,
-            t_max: 0,
-        }
-    }
-}
-
 impl Trace {
     pub fn find(&self, path: &str) -> Option<Handle> {
-        self.signals.iter().position(|s| s.path() == path).map(|i| i as Handle)
+        self.signals
+            .iter()
+            .position(|s| s.path() == path)
+            .map(|i| i as Handle)
     }
 
     pub fn total_events(&self) -> usize {
@@ -515,14 +523,17 @@ mod tests {
 
     #[test]
     fn path_joins_hierarchy() {
-        let id = SignalId { hier: vec!["tb".into(), "dut".into()], name: "clk".into() };
+        let id = SignalId {
+            hier: vec!["tb".into(), "dut".into()],
+            name: "clk".into(),
+        };
         assert_eq!(id.path(), "tb.dut.clk");
     }
 
     #[test]
     fn wide_column_round_trips() {
         let mut s = EventStream::new(100, Kind::Wire);
-        let digits: Vec<u8> = std::iter::repeat(b'1').take(100).collect();
+        let digits: Vec<u8> = std::iter::repeat_n(b'1', 100).collect();
         s.push(0, &parse_vcd_vector(&digits, 100).unwrap());
         s.push(1, &parse_vcd_vector(b"0", 100).unwrap());
         assert_eq!(s.values.len(), 2);

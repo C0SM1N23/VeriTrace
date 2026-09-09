@@ -9,6 +9,7 @@ says a thing is verified without the qualifier that makes it true.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -75,6 +76,27 @@ def test_metrics_land_in_tables_the_spec_queries(con):
     assert regress.query(con, "SELECT score FROM coverage WHERE kind='line'")[1] == [(0.94,)]
 
 
+def test_record_collection_does_not_drop_the_real_findings():
+    """The DB writer used to iterate a nonexistent ``Report.groups`` field."""
+    from veritrace.analysis.findings import Finding, Group, Report, Severity
+    from veritrace.cli import _collect
+
+    report = Report(
+        findings=[
+            Finding(Group.STUCK, Severity.WARN, "stuck", "frozen"),
+            Finding(Group.LINT, Severity.ERROR, "inferred_latch", "latch"),
+        ]
+    )
+    ctx = SimpleNamespace(
+        transactions=lambda: SimpleNamespace(extractions=[]),
+        check_report=lambda: report,
+        coverage_report=lambda: SimpleNamespace(code=None, functional=[]),
+    )
+    run = _run()
+    _collect(ctx, run)
+    assert sorted(run.findings) == [("lint", "error", 1), ("stuck", "warn", 1)]
+
+
 def test_history_is_machine_readable(tmp_path):
     """§13.6's whole point is a trend across runs, which is read by a script.
 
@@ -106,6 +128,106 @@ def test_history_is_machine_readable(tmp_path):
         main, ["history", "--db", str(path), "--json", "SELECT n FROM findings WHERE grp='stuck'"]
     )
     assert json.loads(q.output)["rows"] == [[3]]
+
+
+def test_performance_history_reads_recorded_metrics_and_marks_the_regression(tmp_path):
+    """The UI history is not a second store: it reads the rows `record` wrote."""
+    path = tmp_path / "regressions.duckdb"
+    con = regress.connect(path)
+    for commit, p99 in (("old", 10.0), ("regressed", 15.0), ("latest", 16.0)):
+        run = _run(commit_sha=commit)
+        run.txn.append({"iface": "dma0", "pack": "AXI4", "n": 10, "p99": p99})
+        regress.record(con, run)
+    con.close()
+
+    out = regress.performance_history(path, "dma0", "p99_latency")
+    assert out["available"] is True
+    assert [p["commit"] for p in out["points"]] == ["old", "regressed", "latest"]
+    assert [p["value"] for p in out["points"]] == [10.0, 15.0, 16.0]
+    assert out["regression_run_id"] == out["points"][1]["run_id"]
+    assert out["points"][1]["regression"] is True
+    assert out["delta"] == 1.0
+
+
+def test_performance_history_missing_database_and_bad_metric_are_explicit(tmp_path):
+    out = regress.performance_history(tmp_path / "absent.duckdb", "dma0")
+    assert out["available"] is False
+    assert "veritrace record" in out["reason"]
+    with pytest.raises(ValueError, match="unknown performance metric"):
+        regress.performance_history(tmp_path / "absent.duckdb", "dma0", "made_up")
+
+
+def test_scorecard_history_uses_the_latest_real_database_run(tmp_path):
+    path = tmp_path / "regressions.duckdb"
+    con = regress.connect(path)
+    regress.record(con, _run(commit_sha="older"))
+    latest = _run(commit_sha="latest", top="cpu_top")
+    latest.txn.append(
+        {
+            "iface": "dma0",
+            "pack": "AXI4",
+            "n": 20,
+            "violations": 0,
+        }
+    )
+    latest.findings.append(("stuck", "warn", 2))
+    latest.coverage.extend(
+        [
+            ("line", None, 94, 100, 0.94),
+            ("functional", "dma0", 8, 10, 0.8),
+            ("mutation", None, 15, 20, 0.75),
+        ]
+    )
+    latest_id = regress.record(con, latest)
+    con.close()
+
+    snapshot = regress.scorecard_snapshot(path)
+    assert snapshot["run_id"] == latest_id and snapshot["run_count"] == 2
+    assert snapshot["run"]["commit_sha"] == "latest"
+    assert snapshot["transactions"][0]["n_transactions"] == 20
+    assert snapshot["findings"] == [{"group": "stuck", "severity": "warn", "n": 2}]
+
+
+def test_scorecard_cli_can_render_history_without_a_waveform(tmp_path):
+    from click.testing import CliRunner
+
+    from veritrace.cli import main
+
+    path = tmp_path / "regressions.duckdb"
+    con = regress.connect(path)
+    run = _run(commit_sha="abc123", top="cpu_top")
+    run.txn.append({"iface": "dma0", "pack": "AXI4", "n": 20, "violations": 0})
+    run.findings.append(("stuck", "warn", 2))
+    run.coverage.extend(
+        [
+            ("line", None, 94, 100, 0.94),
+            ("functional", "dma0", 8, 10, 0.8),
+        ]
+    )
+    regress.record(con, run)
+    con.close()
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["scorecard", "--history", str(path), "--json"])
+    assert result.exit_code == 0, result.output
+    import json
+
+    body = json.loads(result.output)
+    assert body["design"] == "cpu_top" and body["commit"] == "abc123"
+    assert body["history"]["runs"] == 1
+    rows = {row["category"]: row for row in body["rows"]}
+    assert rows["line coverage"]["value"] == "94%"
+    assert rows["protocol violations"]["value"] == "0"
+    assert rows["deadlock/stuck"]["value"] == "2"
+
+    output = tmp_path / "signoff.html"
+    rendered = runner.invoke(
+        main, ["scorecard", "--history", str(path), "-o", str(output)]
+    )
+    assert rendered.exit_code == 0, rendered.output
+    page = output.read_text(encoding="utf-8")
+    assert "<!doctype html>" in page and "Latest recorded run" in page
+    assert "line coverage" in page and "94%" in page
 
 
 def test_the_rtl_hash_changes_when_the_rtl_does(tmp_path):

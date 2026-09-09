@@ -1,0 +1,12 @@
+design = "arbiter"
+top = "tb_arbiter"
+bug = "async reset release never arms the unlock path, so lock_r remains set"
+correlation_min = 99
+
+[[why]]
+question = "why(tb_arbiter.dut.lock_r)"
+reaches = "tb_arbiter.dut.release_armed"
+
+[checks]
+required_signals = ["tb_arbiter.dut.lock_r"]
+required_checks = ["stuck", "async_reset_no_sync"]

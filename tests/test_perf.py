@@ -580,6 +580,10 @@ def test_the_cycle_profile_survives_the_cache(tmp_path_factory):
         # And the aggregates a restored profile produces are identical, which is
         # the property that actually matters to the tab.
         assert metrics.stall_profile(b).counts == metrics.stall_profile(a).counts
+        # Cached data feeds every other chart too.  A preserved cycle profile
+        # beside empty transaction events used to turn real throughput into 0.
+        assert metrics.measure(a, store, clock).to_dict() == metrics.measure(b, store, clock).to_dict()
+        assert metrics.bytes_moved(b, store)[0] > 0
 
 
 # --- the cascade reaches outside the interface ------------------------------

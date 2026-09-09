@@ -13,6 +13,7 @@
  */
 
 import { expect, test, type Page } from "@playwright/test";
+import { waitForReady } from "./session";
 
 const BACKEND = process.env.VERITRACE_BACKEND ?? "http://127.0.0.1:8765";
 
@@ -25,7 +26,9 @@ test.beforeAll(async ({ request }) => {
       data: { trace_path: trace, rtl_paths: ["designs/deadlock"] },
     });
     expect(r.ok(), `could not open ${trace}: ${await r.text()}`).toBeTruthy();
-    return (await r.json()).session_id as string;
+    const sid = (await r.json()).session_id as string;
+    await waitForReady(request, BACKEND, sid);
+    return sid;
   };
   deadlocked = await open("designs/deadlock/dump.vtx");
   healthy = await open("designs/deadlock/dump_ok.vtx");
@@ -63,6 +66,26 @@ test("the Performance tab exists and is reachable by key", async ({ page }) => {
   await page.keyboard.press("9");
   await expect(page.locator('[data-testid="performance-tab"]')).toBeVisible();
   await expect(page.locator('[data-testid="tab-9"]')).toHaveAttribute("aria-selected", "true");
+});
+
+test("a failed analysis remains actionable and Retry loads real data", async ({ page }) => {
+  let requests = 0;
+  await page.route(`**/session/${healthy}/performance`, async (route) => {
+    requests++;
+    if (requests === 1) {
+      await route.fulfill({ status: 500, json: { detail: "Cannot read protocol cache" } });
+    } else await route.continue();
+  });
+  await ready(page, healthy);
+  await page.getByTestId("tab-9").click();
+  await expect(page.getByRole("alert")).toContainText("Cannot read protocol cache");
+  // Let the former effect loop run; it used to reissue failures indefinitely.
+  await page.waitForTimeout(500);
+  expect(requests).toBe(1);
+  await page.getByRole("button", { name: "Retry", exact: true }).click();
+  await expect(page.getByTestId("perf-stall-total")).toHaveText("100.0%");
+  expect(requests).toBe(2);
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
 test("the stall shares on screen add to exactly 100%", async ({ page }) => {
@@ -159,10 +182,23 @@ test("fairness is per master, with the Jain index", async ({ page }) => {
   await expect(page.locator('[data-testid="perf-jain"]')).toHaveText("1.000");
 });
 
+test("bandwidth consumes the real throughput series and states its ceiling", async ({ page }) => {
+  await open(page, healthy);
+  const card = page.locator('[data-testid="perf-bandwidth"]');
+  await expect(card).toBeVisible();
+  await expect(card.locator(".perf-line")).toBeVisible();
+  await expect(card).toContainText("bytes moved");
+  await expect(card).toContainText("theoretical bytes/cycle");
+  await expect(page.locator('[data-testid="perf-bandwidth-share"]')).toBeVisible();
+});
+
 test("selecting a window narrows the charts and moves Wave", async ({ page }) => {
   // §11.4b: select a window in any chart and everything else follows.
   await open(page, healthy);
   await expect(page.locator('[data-testid="perf-window-clear"]')).toHaveCount(0);
+  const bytes = page.locator('[data-testid="perf-bandwidth"] .perf-percentiles > span').first();
+  const beforeBytes = parseInt((await bytes.textContent())!);
+  const narrowed = page.waitForResponse((r) => r.url().includes("/performance?t0="));
 
   const chart = page.locator('[data-testid="perf-stall-chart"]');
   const box = await chart.boundingBox();
@@ -172,6 +208,8 @@ test("selecting a window narrows the charts and moves Wave", async ({ page }) =>
   await page.mouse.down();
   await page.mouse.move(b.x + b.width * 0.5, b.y + b.height / 2, { steps: 8 });
   await page.mouse.up();
+  const response = await narrowed;
+  expect(response.ok(), await response.text()).toBeTruthy();
 
   const chip = page.locator('[data-testid="perf-window-clear"]');
   await expect(chip).toBeVisible();
@@ -179,7 +217,11 @@ test("selecting a window narrows the charts and moves Wave", async ({ page }) =>
   // The total still reads 100% — of what is on screen, which is the property
   // that would break if the shares were reused from the whole run.
   await expect(page.locator('[data-testid="perf-stall-total"]')).toHaveText("100.0%");
+  await expect.poll(async () => parseInt((await bytes.textContent())!)).toBeLessThan(beforeBytes);
+  const restored = page.waitForResponse((r) => r.url().endsWith("/performance"));
 
   await chip.click();
+  await restored;
   await expect(chip).toHaveCount(0);
+  await expect(bytes).toHaveText(`${beforeBytes} bytes moved`);
 });

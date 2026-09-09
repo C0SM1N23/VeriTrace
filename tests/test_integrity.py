@@ -400,6 +400,26 @@ def test_the_scoreboard_still_works_from_a_cached_extraction(tmp_path):
     assert again.mismatches[0].lanes == CORRUPTED_LANES
 
 
+def test_a_missing_beat_cache_is_rebuilt_instead_of_becoming_fake_clean(tmp_path):
+    """A surviving transaction table must not conceal a damaged beat table."""
+    from veritrace.protocol import persist
+
+    out = tmp_path / "dump.vtx"
+    convert(str(DESIGNS / "dma" / "dump.vcd"), str(out))
+    store = TraceStore(str(out))
+    clock = clocks.resolve(store)
+    cfg = Config.empty()
+    first = engine.extract(store, out, clock, cfg, use_cache=False)
+    victim = next(ex for ex in first.extractions if ex.beats)
+    beat_file = persist.beats_path(out, victim.interface.name)
+    beat_file.unlink()
+
+    reopened = engine.extract(store, out, clock, cfg, use_cache=True)
+    assert beat_file.is_file(), "the damaged cache was reused instead of rebuilt"
+    again = int_report.build(reopened, store, clock)
+    assert len(again.mismatches) == 16
+
+
 # --- presentation -----------------------------------------------------------
 
 

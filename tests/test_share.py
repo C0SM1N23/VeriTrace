@@ -188,6 +188,22 @@ def test_provenance_is_not_shared(vtx, tmp_path):
     assert "provenance" not in share.build(vtx, layout, tmp_path)["layout"]
 
 
+@pytest.mark.parametrize("path", ["../outside.vtnotes", "notes/../../outside.vtnotes"])
+def test_restore_rejects_note_paths_outside_the_project(vtx, tmp_path, path):
+    root = tmp_path / "receiver"
+    root.mkdir()
+    bundle = share.build(vtx, _layout(vtx), tmp_path)
+    bundle["notes"] = [{"path": path, "text": "overwrite me"}]
+    sidecar = LayoutFile.for_trace(vtx)
+    before = sidecar.path.read_bytes()
+
+    with pytest.raises(ValueError, match="escapes project root"):
+        share.apply(bundle, vtx, root)
+
+    assert not (tmp_path / "outside.vtnotes").exists()
+    assert sidecar.path.read_bytes() == before, "a rejected bundle must have no partial writes"
+
+
 # --- §1.8 -------------------------------------------------------------------
 
 

@@ -9,7 +9,6 @@ share everything but a mode.
 from __future__ import annotations
 
 import shutil
-import time
 from pathlib import Path
 from typing import Any
 
@@ -258,7 +257,6 @@ def _with_covers(
 
 def _endmodule(data: bytes, module: str) -> int | None:
     """Byte offset of the `endmodule` that closes `module`."""
-    from pyslang import syntax as S
 
     from veritrace.mutate.operators import span
 

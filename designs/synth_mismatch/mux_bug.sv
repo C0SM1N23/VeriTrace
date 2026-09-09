@@ -29,8 +29,9 @@ module mux_bug (
     y = sel ? a : b;
   end
 
-  // The same mux written correctly, so the two can be compared inside one run.
-  always @* begin
+  // The control also evaluates at time zero: declaration initializers can run
+  // before an always @* starts waiting, leaving its output X until an input moves.
+  always_comb begin
     y_ok = sel ? a : b;
   end
 

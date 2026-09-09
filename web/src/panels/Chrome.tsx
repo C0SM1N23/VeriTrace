@@ -19,7 +19,7 @@ const NO_TABLES: PluginTable[] = [];
 
 /** The tab strip of §11.4. Tabs that do not exist yet are visible but inert. */
 const TABS = [
-  "Wave", "Causal", "Source", "FSM", "Checks", "Diff", "Coverage",
+  "Wave", "Causal", "Source", "FSM", "Diff", "Checks", "Coverage",
   "Transactions", "Performance", "Memory",
 ];
 /**
@@ -32,8 +32,8 @@ const TABS = [
  */
 const BUILT = new Set([1, 2, 3, 5, 6, 7, 8, 9, 10]);
 const MOVED: Record<number, string> = { 4: "FSM — a mode of the Source tab (⌘M)" };
-/** Checks is tab 5; its badge shows how much it already knows (§13.4). */
-export const CHECKS_TAB = 5;
+/** Checks is tab 6; its badge shows how much it already knows (§11.4). */
+export const CHECKS_TAB = 6;
 
 export function TopBar() {
   const status = useWave((s) => s.status);
@@ -52,6 +52,14 @@ export function TopBar() {
       <span className="crumb">
         t: {formatTime(status.t0, status.timescale)}–{formatTime(status.t1, status.timescale)}
       </span>
+      {status.capture && (
+        <>
+          <Dot />
+          <span className="crumb" title="History before sample zero is unavailable">
+            CAPTURE WINDOW · sampled, shallow, probed signals only
+          </span>
+        </>
+      )}
     </div>
   );
 }
@@ -361,6 +369,7 @@ function Bookmarks({ onClose }: { onClose: () => void }) {
 const SHORTCUTS: [string, string][] = [
   ["⌘K", "focus query bar"],
   ["⌘P", "find a signal"],
+  ["⌘⇧F", "find a signal across the design"],
   ["w", "why on the selected signal"],
   ["s", "minimal subtrace of the current chain"],
   ["r", "replay the chain, step by step"],
@@ -402,8 +411,11 @@ export function HelpOverlay() {
 
 /** The §10.1 verbs, for the completion list. `why` first: it is the main road. */
 const VERBS = [
-  "why", "subtrace", "repro", "cone", "fanout", "find", "stuck", "edges",
-  "hold", "changed", "xtrace", "fsm", "lint", "handshake", "uncovered",
+  "why", "why_not", "subtrace", "repro", "cone", "fanout", "find", "stuck", "edges",
+  "hold", "changed", "xtrace", "fsm", "lint", "handshake", "uncovered", "txn",
+  "latency", "throughput", "stalls", "outstanding", "fairness", "deadlock",
+  "livelock", "track", "scoreboard", "cmds", "banks", "timing", "rowhits",
+  "fcov", "protocol",
 ];
 
 /**
@@ -425,6 +437,7 @@ export function QueryBar() {
   const text = useWave((s) => s.queryText);
   const setQueryText = useWave((s) => s.setQueryText);
   const history = useWave((s) => s.queryHistory);
+  const saved = useWave((s) => s.savedQueries);
   const signals = useWave((s) => s.signals);
   // -1 means "not walking history"; 0 is the most recent query.
   const [histAt, setHistAt] = useState(-1);
@@ -444,6 +457,13 @@ export function QueryBar() {
   // the parentheses — the two things that are long enough to be worth it.
   const suggestions = useMemo(() => {
     if (!open || !text.trim()) return [];
+    if (text.trim().startsWith("@")) {
+      const head = text.trim().slice(1).toLowerCase();
+      return Object.keys(saved)
+        .filter((name) => name.toLowerCase().startsWith(head))
+        .slice(0, 8)
+        .map((name) => `@${name}`);
+    }
     const paren = text.indexOf("(");
     if (paren < 0) {
       const head = text.trim().toLowerCase();
@@ -456,7 +476,7 @@ export function QueryBar() {
       .filter((s) => s.path.toLowerCase().includes(low))
       .slice(0, 8)
       .map((s) => `${text.slice(0, paren + 1)}${s.path}`);
-  }, [open, text, signals]);
+  }, [open, text, signals, saved]);
 
   const accept = (value: string) => {
     setQueryText(value);
@@ -485,9 +505,8 @@ export function QueryBar() {
         placeholder={
           hasRtl
             ? "why(top.ctrl.ready == 0 @ c1247)"
-            : "why() needs RTL — start the server with --rtl"
+            : "find(clk) — waveform queries work without RTL"
         }
-        disabled={!hasRtl}
         onChange={(e) => {
           setQueryText(e.target.value);
           setHistAt(-1);

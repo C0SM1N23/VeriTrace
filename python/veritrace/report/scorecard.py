@@ -58,6 +58,10 @@ class Scorecard:
     design: str = ""
     commit: str = ""
     rows: list[Row] = field(default_factory=list)
+    #: Set when the inputs came from §13.6 rather than a live trace.
+    history_path: str = ""
+    history_runs: int = 0
+    run_id: int | None = None
 
     @property
     def covered(self) -> list[Row]:
@@ -72,6 +76,15 @@ class Scorecard:
             "design": self.design,
             "commit": self.commit,
             "n_categories": len(self.covered),
+            "history": (
+                {
+                    "path": self.history_path,
+                    "runs": self.history_runs,
+                    "run_id": self.run_id,
+                }
+                if self.history_path
+                else None
+            ),
             "rows": [r.to_dict() for r in self.rows],
         }
 
@@ -232,9 +245,16 @@ def _protocol(protocol: Any) -> Row:
     if not extractions:
         row.detail = "no protocol interface was extracted"
         return row
-    n = sum(len(e.violations) for e in extractions)
+    n = sum(
+        int(getattr(e, "n_violations", len(getattr(e, "violations", []) or [])) or 0)
+        for e in extractions
+    )
+    n_transactions = sum(
+        int(getattr(e, "n_transactions", len(getattr(e, "transactions", []) or [])) or 0)
+        for e in extractions
+    )
     row.value = str(n)
-    row.detail = f"over {sum(len(e.transactions) for e in extractions)} transaction(s) in this run"
+    row.detail = f"over {n_transactions} transaction(s) in this run"
     row.status = OK if n == 0 else BAD
     row.source = "veritrace txn"
     return row
@@ -273,17 +293,38 @@ def _liveness(checks: Any) -> Row:
     the design, and the two are easy to confuse in a report like this one.
     """
     row = Row("deadlock/stuck", target="0")
-    findings = list(getattr(checks, "findings", []) or [])
-    if checks is None or not hasattr(checks, "findings"):
+    summary = getattr(checks, "counts_by_group", None) if checks is not None else None
+    if isinstance(summary, Loaded):
+        summary = summary._d
+    if isinstance(summary, dict):
+        n = sum(
+            int(value or 0)
+            for group, value in summary.items()
+            if any(key in str(group).lower() for key in LIVENESS)
+        )
+        total = sum(int(value or 0) for value in summary.values())
+    else:
+        findings = list(getattr(checks, "findings", []) or [])
+        if checks is None or not hasattr(checks, "findings"):
+            row.detail = "checks were not run"
+            return row
+        n = sum(
+            1
+            for f in findings
+            if any(
+                k
+                in str(
+                    getattr(getattr(f, "group", ""), "value", getattr(f, "group", ""))
+                ).lower()
+                for k in LIVENESS
+            )
+        )
+        total = len(findings)
+    if checks is None:
         row.detail = "checks were not run"
         return row
-    n = sum(
-        1 for f in findings
-        if any(k in str(getattr(getattr(f, "group", ""), "value", getattr(f, "group", ""))).lower()
-               for k in LIVENESS)
-    )
     row.value = str(n)
-    row.detail = f"open stuck and deadlock findings, out of {len(findings)} finding(s) in this run"
+    row.detail = f"open stuck and deadlock findings, out of {total} finding(s) in this run"
     row.status = OK if n == 0 else BAD
     row.source = "veritrace check"
     return row
