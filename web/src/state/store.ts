@@ -198,6 +198,10 @@ export interface WaveState {
    * "something went wrong". Cleared by the next action that succeeds.
    */
   note: string;
+  /** Persisted state remains dirty until the latest snapshot is acknowledged. */
+  layoutDirty: boolean;
+  layoutSaving: boolean;
+  layoutError: string | null;
   // §8.8 — a mode of Source, not a tab.
   machines: Machine[];
   fsmBusy: boolean;
@@ -348,6 +352,8 @@ export interface WaveState {
 }
 
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
+let persistInFlight: Promise<void> | null = null;
+let persistRevision = 0;
 /** Set by tests to observe that a save actually reached the server. */
 let persistCount = 0;
 let perfRequest = 0;
@@ -377,28 +383,48 @@ export function layoutFrom(s: WaveState): Layout {
 }
 
 function schedulePersist(get: () => WaveState): void {
+  const s = get();
+  if (!s.session || !s.ready) return;
+  persistRevision += 1;
+  useWave.setState({ layoutDirty: true });
   if (persistTimer) clearTimeout(persistTimer);
   persistTimer = setTimeout(() => {
-    const s = get();
-    if (!s.session || !s.ready) return;
-    void putLayout(s.session, layoutFrom(s))
-      .then(() => {
-        persistCount += 1;
-        (window as unknown as { __vtSaves?: number }).__vtSaves = persistCount;
-      })
-      .catch((e) => console.warn("layout save failed", e));
+    persistTimer = null;
+    void flushPersist();
   }, PERSIST_DEBOUNCE_MS);
 }
 
-/** Flush any pending layout save immediately (used on page hide). */
+/** One writer, shared by autosave, page hide and Retry. Never report fake success. */
 export async function flushPersist(): Promise<void> {
   if (persistTimer) {
     clearTimeout(persistTimer);
     persistTimer = null;
   }
-  const s = useWave.getState();
-  if (!s.session || !s.ready) return;
-  await putLayout(s.session, layoutFrom(s)).catch(() => {});
+  if (persistInFlight) return persistInFlight;
+  if (!useWave.getState().layoutDirty) return;
+  persistInFlight = (async () => {
+    while (useWave.getState().layoutDirty) {
+      const s = useWave.getState();
+      if (!s.session || !s.ready) return;
+      const revision = persistRevision;
+      useWave.setState({ layoutSaving: true });
+      try {
+        await putLayout(s.session, layoutFrom(s));
+      } catch (e) {
+        useWave.setState({ layoutError: e instanceof Error ? e.message : String(e) });
+        return; // Keep edits in memory; retry on the next edit or explicit Retry.
+      }
+      persistCount += 1;
+      (window as unknown as { __vtSaves?: number }).__vtSaves = persistCount;
+      useWave.setState({ layoutDirty: revision !== persistRevision, layoutError: null });
+      // Edits made during the request are coalesced into the next snapshot.
+      // Starting an independent PUT would let the older request land last.
+    }
+  })().finally(() => {
+    persistInFlight = null;
+    useWave.setState({ layoutSaving: false });
+  });
+  return persistInFlight;
 }
 
 /**
@@ -509,6 +535,9 @@ export const useWave = create<WaveState>((set, get) => ({
   savedQueries: {},
   bookmarks: [],
   note: "",
+  layoutDirty: false,
+  layoutSaving: false,
+  layoutError: null,
   machines: [],
   fsmBusy: false,
   fsmError: null,

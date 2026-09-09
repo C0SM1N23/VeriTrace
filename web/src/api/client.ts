@@ -178,12 +178,30 @@ export async function fetchLayout(session: string): Promise<Layout> {
 }
 
 export async function putLayout(session: string, layout: Layout): Promise<void> {
-  const r = await fetch(`${API}/session/${session}/layout`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify(layout),
-  });
-  if (!r.ok) throw new Error(`layout save failed: ${r.status}`);
+  const body = JSON.stringify(layout);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const r = await fetch(`${API}/session/${session}/layout`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body,
+      // Small page-hide saves may finish after navigation. Larger layouts use
+      // ordinary fetch to avoid the browser's keepalive payload limit; the
+      // unsaved-change warning remains until either request is acknowledged.
+      keepalive: new TextEncoder().encode(body).byteLength <= 60_000,
+      signal: controller.signal,
+    });
+    if (!r.ok) {
+      const error = await r.json().catch(() => ({ detail: r.statusText }));
+      throw new Error(error.detail || `layout save failed: ${r.status}`);
+    }
+  } catch (e) {
+    if (controller.signal.aborted) throw new Error("Layout save timed out. Check the server and retry.");
+    throw e;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export interface WaveRequest {

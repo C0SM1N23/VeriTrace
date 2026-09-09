@@ -1569,7 +1569,13 @@ def create_app(
     @api.put("/session/{session_id}/layout")
     def put_layout(session_id: str, body: LayoutBody) -> dict[str, Any]:
         session = require(session_id)
-        return session.save_layout(body.model_dump())
+        try:
+            return session.save_layout(body.model_dump())
+        except OSError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Could not save layout: {exc}. Check storage permissions and available space, then retry.",
+            ) from exc
 
     @api.websocket("/session/{session_id}/ws")
     async def ws(websocket: WebSocket, session_id: str) -> None:

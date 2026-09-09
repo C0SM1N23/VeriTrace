@@ -3234,6 +3234,14 @@ select:focus-visible {
   white-space: nowrap;
 }
 
+.layout-save-error {
+  color: var(--sig-x);
+  max-width: 42ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .sig-row.derived .sig-name {
   color: var(--causal);
   text-decoration: underline dotted;

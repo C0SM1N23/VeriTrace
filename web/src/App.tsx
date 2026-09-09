@@ -53,12 +53,20 @@ export default function App() {
   useEffect(() => {
     const onHide = () => void flushPersist();
     window.addEventListener("pagehide", onHide);
+    const onLeave = (event: BeforeUnloadEvent) => {
+      if (!useWave.getState().layoutDirty) return;
+      void flushPersist();
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onLeave);
     const onVisibility = () => {
       if (document.visibilityState === "hidden") onHide();
     };
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       window.removeEventListener("pagehide", onHide);
+      window.removeEventListener("beforeunload", onLeave);
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, []);

@@ -19,6 +19,7 @@ The external Siemens project was not modified.
 | §11.4 Diff: connected visualization | Diff selection → API focus → both causal trees and aligned event segments → overlaid SVG with divergent regions hatched. Export contains that actual report. B-side navigation opens B's session and native timestamp. | `web/tests/diff.spec.ts`: real backend comparison, keyboard navigation, export download, wave jump and cross-session source link. |
 | §11.4 Diff: error/state consistency | A failed focus request leaves the previous signal, wave and causal explanation together; retry uses the backend again. | Browser test injects only an HTTP failure between successful real comparisons. It does not substitute successful analysis data. |
 | P5: state persistence | Diff anchors/options, query history, wave layout and memory timing choices survive reload. Layout writes and suppression updates are serialized within the process. | Browser reload tests; API layout concurrency and suppression tests. |
+| P5 / §11.8: save failures and ordering | Autosave, page-hide flush and Retry share one writer. New edits remain unsaved until acknowledged; failed saves retain edits, display the server's actual error, and warn before leaving. I/O failure leaves the previous file intact. | `web/tests/wave.spec.ts`: real filesystem write refusal → API → visible error → cancel leave → Retry → reload; deliberately delayed real PUTs prove an older save cannot overwrite the latest layout. `tests/test_api.py` verifies the original bytes and a fresh application reopen. |
 | §10–11: session bootstrap | Progress remains visible while session setup and layout restoration finish. Interactive controls mount only afterward, and keyboard shortcuts cannot mutate the pending state. | `web/tests/smoke.spec.ts`: delayed status and real layout responses, backend setup failure, and a fresh compiled design queried through the UI. |
 | §8.8: FSM time ownership | FSM overlays use their own clock, preserve unknown intervals and the final observed stay, and feed the canonical coverage result. | Real gated-clock tests; `tests/test_fsm.py`; `web/tests/fsm.spec.ts`. |
 | §8.13–8.14: protocol extraction/cache | Interface clocks and reset masks control actual sampling. All-reset traces do not fabricate transactions. Cache schema 8 preserves channel events, payloads, missing values and wide integers. | Protocol roundtrip tests; real reset-held Icarus → fresh/cached API tests. |
@@ -51,6 +52,9 @@ The external Siemens project was not modified.
   instead of substituting empty results or successful exit codes.
 - Startup no longer accepts commands that the arriving layout silently
   overwrites. Waveform range text also appears only for a loaded trace.
+- Layout writes no longer race through independent browser requests, swallow
+  errors on page hide, or hide failed autosaves in the developer console.
+  Failure remains actionable without discarding the in-memory edits.
 
 ## Remaining limits and follow-up scope
 
@@ -67,8 +71,11 @@ These items are **not certified complete** by this overhaul:
   complete UI traceability. Memory metric-series presentation is also partial.
 - Diff transaction payload completeness, simultaneous handshake anchors and
   one-sided interfaces need additional semantic verification.
-- Layout coordination is in-process, not a multi-process lock. Autosave error
-  presentation and cache filename collisions remain follow-up items.
+- Layout coordination is in-process and browser writes are ordered within one
+  page, not merged across concurrent editing tabs or protected by a multi-process
+  lock. Closing despite the unsaved-change warning cannot guarantee delivery;
+  neither can a browser/process crash before server acknowledgement. Cache
+  filename collisions remain a follow-up item.
 - Native FST is unavailable in the Windows wheel and is reported as such;
   Linux/macOS use the platform-gated reader. This checkpoint's commands were
   run on Windows, not every supported simulator/platform combination.
@@ -80,7 +87,7 @@ These items are **not certified complete** by this overhaul:
 From the repository root, unless stated otherwise:
 
 - `uv run --no-sync pytest -q -W error --junitxml=.veritrace/audit-python.xml`
-  — 962 passed, no skips (including the build-manifest follow-up).
+  — 963 passed, no skips (including build-manifest and layout I/O follow-ups).
 - `cargo test --workspace` — 88 passed; Windows has no native FST test cases.
 - `cargo fmt --all -- --check` and
   `cargo clippy --workspace --all-targets -- -D warnings` — passed.
@@ -93,7 +100,7 @@ From the repository root, unless stated otherwise:
 - Backend: `uv run --no-sync veritrace serve designs/fifo_buggy/dump.vtx --rtl designs/fifo_buggy --port 8765 --no-browser`.
   In `web/`, set `VERITRACE_TEST_ORIGIN=http://127.0.0.1:8765`, then run
   `npx playwright test --grep-invert "sustains 60fps" --max-failures=3`
-  — 143 functional browser tests passed. The 60-fps threshold is excluded at
+  — 145 functional browser tests passed. The 60-fps threshold is excluded at
   the user's request; functional performance-analysis tests remain enabled.
 - `uv build --wheel --out-dir dist` — passed.
 - `uv run --isolated --no-project --with K:/VeriTrace/dist/veritrace-0.1.0-cp312-cp312-win_amd64.whl --with httpx2 python tests/wheel_smoke.py`

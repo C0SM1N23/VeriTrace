@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { fetchCorrelation } from "../api/client";
 import { formatTime } from "../lib/time";
 import type { CorrelationReport, PluginTable } from "../lib/types";
-import { useWave } from "../state/store";
+import { flushPersist, useWave } from "../state/store";
 
 /**
  * One empty array, shared.
@@ -209,6 +209,9 @@ export const FIXED_TABS = TABS.length;
  * would re-render this on every frame of a pan.
  */
 export function StatusBar() {
+  const layoutDirty = useWave((s) => s.layoutDirty);
+  const layoutSaving = useWave((s) => s.layoutSaving);
+  const layoutError = useWave((s) => s.layoutError);
   const rangeRef = useRef<HTMLSpanElement>(null);
   const cursorRef = useRef<HTMLSpanElement>(null);
   const rulerMode = useWave((s) => s.rulerMode);
@@ -254,6 +257,20 @@ export function StatusBar() {
         </>
       )}
       <span className="spacer" />
+      {layoutError ? (
+        <>
+          <span className="layout-save-error" role="alert" data-testid="layout-save-error" title={layoutError}>
+            Layout not saved: {layoutError}
+          </span>
+          <button className="chip" disabled={layoutSaving} onClick={() => void flushPersist()}>
+            Retry save
+          </button>
+        </>
+      ) : layoutDirty && (
+        <span role="status" data-testid="layout-save-pending">
+          {layoutSaving ? "Saving layout…" : "Layout not saved yet"}
+        </span>
+      )}
       <button className="chip" onClick={zoomAll} title="Zoom to fit">
         fit
       </button>

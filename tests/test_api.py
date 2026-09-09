@@ -386,6 +386,32 @@ def test_corrupt_layout_file_does_not_break_the_session(vtx):
         assert len(backups) == 1 and backups[0].read_text() == "{ this is not json"
 
 
+def test_unwritable_layout_reports_the_real_error_and_retry_preserves_changes(vtx):
+    app = create_app(default_trace=vtx)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        sid = client.get("/").json()["default_session"]
+        endpoint = f"/session/{sid}/layout"
+        initial = client.put(endpoint, json={"rowH": 20, "rulerMode": "time"})
+        assert initial.status_code == 200, initial.text
+        sidecar = app.state.registry.get(sid).layout_file.path
+        original = sidecar.read_bytes()
+        # A real filesystem refusal on the production atomic-write path, not a
+        # mocked LayoutFile or a successful fixture response.
+        temporary = sidecar.with_suffix(sidecar.suffix + ".tmp")
+        temporary.mkdir()
+        failed = client.put(endpoint, json={"rowH": 28, "rulerMode": "cycle"})
+        assert failed.status_code == 503, failed.text
+        assert "Could not save layout" in failed.json()["detail"]
+        assert "retry" in failed.json()["detail"]
+        assert sidecar.read_bytes() == original
+        temporary.rmdir()
+        saved = client.put(endpoint, json={"rowH": 28, "rulerMode": "cycle"})
+        assert saved.status_code == 200, saved.text
+        assert client.get(endpoint).json()["rulerMode"] == "cycle"
+    with TestClient(create_app(default_trace=vtx)) as reopened:
+        assert reopened.get(endpoint).json()["rowH"] == 28
+
+
 def test_session_id_is_stable_and_path_based(tmp_path, vtx):
     assert session_id_for(vtx) == session_id_for(vtx)
     assert session_id_for(vtx) != session_id_for(tmp_path)

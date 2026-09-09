@@ -7,11 +7,15 @@
  */
 
 import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
+import { cpSync, mkdirSync, mkdtempSync, rmdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { waitForReady } from "./session";
 
 const CANVAS = '[data-testid="wave-canvas"]';
 
-async function openApp(page: Page): Promise<void> {
-  await page.goto("/");
+async function openApp(page: Page, session?: string): Promise<void> {
+  await page.goto(session ? `/?session=${session}` : "/");
   await expect(page.locator('[data-testid="signal-row"]').first()).toBeVisible();
   // §11.4b: a trace with findings opens on Checks, not Wave. These tests are
   // about Wave, so they ask for it rather than relying on where the app lands.
@@ -247,6 +251,72 @@ test.describe("Wave tab", () => {
 });
 
 test.describe("layout persistence", () => {
+  test("a failed save stays visible and Retry persists the actual edited layout", async ({ page, request }) => {
+    // A private copy of a real native waveform keeps filesystem fault injection
+    // away from the repository's trace and from every other browser session.
+    const project = mkdtempSync(join(tmpdir(), "veritrace layout failure "));
+    const trace = join(project, "dump.vtx");
+    cpSync(resolve("../designs/fifo_buggy/dump.vtx"), trace, { recursive: true });
+    const opened = await request.post(`${BACKEND}/session`, { data: { trace_path: trace, rtl_paths: [] } });
+    expect(opened.ok(), await opened.text()).toBeTruthy();
+    const sid = (await opened.json()).session_id;
+    await waitForReady(request, BACKEND, sid);
+    const initial = await request.put(`${BACKEND}/session/${sid}/layout`, { data: { rowH: 20, rulerMode: "time" } });
+    expect(initial.ok(), await initial.text()).toBeTruthy();
+    await openApp(page, sid);
+    const blockedWrite = `${trace}.session.json.tmp`;
+    mkdirSync(blockedWrite);
+    await page.getByTestId("density-toggle").click();
+    await expect(page.getByTestId("layout-save-error")).toContainText("Could not save layout");
+    await expect(page.getByTestId("layout-save-error")).toContainText("retry");
+    await expect(page.getByTestId("density-toggle")).toHaveText("tall");
+    const unchanged = await (await request.get(`${BACKEND}/session/${sid}/layout`)).json();
+    expect(unchanged.rowH ?? 20).toBe(20);
+    // A failed save is not just decoration: leaving would lose these edits.
+    // Cancel the browser's own warning and retain the unsaved workspace.
+    const leaving = page.waitForEvent("dialog");
+    await page.evaluate(() => { setTimeout(() => location.reload(), 0); });
+    const warning = await leaving;
+    expect(warning.type()).toBe("beforeunload");
+    await warning.dismiss();
+    await expect(page.getByTestId("density-toggle")).toHaveText("tall");
+
+    rmdirSync(blockedWrite); // Only the empty fault-injection directory we made.
+    await page.getByRole("button", { name: "Retry save", exact: true }).click();
+    await expect(page.getByTestId("layout-save-error")).toHaveCount(0);
+    await expect.poll(async () => (await (await request.get(`${BACKEND}/session/${sid}/layout`)).json()).rowH).toBe(28);
+    await page.reload();
+    await expect(page.getByTestId("density-toggle")).toHaveText("tall");
+  });
+
+  test("a slow older save cannot overwrite newer layout edits", async ({ page, request }) => {
+    await resetLayout(request);
+    await openApp(page);
+    const sid = (await (await request.get(`${BACKEND}/`)).json()).default_session;
+    let started = 0;
+    let completed = 0;
+    await page.route(`**/session/${sid}/layout`, async (route) => {
+      if (route.request().method() !== "PUT") return route.continue();
+      started += 1;
+      // Delay only delivery of the first write. Both saves and their responses
+      // are real; an independent second PUT used to commit before this one.
+      if (started === 1) await new Promise((resolve) => setTimeout(resolve, 1200));
+      const response = await route.fetch();
+      await route.fulfill({ response });
+      completed += 1;
+    });
+    await page.getByTestId("density-toggle").click();
+    await expect.poll(() => started).toBe(1);
+    await page.getByTestId("ruler-toggle").click();
+    await expect(page.getByTestId("ruler-toggle")).toHaveText("cycles");
+    await expect.poll(() => completed).toBeGreaterThanOrEqual(2);
+    const saved = await (await request.get(`${BACKEND}/session/${sid}/layout`)).json();
+    expect(saved).toMatchObject({ rowH: 28, rulerMode: "cycle" });
+    await page.reload();
+    await expect(page.getByTestId("density-toggle")).toHaveText("tall");
+    await expect(page.getByTestId("ruler-toggle")).toHaveText("cycles");
+  });
+
   /**
    * Acceptance criterion: reopen the browser tab and the layout is exactly as
    * it was left.
