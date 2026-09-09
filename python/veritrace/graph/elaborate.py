@@ -686,7 +686,11 @@ def elaborate(
     # the LRM does not allow, so slang rejects it. Guarding it with
     # `ifndef VERITRACE` keeps both tools happy without changing what is dumped.
     args += ["-DVERITRACE=1"]
-    args += [f"-D{d}" for d in defines]
+    # Icarus applies the last -D for a name; slang otherwise retains the first.
+    # Config defaults precede command-line overrides, so handing both copies
+    # to slang elaborates a different design from the waveform's compiler.
+    effective_defines = {d.partition("=")[0]: d for d in defines}
+    args += [f"-D{d}" for d in effective_defines.values()]
     if top:
         args += ["--top", top]
     if not drv.parseCommandLine(" ".join(args)):

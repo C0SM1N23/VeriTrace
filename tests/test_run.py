@@ -751,6 +751,104 @@ endmodule
 
 
 @needs_icarus
+def test_run_overrides_survive_fresh_cli_and_api_analysis_without_rewriting_config(tmp_path, monkeypatch):
+    import json
+    from fastapi.testclient import TestClient
+    from veritrace.api import create_app
+    from veritrace.cli import _load
+
+    (tmp_path / "headers").mkdir()
+    (tmp_path / "headers/width.vh").write_text("`define WIDTH 8\n")
+    source = tmp_path / "tb.sv"
+    source.write_text('''`timescale 1ns/1ps
+`ifdef OVERRIDE
+  `include "width.vh"
+`else
+  `define WIDTH 4
+`endif
+module tb;
+  reg clk=0;
+  always #5 clk=~clk;
+  reg [`WIDTH-1:0] data=`INITIAL;
+  initial #25 $finish;
+endmodule
+''')
+    config = tmp_path / ".veritrace.toml"
+    config.write_text('[design]\ntop="tb"\nrtl=["tb.sv"]\n[design.defines]\nINITIAL=1\n')
+    original = config.read_bytes()
+    monkeypatch.chdir(tmp_path)
+    run = CliRunner().invoke(main, ["run", "--incdir", "headers", "-D", "OVERRIDE", "-D", "INITIAL=42", "--json"])
+    assert run.exit_code == 0, run.output
+    dump = Path(json.loads(run.stdout)["dump"])
+    assert config.read_bytes() == original
+    # A real second command must not elaborate the old 4-bit/default branch.
+    ctx = _load(dump, need_rtl=True)
+    assert ctx.graph.get("tb.data").width == 8
+    assert "OVERRIDE" in ctx.config.defines and ctx.config.defines[-1] == "INITIAL=42"
+    why = CliRunner().invoke(main, ["why", str(dump), "why(tb.data @ 8000)", "--json"])
+    assert why.exit_code == 0, why.output
+    assert json.loads(why.stdout)["root"]["value"] == "00101010"
+    with TestClient(create_app(default_trace=dump)) as client:
+        sid = client.get("/").json()["default_session"]
+        session = client.app.state.registry.get(sid)
+        assert session.graph.get("tb.data").width == 8
+        got = client.post(f"/session/{sid}/query", json={"vtq": "why(tb.data @ 8000)"})
+        assert got.status_code == 200, got.text
+        assert got.json()["root"]["value"] == "00101010"
+    moved = tmp_path.parent / (tmp_path.name + " moved")
+    shutil.copytree(tmp_path, moved)
+    monkeypatch.chdir(moved)
+    moved_dump = moved / dump.relative_to(tmp_path)
+    relocated = CliRunner().invoke(main, ["why", str(moved_dump), "why(tb.data @ 8000)", "--json"])
+    assert relocated.exit_code == 0, relocated.output
+    assert json.loads(relocated.stdout)["root"]["value"] == "00101010"
+    monkeypatch.chdir(tmp_path)
+    # A later default run uses the user's original config, not the old override.
+    fresh = CliRunner().invoke(main, ["run", "--json"])
+    assert fresh.exit_code == 0, fresh.output
+    latest = _load(Path(json.loads(fresh.stdout)["dump"]), need_rtl=True)
+    assert latest.graph.get("tb.data").width == 4
+    assert "OVERRIDE" not in latest.config.defines
+    assert config.read_bytes() == original
+
+
+@needs_icarus
+def test_reopening_a_new_build_uses_its_sources_and_top_not_the_previous_run(tmp_path, monkeypatch):
+    import json
+    import time
+    from fastapi.testclient import TestClient
+    from veritrace.api import create_app
+    from veritrace.api.sessions import SessionRegistry
+
+    first, second = tmp_path / "first.sv", tmp_path / "second.sv"
+    first.write_text("module first; reg data=0; initial #25 $finish; endmodule\n")
+    second.write_text("module second; reg [7:0] data=42; initial #25 $finish; endmodule\n")
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    run = runner.invoke(main, ["run", str(first), "--top", "first", "--json"])
+    assert run.exit_code == 0, run.output
+    raw = Path(json.loads(run.stdout)["dump"])
+    sync = SessionRegistry()
+    sync.open(raw)
+    with TestClient(create_app(default_trace=raw)) as client:
+        sid = client.get("/").json()["default_session"]
+        rerun = runner.invoke(main, ["run", str(second), "--top", "second", "--json"])
+        assert rerun.exit_code == 0, rerun.output
+        assert Path(json.loads(rerun.stdout)["dump"]) == raw
+        reopened = client.post("/session", json={"trace_path": str(raw)})
+        assert reopened.json()["session_id"] == sid
+        deadline = time.monotonic() + 15
+        while (status := client.get(f"/session/{sid}/status").json())["phase"] != "ready":
+            assert status["phase"] != "error", status
+            assert time.monotonic() < deadline, status
+            time.sleep(0.01)
+        assert status["top"] == "second" and status["has_rtl"], status
+        assert client.app.state.registry.get(sid).graph.get("second.data").width == 8
+    reopened = sync.open(raw)
+    assert reopened.top == "second" and reopened.graph.get("second.data").width == 8
+
+
+@needs_icarus
 def test_the_config_lands_where_the_next_command_will_look_for_it(tmp_path, monkeypatch):
     """`veritrace run rtl/` — the shape of every real project.
 

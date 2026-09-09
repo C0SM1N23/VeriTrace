@@ -11,6 +11,7 @@ The external Siemens project was not modified.
 | --- | --- | --- |
 | §4.0, §13.4b: build and simulate | `cli.run` → `simulate.icarus` → real `iverilog` / `vvp` → generated dump → native conversion. Source order, filelists, includes, defines, top and working directory reach the process. Compile failures, assertion failures and hangs are not successful runs. | `tests/test_run.py`: real compiler, missing includes, intentional errors, timeout, stale output, spaces in paths and JSON runs. |
 | §4.3: reusable project configuration | A newly configured JSON run saves the exact source list and build options. Later CLI analysis and a fresh API session use them; omitted RTL selects configured sources while explicit `[]` retains waveform-only mode. | `test_json_run_preserves_exact_build_for_cli_rerun_and_api_elaboration`; `test_configured_rtl_is_used_on_first_open_but_explicit_empty_still_disables_it`. |
+| §4.3: transient build options and reruns | `run` records source order, include paths, defines and top in the exact native store's `build.json`, bound to the waveform hash. CLI/API elaboration restores them without rewriting project config. Last-definition precedence matches Icarus; reopening a new build replaces inherited sources/top. | `tests/test_build.py`; real override, relocated-project and changed-top rerun tests in `tests/test_run.py`; fresh-simulation browser test in `web/tests/smoke.spec.ts`; installed-wheel smoke with include/define overrides. |
 | §4.2, §6: Python/Rust and store ownership | The application loads the native extension. Source identity invalidates stale stores, live readers retain immutable generations, malformed data raises errors, and wide values survive persistence. | Rust store/property tests; `tests/test_store.py`, `tests/test_protocol.py`; installed-wheel smoke test. |
 | §5, §11.6: graph/source correlation | Elaborated source identities distinguish same-named files; exact source paths and values reach Source and Inspector. | `tests/test_api.py`, `tests/test_whytrace.py`, `web/tests/causal.spec.ts`. |
 | §8.7: exact divergence detection | `cli.diff` / REST / VTQ → shared alignment → native transitions → exact rational event positions. Sub-cycle pulses and the tail after the final anchor are compared, not collapsed away. Empty comparisons are errors, not equivalence. | `tests/test_diff.py`: known-time pulses, different timescales, missing signals and CLI/API/VTQ agreement. |
@@ -18,6 +19,7 @@ The external Siemens project was not modified.
 | §11.4 Diff: connected visualization | Diff selection → API focus → both causal trees and aligned event segments → overlaid SVG with divergent regions hatched. Export contains that actual report. B-side navigation opens B's session and native timestamp. | `web/tests/diff.spec.ts`: real backend comparison, keyboard navigation, export download, wave jump and cross-session source link. |
 | §11.4 Diff: error/state consistency | A failed focus request leaves the previous signal, wave and causal explanation together; retry uses the backend again. | Browser test injects only an HTTP failure between successful real comparisons. It does not substitute successful analysis data. |
 | P5: state persistence | Diff anchors/options, query history, wave layout and memory timing choices survive reload. Layout writes and suppression updates are serialized within the process. | Browser reload tests; API layout concurrency and suppression tests. |
+| §10–11: session bootstrap | Progress remains visible while session setup and layout restoration finish. Interactive controls mount only afterward, and keyboard shortcuts cannot mutate the pending state. | `web/tests/smoke.spec.ts`: delayed status and real layout responses, backend setup failure, and a fresh compiled design queried through the UI. |
 | §8.8: FSM time ownership | FSM overlays use their own clock, preserve unknown intervals and the final observed stay, and feed the canonical coverage result. | Real gated-clock tests; `tests/test_fsm.py`; `web/tests/fsm.spec.ts`. |
 | §8.13–8.14: protocol extraction/cache | Interface clocks and reset masks control actual sampling. All-reset traces do not fabricate transactions. Cache schema 8 preserves channel events, payloads, missing values and wide integers. | Protocol roundtrip tests; real reset-held Icarus → fresh/cached API tests. |
 | §8.17: selected-window metrics | Selected endpoints reach the backend measurement window; stale responses are discarded. Whole-run liveness is identified separately. | `tests/test_perf.py`; `web/tests/performance.spec.ts`. |
@@ -32,6 +34,10 @@ The external Siemens project was not modified.
 
 - JSON runs no longer omit configuration needed by the next process; API
   configuration no longer stops at a parsed but unused RTL list.
+- Per-run defines and include paths now reach later CLI/API analysis through a
+  waveform-bound build manifest. Duplicate macro definitions use Icarus's
+  last-definition rule, and new builds do not inherit an old session's top or
+  source list. Project configuration remains unchanged.
 - Cycle-rounded Diff events no longer hide real short pulses. The displayed
   value comes from the divergence time, not the beginning of its cycle.
 - Large anchor sets no longer silently switch to incorrect positional matching.
@@ -43,13 +49,17 @@ The external Siemens project was not modified.
   qualifying timing observation is not evidence of compliance.
 - Native conversion, simulation and exported verification preserve failures
   instead of substituting empty results or successful exit codes.
+- Startup no longer accepts commands that the arriving layout silently
+  overwrites. Waveform range text also appears only for a loaded trace.
 
 ## Remaining limits and follow-up scope
 
 These items are **not certified complete** by this overhaul:
 
-- Existing project config plus per-invocation `-D` / include overrides still needs
-  a per-run build manifest so later elaboration cannot return to older options.
+- Build manifests are emitted by `veritrace run`; an external simulator's dump
+  without such metadata still needs correct RTL/build configuration from its
+  producer. Moving a complete project is tested; moving only a waveform does
+  not also transfer the referenced RTL and include files.
 - Memory checks without observed DQ cannot establish full CL/CWL/write-recovery
   semantics; automatic precharge is qualified rather than fully modeled.
   Command occupancy must not be mistaken for measured data-bus utilization.
@@ -70,7 +80,7 @@ These items are **not certified complete** by this overhaul:
 From the repository root, unless stated otherwise:
 
 - `uv run --no-sync pytest -q -W error --junitxml=.veritrace/audit-python.xml`
-  — 946 passed, no skips.
+  — 962 passed, no skips (including the build-manifest follow-up).
 - `cargo test --workspace` — 88 passed; Windows has no native FST test cases.
 - `cargo fmt --all -- --check` and
   `cargo clippy --workspace --all-targets -- -D warnings` — passed.
@@ -83,7 +93,7 @@ From the repository root, unless stated otherwise:
 - Backend: `uv run --no-sync veritrace serve designs/fifo_buggy/dump.vtx --rtl designs/fifo_buggy --port 8765 --no-browser`.
   In `web/`, set `VERITRACE_TEST_ORIGIN=http://127.0.0.1:8765`, then run
   `npx playwright test --grep-invert "sustains 60fps" --max-failures=3`
-  — 142 functional browser tests passed. The 60-fps threshold is excluded at
+  — 143 functional browser tests passed. The 60-fps threshold is excluded at
   the user's request; functional performance-analysis tests remain enabled.
 - `uv build --wheel --out-dir dist` — passed.
 - `uv run --isolated --no-project --with K:/VeriTrace/dist/veritrace-0.1.0-cp312-cp312-win_amd64.whl --with httpx2 python tests/wheel_smoke.py`

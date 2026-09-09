@@ -15,8 +15,39 @@
 
 import { expect, test } from "@playwright/test";
 import { waitForReady } from "./session";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 const BACKEND = process.env.VERITRACE_BACKEND ?? "http://127.0.0.1:8765";
+
+test("a newly opened simulation retains transient build defines in causal analysis", async ({ page, request }) => {
+  const project = mkdtempSync(join(tmpdir(), "veritrace build flags "));
+  writeFileSync(join(project, ".veritrace.toml"), '[design]\ntop="tb"\nrtl=["tb.sv"]\n[design.defines]\nWIDTH=4\n');
+  writeFileSync(join(project, "tb.sv"), `\`timescale 1ns/1ps
+module tb;
+  reg clk=0;
+  always #5 clk=~clk;
+  reg [\`WIDTH-1:0] data=0;
+  initial begin #7 data=42; #20 $finish; end
+endmodule
+`);
+  const output = execFileSync("uv", ["run", "--no-sync", "veritrace", "run", project, "-D", "WIDTH=8", "--json"],
+    { cwd: resolve(".."), encoding: "utf8", timeout: 60_000 });
+  const opened = await request.post(`${BACKEND}/session`, { data: { trace_path: JSON.parse(output).dump } });
+  expect(opened.ok(), await opened.text()).toBeTruthy();
+  const sid = (await opened.json()).session_id;
+  await waitForReady(request, BACKEND, sid);
+  const why = await request.post(`${BACKEND}/session/${sid}/query`, { data: { vtq: "why(tb.data @ 8000)" } });
+  expect(why.ok(), await why.text()).toBeTruthy();
+  expect((await why.json()).root).toMatchObject({ signal: "tb.data", value: "00101010", width: 8 });
+  await page.goto(`/?session=${sid}`);
+  await expect(page.getByTestId("status-range")).not.toBeEmpty();
+  await page.getByTestId("query-bar").fill("why(tb.data @ 8000)");
+  await page.getByTestId("query-bar").press("Enter");
+  await expect(page.getByTestId("causal-card").first().locator(".card-val")).toHaveText("= 00101010");
+});
 
 test("opening progress waits before fetching the real waveform", async ({ page, request }) => {
   const root = await (await request.get(`${BACKEND}/`)).json();
@@ -24,6 +55,9 @@ test("opening progress waits before fetching the real waveform", async ({ page, 
   await waitForReady(request, BACKEND, sid);
   let release = false;
   let prematureReads = 0;
+  let layoutRequested = false;
+  let releaseLayout!: () => void;
+  const layoutGate = new Promise<void>((resolve) => { releaseLayout = resolve; });
   page.on("request", (req) => {
     if (!release && /\/session\/[^/]+\/(signals|layout)/.test(req.url())) prematureReads++;
   });
@@ -33,11 +67,27 @@ test("opening progress waits before fetching the real waveform", async ({ page, 
     if (release) await route.continue();
     else await route.fulfill({ json: { phase: "indexing", progress: 0.42 } });
   });
+  await page.route(`**/session/${sid}/layout`, async (route) => {
+    layoutRequested = true;
+    await layoutGate;
+    await route.continue();
+  });
   await page.goto(`/?session=${sid}`);
   await expect(page.locator(".loading")).toContainText("indexing: 42%");
   expect(prematureReads).toBe(0);
+  // Bootstrap restores the query, tab, and layout. Do not offer commands that
+  // it would silently discard, including shortcuts with no input focused.
+  await expect(page.getByTestId("query-bar")).toHaveCount(0);
+  await page.keyboard.press("5");
+  await expect(page.getByTestId("tab-5")).toHaveCount(0);
   release = true;
+  await expect.poll(() => layoutRequested).toBe(true);
+  await expect(page.locator(".loading")).toBeVisible();
+  await expect(page.getByTestId("query-bar")).toHaveCount(0);
+  releaseLayout();
   await expect(page.locator(".loading")).toHaveCount(0);
+  await expect(page.getByTestId("query-bar")).toBeEditable();
+  await expect(page.getByTestId("tab-5")).not.toHaveAttribute("aria-selected", "true");
   await expect(page.locator('[data-testid="signal-row"]').first()).toBeVisible();
   await expect(page.locator('[data-testid="status-range"]')).not.toBeEmpty();
 });

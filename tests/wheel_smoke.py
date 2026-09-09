@@ -43,20 +43,30 @@ def main_check() -> None:
         with TemporaryDirectory(prefix="veritrace wheel ") as temporary, chdir(temporary):
             work = Path(temporary)
             os.chdir(work)
+            (work / "headers").mkdir()
+            (work / "headers/width.vh").write_text("`define WIDTH 8\n", encoding="utf-8")
+            config = work / ".veritrace.toml"
+            config.write_text('[design]\ntop="tb"\nrtl=["tb.sv"]\n[design.defines]\nINITIAL=1\n', encoding="utf-8")
+            configured = config.read_bytes()
             source = work / "tb.sv"
             source.write_text("""`timescale 1ns/1ps
+`ifdef WIDE
+  `include "width.vh"
+`else
+  `define WIDTH 4
+`endif
 module tb;
   reg clk=0;
   always #5 clk=~clk;
-  reg [7:0] data=0;
-  initial begin #7 data=42; #20 $finish; end
+  reg [`WIDTH-1:0] data=0;
+  initial begin #7 data=`INITIAL; #20 $finish; end
 endmodule
 """, encoding="utf-8")
             runner = CliRunner()
-            run = runner.invoke(main, ["run", str(source), "--top", "tb", "--json"])
+            run = runner.invoke(main, ["run", "--incdir", "headers", "-D", "WIDE", "-D", "INITIAL=42", "--json"])
             assert run.exit_code == 0, run.output
             result = json.loads(run.stdout)
-            assert (work / ".veritrace.toml").is_file(), run.output
+            assert config.read_bytes() == configured, "run rewrote the user's configuration"
             dump = Path(result["dump"])
             assert dump.is_file()
             with TestClient(create_app(default_trace=dump)) as client:
@@ -74,7 +84,7 @@ endmodule
                 assert response.status_code == 200, response.text
                 answer = response.json()
                 assert answer["root"]["signal"] == "tb.data", answer
-                assert answer["root"]["value"] in ("42", "0x2a", "00101010"), answer
+                assert answer["root"]["value"] == "00101010" and answer["root"]["width"] == 8, answer
             # A syntax error must not reuse the success artifact or return 0.
             source.write_text("module tb; not valid HDL ! endmodule", encoding="utf-8")
             failed = runner.invoke(main, ["run", str(source), "--top", "tb", "--json"])

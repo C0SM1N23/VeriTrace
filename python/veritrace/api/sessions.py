@@ -314,6 +314,15 @@ class Session:
         store = TraceStore(str(path))
         rtl_root = Path(rtl_paths[0]) if rtl_paths else None
         rtl_config = cfg.load(rtl_root if rtl_root.is_dir() else rtl_root.parent) if rtl_root else None
+        from veritrace import build
+        from veritrace.graph.elaborate import discover
+
+        config = rtl_config or cfg.load() or cfg.load_or_empty(path.parent)
+        requested = ([p for root in rtl_paths for p in discover(Path(root))]
+                     if rtl_paths is not None else None)
+        restored = build.config_for(path, store, config, requested)
+        if restored is not config:
+            rtl_paths = [str(p) for p in restored.rtl_files()]
         session = cls(
             session_id=session_id_for(identity_path),
             trace_path=path,
@@ -325,7 +334,7 @@ class Session:
             # the trace's directory is only the fallback for a dump kept outside
             # it. `cli._load` resolves it the same way, so the CLI and the
             # interface never disagree about which config is in force.
-            config=rtl_config or cfg.load() or cfg.load_or_empty(path.parent),
+            config=restored,
         )
         # Capture identity travels beside the generated VCD/store. Without this
         # durable marker, `import-capture` followed by `serve` quietly turns an
@@ -827,6 +836,23 @@ class SessionRegistry:
 
         return session_id_for(identity(trace_path))
 
+    @staticmethod
+    def _reopen_inputs(existing: Session, store_path: Path, store: TraceStore,
+                       rtl_paths: list[str] | None, top: str | None) -> tuple[list[str] | None, str | None]:
+        from veritrace.build import MANIFEST
+
+        chosen_rtl = existing.rtl_paths if rtl_paths is None else rtl_paths
+        chosen_top = existing.top if top is None else top
+        # Inherit a viewer's choices for the same trace. A new recorded build
+        # has its own sources/top, not yesterday's; explicit requests and an
+        # existing waveform-only selection still take precedence.
+        if store.source_sha256 != existing.store.source_sha256 and (store_path / MANIFEST).is_file():
+            if rtl_paths is None and existing.rtl_paths:
+                chosen_rtl = None
+            if top is None:
+                chosen_top = None
+        return chosen_rtl, chosen_top
+
     def start(
         self,
         trace_path: str | Path,
@@ -857,8 +883,15 @@ class SessionRegistry:
                 # Every POST means reopen the requested inputs.  Returning an
                 # already-open object here bypassed rerun/top/RTL changes even
                 # though the synchronous registry path supported them.
-                chosen_rtl = existing.rtl_paths if existing is not None and rtl_paths is None else rtl_paths
-                chosen_top = existing.top if existing is not None and top is None else top
+                chosen_rtl, chosen_top = rtl_paths, top
+                if existing is not None:
+                    from veritrace import store as store_mod
+
+                    update("converting", 0.05)
+                    current = store_mod.ensure(path)
+                    chosen_rtl, chosen_top = self._reopen_inputs(
+                        existing, current, TraceStore(str(current)), rtl_paths, top,
+                    )
                 session = Session.open(path, chosen_rtl, chosen_top, progress=update)
             except Exception as exc:  # noqa: BLE001 - surfaced through /status
                 with self._lock:
@@ -911,8 +944,7 @@ class SessionRegistry:
                 )
 
             if fingerprint(probe) != fingerprint(existing.store):
-                chosen_rtl = existing.rtl_paths if rtl_paths is None else rtl_paths
-                chosen_top = existing.top if top is None else top
+                chosen_rtl, chosen_top = self._reopen_inputs(existing, store_path, probe, rtl_paths, top)
                 replacement = Session.open(requested_path, chosen_rtl, chosen_top)
                 self._sessions[sid] = replacement
                 return replacement

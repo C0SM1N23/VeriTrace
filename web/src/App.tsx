@@ -79,6 +79,14 @@ export default function App() {
     );
   }
 
+  // Loading restores the saved query, tab, and layout as one state update.
+  // Mounting controls before that point accepts user actions only to overwrite
+  // them when the response arrives. Keep progress visible until both the trace
+  // and its layout are ready, then mount the actual workspace once.
+  if (!ready) {
+    return <div className="loading" role="status">Opening trace… {loadingNote}</div>;
+  }
+
   return (
     <div className={replay ? "app replaying" : "app"}>
       <TopBar />
@@ -169,7 +177,6 @@ export default function App() {
       <CommandPalette />
       <HelpOverlay />
       <WaveMenu />
-      {!ready && <div className="loading" role="status">Opening trace… {loadingNote}</div>}
     </div>
   );
 }
@@ -183,6 +190,7 @@ function useKeyboard() {
         target &&
         (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
       const s = useWave.getState();
+      if (!s.ready || s.error) return;
       const mod = e.metaKey || e.ctrlKey;
 
       if (mod && e.key.toLowerCase() === "p") {

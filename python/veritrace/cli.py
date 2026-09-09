@@ -388,7 +388,7 @@ def _load(
     top: str | None = None,
     need_rtl: bool = False,
 ) -> Context:
-    from veritrace import TraceStore, clocks
+    from veritrace import TraceStore, build, clocks
     from veritrace import config as cfg
     from veritrace.correlate.resolver import correlate
     from veritrace.graph.elaborate import elaborate
@@ -396,6 +396,16 @@ def _load(
     trace = _default_trace(trace, flag="a trace path")
     rtl_config = cfg.load(rtl[0] if rtl[0].is_dir() else rtl[0].parent) if rtl else None
     config = rtl_config or cfg.load() or cfg.load_or_empty(trace.parent)
+    store = TraceStore(str(trace))
+    if rtl:
+        from veritrace.graph.elaborate import discover
+        requested = [p for root in rtl for p in discover(root)]
+    else:
+        requested = None
+    original_config = config
+    config = build.config_for(trace, store, config, requested)
+    if config is not original_config:
+        rtl = tuple(config.rtl_files())
     files, incdirs, defines, top = _resolve_rtl(rtl, top, config)
     if need_rtl and not files:
         # §7.4 makes "no RTL" a supported mode, but not for these commands.
@@ -408,7 +418,7 @@ def _load(
     # a command with no argument finds the one recorded there rather than
     # asking for it again.
     ctx = Context(
-        store=TraceStore(str(trace)),
+        store=store,
         # The project you are standing in decides its own settings; the trace's
         # directory is only the fallback for a dump kept outside it. The other
         # way round lets a trace's *location* pick the packs, the ignore list and
@@ -1455,7 +1465,13 @@ def run(
     # JSON changes presentation only. The next process must inherit the same
     # source order, includes, defines and top used by this compiler invocation.
     _write_config_if_missing(base, top, rtl, got, incdirs, defines, quiet=as_json)
-    ctx = _load(got.dump, tuple(rtl) or tuple(roots), top)
+    from veritrace import build
+    native_trace = _default_trace(got.dump, flag="a trace path")
+    try:
+        build.record(native_trace, rtl, list(incdirs), list(defines), got.top, run_dir)
+    except OSError as exc:
+        raise click.ClickException(f"could not record the simulation build: {exc}") from exc
+    ctx = _load(native_trace, tuple(rtl) or tuple(roots), top)
     say(f"waveform: {_rel(got.dump)} ({ctx.store.n_signals} signals)")
     if ctx.correlation is not None:
         say(

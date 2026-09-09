@@ -79,12 +79,17 @@ async function compare(page: Page): Promise<void> {
 
 /** The value of the option pointing at `designs/deadlock/dump.vtx`. */
 async function buggyTrace(page: Page): Promise<string> {
-  const values = await page
-    .locator('[data-testid="diff-other"] option')
-    .evaluateAll((els) => els.map((e) => (e as HTMLOptionElement).value));
-  const found = values.find((v) => v.replace(/\\/g, "/").endsWith("deadlock/dump.vtx"));
-  expect(found, `no deadlock/dump.vtx among ${values.join(", ")}`).toBeTruthy();
-  return found as string;
+  let found = "";
+  // The selector mounts before /sessions returns. Waiting for the selector
+  // alone tested network scheduling instead of whether the real run is offered.
+  await expect.poll(async () => {
+    const values = await page
+      .locator('[data-testid="diff-other"] option')
+      .evaluateAll((els) => els.map((e) => (e as HTMLOptionElement).value));
+    found = values.find((v) => v.replace(/\\/g, "/").endsWith("deadlock/dump.vtx")) ?? "";
+    return found;
+  }).not.toBe("");
+  return found;
 }
 
 test("the tab is built and reachable by key", async ({ page }) => {
@@ -178,6 +183,9 @@ test("manual anchors affect alignment, reject invalid marks, and survive reload"
   await expect(page.getByTestId("diff-first")).toContainText("at anchor");
   await expect.poll(async () => (await (await page.request.get(`${BACKEND}/session/${clean}/layout`)).json()).diffOptions.marksA).toBe("0, 100");
   await page.reload();
+  // As in ready(): wait for bootstrap to restore the saved session state.
+  await expect(page.getByTestId("status-range")).not.toBeEmpty();
+  await expect(page.locator(".loading")).toHaveCount(0);
   await page.getByTestId("tab-5").click();
   await expect(page.getByTestId("diff-strategy")).toHaveValue("manual");
   await expect(page.getByLabel("Anchors A", { exact: true })).toHaveValue("0, 100");
