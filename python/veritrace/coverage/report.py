@@ -48,6 +48,8 @@ def build(
     path = Path(coverage_path) if coverage_path else (
         code_mod.discover(project_root) if project_root else None
     )
+    if coverage_path and path is not None and not path.is_absolute() and project_root:
+        path = Path(project_root) / path
     if path is None:
         out.skipped["code"] = (
             "no coverage database found; run verilator --coverage or xcrg, "

@@ -30,6 +30,7 @@ import argparse
 import json
 import random
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -163,13 +164,27 @@ def _rss_mb() -> float | None:
     return psutil.Process().memory_info().rss / 1e6
 
 
-def measure_stuck(vtx: Path, budget: float | None) -> tuple[Row, Row | None]:
-    """§8.4 over every signal, from a store nothing has touched yet.
+def _in_a_fresh_process(*args: str) -> dict:
+    """Run this file again with `args`, and return the JSON it prints.
 
-    Reports RAM alongside, because the same pass answers §4.2's other unmeasured
-    row: a whole-trace scan touches every signal once, so if anything retains
-    what it decoded, this is where 1.5 GB would go.
+    §6.3: *"Fisierul se deschide cu mmap. Nu incarci nimic in RAM pana nu se
+    cere."* — so §4.2's RAM row is about a process that has a trace **open**,
+    and it can only be measured in one that has done nothing else. Measured in
+    the process that had just generated and converted the tier-B trace, the
+    number was the converter's heap: 2831 MB, reported OVER for a scan that in
+    fact retained 23 MB of a 277 MB store.
     """
+    got = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), *args],
+        capture_output=True, text=True, check=False,
+    )
+    if got.returncode != 0:
+        raise RuntimeError(f"`pybench {' '.join(args)}` failed:\n{got.stderr.strip()[-2000:]}")
+    return json.loads(got.stdout)
+
+
+def _scan(vtx: Path) -> dict:
+    """§8.4 over every signal, in a process that has only ever opened the store."""
     from veritrace import TraceStore, clocks
     from veritrace.analysis import stuck
     from veritrace.config import Config
@@ -182,14 +197,32 @@ def measure_stuck(vtx: Path, budget: float | None) -> tuple[Row, Row | None]:
     ms, found = _timed(
         lambda: list(stuck.scan(store, clock, None, Config.empty(), threshold_cycles=5))
     )
-    after = _rss_mb()
+    return {"ms": ms, "findings": len(found), "before_mb": before, "after_mb": _rss_mb()}
 
-    row = Row("stuck detector, every signal", ms, budget, f"{len(found)} findings")
+
+def _convert(src: Path, vtx: Path) -> dict:
+    """Convert `src`, and report what conversion cost in RAM."""
+    from veritrace import convert
+
+    convert(str(src), str(vtx))
+    return {"rss_mb": _rss_mb()}
+
+
+def measure_stuck(vtx: Path, budget: float | None) -> tuple[Row, Row | None]:
+    """§8.4 over every signal, from a store nothing has touched yet.
+
+    Reports RAM alongside, because the same pass answers §4.2's other unmeasured
+    row: a whole-trace scan touches every signal once, so if anything retains
+    what it decoded, this is where 1.5 GB would go.
+    """
+    got = _in_a_fresh_process("--scan", str(vtx))
+    row = Row("stuck detector, every signal", got["ms"], budget, f"{got['findings']} findings")
+    before, after = got["before_mb"], got["after_mb"]
     if before is None or after is None:
         return row, None
     disk = sum(f.stat().st_size for f in vtx.rglob("*") if f.is_file()) / 1e6
     return row, Row(
-        "RAM after one whole-trace scan",
+        "RAM with the trace open and scanned",
         after,
         1500.0,
         f"{after - before:.0f} MB retained over a {disk:.0f} MB store "
@@ -278,6 +311,10 @@ def measure_why(root: Path, budget: float | None) -> Row:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
+    # The two internal modes. Not for people to type: they are how a measurement
+    # gets a process of its own — see `_in_a_fresh_process`.
+    ap.add_argument("--scan", type=Path, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--convert", type=Path, nargs=2, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--tier", choices=["a", "b"], default="a")
     ap.add_argument("--json", action="store_true", help="Machine-readable output.")
     ap.add_argument("--keep", type=Path, default=None,
@@ -291,6 +328,13 @@ def main() -> int:
     )
     args = ap.parse_args()
 
+    if args.scan is not None:
+        print(json.dumps(_scan(args.scan)))
+        return 0
+    if args.convert is not None:
+        print(json.dumps(_convert(*args.convert)))
+        return 0
+
     budgets = BUDGETS_MS[args.tier]
     n_signals, n_steps = SHAPE[args.tier]
     n_steps = args.steps or n_steps
@@ -298,14 +342,16 @@ def main() -> int:
     work.mkdir(parents=True, exist_ok=True)
     src, vtx = work / "bench.vcd", work / "bench.vtx"
 
+    convert_mb: float | None = None
     try:
         if not vtx.is_dir():
             if not src.exists():
                 print(f"generating {n_signals} signals x {n_steps} steps...", file=sys.stderr)
                 _generate(src, n_signals, n_steps)
-            from veritrace import convert
-
-            convert(str(src), str(vtx))
+            # In its own process, for the same reason the scan is: whatever the
+            # converter's allocator keeps hold of afterwards must not be charged
+            # to the rows measured next.
+            convert_mb = _in_a_fresh_process("--convert", str(src), str(vtx))["rss_mb"]
 
         from veritrace import TraceStore
 
@@ -333,6 +379,17 @@ def main() -> int:
                 ram_row
                 if args.tier == "b"
                 else Row(ram_row.name, ram_row.ms, None, ram_row.note, ram_row.unit)
+            )
+        if convert_mb is not None:
+            # Reported, not gated. §4.2's RAM row is pinned to the opened
+            # session by §6.3 ("mmap, nu incarcare"), and the spec gives
+            # conversion a time target and no memory one — so this is a number
+            # to watch, not a threshold to invent. `vcd::parse_file` builds the
+            # whole `Trace` before writing it, which at tier B is where this
+            # goes; docs/AUDIT.md carries it as an open item.
+            report.rows.append(
+                Row("RAM while converting", convert_mb, None,
+                    "whole-trace parse, then write (§6.3 gives no budget here)", unit="MB")
             )
         if budgets["extract"] is not None:
             report.rows.append(measure_extraction(budgets["extract"]))

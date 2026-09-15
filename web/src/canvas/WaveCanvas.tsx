@@ -10,7 +10,7 @@
  * cache and only crossing the margin triggers a new request.
  */
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import jetbrainsMonoUrl from "@fontsource/jetbrains-mono/files/jetbrains-mono-latin-400-normal.woff2?url";
 import { WaveSocket, type WaveRequest } from "../api/client";
 import type { ExactPoint, MinMaxPoint, RenderRow, WaveChunk } from "../lib/types";
@@ -89,6 +89,7 @@ export function WaveCanvas() {
 
   const session = useWave((s) => s.session);
   const ready = useWave((s) => s.ready);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
 
   // --- worker lifecycle ---------------------------------------------------
   //
@@ -215,6 +216,7 @@ export function WaveCanvas() {
   // --- socket -------------------------------------------------------------
   useEffect(() => {
     if (!session || !ready) return;
+    let active = true;
     const sock = new WaveSocket(session, (chunks, req) => {
       for (const c of chunks) chunksRef.current.set(c.h, c);
       // The Source tab reads values from here for its inlays.
@@ -227,10 +229,13 @@ export function WaveCanvas() {
       };
       workerRef.current?.postMessage({ type: "data", chunks });
       (window as unknown as { __vtDataReady?: boolean }).__vtDataReady = true;
-    });
+    }, (error) => { if (active) setConnectionError(error); });
     socketRef.current = sock;
-    void sock.connect().then(() => scheduleFetch());
+    void sock.connect().then(() => { if (active) scheduleFetch(); }).catch((error: unknown) => {
+      if (active) setConnectionError(`${error instanceof Error ? error.message : String(error)}. Reconnecting…`);
+    });
     return () => {
+      active = false;
       sock.close();
       socketRef.current = null;
     };
@@ -346,6 +351,10 @@ export function WaveCanvas() {
 
   return (
     <div className="wave-canvas" ref={hostRef} data-testid="wave-canvas">
+      {connectionError && <div role="status" data-testid="wave-connection-error"
+        style={{ position: "absolute", zIndex: 2, padding: "8px", background: "var(--bg-panel)" }}>
+        {connectionError}
+      </div>}
       <canvas ref={canvasRef} />
     </div>
   );

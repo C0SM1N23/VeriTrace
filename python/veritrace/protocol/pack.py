@@ -61,9 +61,8 @@ class Detect:
     def specificity(self) -> int:
         """How exacting this pack is, for choosing between two that both match.
 
-        AXI4 requires twelve signals, AXI4-Lite ten, generic handshake two — so
-        the count is a faithful ordering and needs no hand-assigned priority
-        that packs would then have to keep consistent with each other.
+        The detector ranks the actual resolved payload as well: optional burst
+        and ID pins may distinguish two packs with the same handshake pins.
         """
         return len(self.required_suffixes)
 

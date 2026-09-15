@@ -83,7 +83,10 @@ def read_verilator(path: Path | str) -> CodeCoverage:
                     line=int(lineno),
                     count=int(m["count"]),
                     kind=_PAGE_KIND.get(page, "line"),
-                    label=fields.get("n", ""),
+                    # Verilator's `n` is the source column; `o` names the
+                    # covered object (property/toggle/branch). Older/simple
+                    # producers put a label in `n`, so retain that fallback.
+                    label=fields.get("o", fields.get("n", "")),
                 )
             )
             continue

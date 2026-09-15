@@ -806,11 +806,31 @@ export interface MemoryInterface {
 }
 
 export interface MemoryReport {
+  arrays: RTLMemory[];
+  rtl_error: string;
   interfaces: MemoryInterface[];
   errors: string[];
   chips: { name: string; slug: string; [key: string]: string | number }[];
   timing_errors: string[];
   selection: Record<string, { chip?: string; toml?: string }>;
+}
+
+export interface RTLMemory {
+  path: string;
+  width: number;
+  depth: number;
+  left: number | null;
+  right: number | null;
+  captured: number;
+  source: string;
+  supported: boolean;
+}
+
+export interface MemoryWords {
+  path: string;
+  time: number;
+  offset: number;
+  words: { index: number; path: string; captured: boolean; bits: string | null }[];
 }
 
 export interface CmdsResult {

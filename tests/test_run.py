@@ -71,6 +71,17 @@ def test_the_top_module_is_the_one_nobody_instantiates(dropped):
     assert guess_top_module(find_rtl_files(dropped)) == "tb_fifo_buggy"
 
 
+def test_onboarding_does_not_mistake_burst_completion_or_comments_for_reset(tmp_path):
+    from veritrace.cli import guess_reset
+
+    rtl = tmp_path / "bus.v"
+    rtl.write_text("// if (!old_reset)\nif (burst_done) done = 1;\n"
+                   "/* if (reset_removed) */\nif (!rst_n_i) state = 0;\n")
+    assert guess_reset([rtl]) == ("rst_n_i", "low")
+    rtl.write_text("if (burst_done) done = 1;\n")
+    assert guess_reset([rtl]) is None
+
+
 def test_multiple_roots_are_not_silently_sorted_into_the_wrong_top(tmp_path):
     """Two valid roots are ambiguity, even though either one compiles cleanly."""
     (tmp_path / "a.sv").write_text("module a; initial $finish; endmodule\n", encoding="utf-8")
@@ -516,6 +527,25 @@ def test_a_zero_status_system_error_is_still_a_failed_simulation(tmp_path):
     assert got.exit_code != 0
     assert "reported a testbench failure" in got.output
     assert "injected failure" in got.output
+
+
+@needs_icarus
+@pytest.mark.parametrize("message,failed", [
+    ("ERR: missing stimulus file", True),
+    ("[TIME 346000] EROARE: wrong arbitration winner", True),
+    ("[FAIL] register readback", True),
+    (">>> [T03] FAILED (IRQ remained HIGH)", True),
+    (">>> TEST FAILED! Data differs", True),
+    ("Rezultate: 38 PASS, 0 FAIL din 38 verificari", False),
+    ("PASS: the expected ERROR response was observed", False),
+])
+def test_explicit_display_failures_cannot_be_overruled_by_zero_exit(tmp_path, message, failed):
+    source = tmp_path / "tb.sv"
+    source.write_text(f'module tb; initial begin #1; $display("{message}"); $finish; end endmodule\n')
+    got = CliRunner().invoke(main, ["run", str(tmp_path), "--json"])
+    assert got.exit_code == int(failed), got.output
+    import json
+    assert json.loads(got.stdout)["simulation_failed"] is failed
 
 
 @needs_icarus

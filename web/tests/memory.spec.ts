@@ -21,6 +21,35 @@ import { waitForReady } from "./session";
 
 const BACKEND = process.env.VERITRACE_BACKEND ?? "http://127.0.0.1:8765";
 
+test("real SRAM captures reach Memory, shared time, pagination and Wave", async ({ page, request }) => {
+  const project = mkdtempSync(join(tmpdir(), "veritrace SRAM "));
+  const source = join(project, "tb.sv");
+  cpSync(resolve("../designs/sram_dualport/tb.sv"), source);
+  const stdout = execFileSync("uv", ["run", "--no-sync", "veritrace", "run", source,
+    "--top", "tb", "--dump-memory", "tb.dut.mem", "--json"], { cwd: resolve(".."), encoding: "utf8", timeout: 60_000 });
+  const dump = JSON.parse(stdout).dump as string;
+  const response = await request.post(`${BACKEND}/session`, { data: { trace_path: dump } });
+  expect(response.ok(), await response.text()).toBeTruthy();
+  const sid = (await response.json()).session_id;
+  await waitForReady(request, BACKEND, sid);
+  await open(page, sid);
+  await expect(page.getByTestId("rtl-memory-summary")).toContainText("256 words × 32 bits [0:255] · 256 words captured");
+  await expect(page.getByTestId("memory-word-3")).toContainText("x");
+  await page.getByLabel("Memory time", { exact: true }).fill("6000");
+  await expect(page.getByTestId("memory-word-3")).toContainText("11223344");
+  await page.getByLabel("Memory time", { exact: true }).fill("16000");
+  await expect(page.getByTestId("memory-word-3")).toContainText("11BB33DD", { ignoreCase: true });
+  await expect(page.getByTestId("memory-word-4")).toContainText("x");
+  for (let i = 0; i < 3; i++) await page.getByRole("button", { name: "Next words", exact: true }).click();
+  await expect(page.getByTestId("memory-word-255")).toContainText("DEADBEEF", { ignoreCase: true });
+  await expect(page.getByRole("button", { name: "Next words", exact: true })).toBeDisabled();
+  await page.getByTestId("memory-word-255").getByRole("button", { name: "Show word in Wave" }).click();
+  await expect(page.getByTestId("tab-1")).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator('[data-path="tb.dut.mem[255]"]')).toBeVisible();
+  await page.getByTestId("tab-10").click();
+  await expect(page.getByLabel("Memory time", { exact: true })).toHaveValue("16000");
+});
+
 let violating = "";
 let clean = "";
 

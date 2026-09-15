@@ -396,3 +396,29 @@ def test_the_exported_table_carries_the_response_a_reader_would_want(tmp_path):
     cols = persist.read(persist.table_path(out, "cpu"))
     assert "bresp" in cols
     assert any(v == 2 for v in cols["bresp"] if v is not None), "the SLVERR is not in the table"
+
+
+def test_relative_coverage_path_is_relative_to_project_not_process(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    other = tmp_path / "unrelated"
+    other.mkdir()
+    (project / "coverage.csv").write_text("v_branch,design.sv,42,7\n")
+    (other / "coverage.csv").write_text("v_branch,wrong.sv,99,0\n")
+    monkeypatch.chdir(other)
+    report = cov_report.build(coverage_path="coverage.csv", project_root=project)
+    assert report.code_error is None
+    assert report.code is not None
+    assert report.code.files[0].points[0].line == 42
+    assert report.code.files[0].points[0].count == 7
+
+
+def test_real_verilator_object_label_is_not_replaced_by_source_column(tmp_path):
+    path = tmp_path / "coverage.dat"
+    path.write_text("# SystemC::Coverage-3\nC '\x01f\x02../sva/check.sv\x01l\x02111"
+                    "\x01n\x0222\x01t\x02user\x01page\x02v_user/check"
+                    "\x01o\x02cov_ar_backpressure\x01h\x02TOP.tb.check' 7\n")
+    point = code.read(path).files[0].points[0]
+    assert point.kind == "user"
+    assert point.label == "cov_ar_backpressure"
+    assert point.count == 7 and point.line == 111

@@ -53,6 +53,7 @@ from veritrace.analysis.whytrace import CausalNode, NodeKind, TraceView, effecti
 from veritrace.graph.conditions import BV, evaluate
 from veritrace.graph.model import Kind, SignalId, refs
 from veritrace.repro.subtrace import Subtrace
+from veritrace.tools import run_capture
 
 #: An interface wider than this is not a control module, whatever it is called,
 #: and §8.3's minimisation stops being readable. The table there says 5–15
@@ -800,12 +801,10 @@ def _run_icarus(
     for d in defines or []:
         cmd += [f"-D{d}"]
     cmd += [str(tb), *(str(s) for s in sources)]
-    built = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+    built = run_capture(cmd, timeout=timeout)
     if built.returncode != 0:
         return (built.stdout or "") + (built.stderr or ""), "iverilog"
-    ran = subprocess.run(
-        [vvp, str(exe)], cwd=str(work), capture_output=True, text=True, timeout=timeout, check=False
-    )
+    ran = run_capture([vvp, str(exe)], cwd=work, timeout=timeout)
     return (ran.stdout or "") + (ran.stderr or ""), "iverilog"
 
 
@@ -836,17 +835,13 @@ def _run_verilator(
     for d in defines or []:
         cmd.append(f"+define+{d}")
     cmd += [str(tb), *(str(s) for s in sources)]
-    built = subprocess.run(
-        cmd, cwd=str(work), capture_output=True, text=True, timeout=timeout, check=False
-    )
+    built = run_capture(cmd, cwd=work, timeout=timeout)
     text = (built.stdout or "") + (built.stderr or "")
     exe = work / "obj_dir" / f"V{tb.stem}"
     exe = exe if exe.is_file() else exe.with_suffix(".exe")
     if built.returncode != 0 or not exe.is_file():
         return text, "verilator"
-    ran = subprocess.run(
-        [str(exe)], cwd=str(work), capture_output=True, text=True, timeout=timeout, check=False
-    )
+    ran = run_capture([str(exe)], cwd=work, timeout=timeout)
     return text + (ran.stdout or "") + (ran.stderr or ""), "verilator"
 
 

@@ -184,6 +184,16 @@ def _depth(sym) -> int:
     return int(getattr(rng, "width", 0) or 0) if rng is not None else 0
 
 
+def _array_bounds(sym) -> tuple[int | None, int | None]:
+    t = getattr(sym, "type", None)
+    if t is None or not getattr(t, "isUnpackedArray", False):
+        return None, None
+    if getattr(getattr(t, "elementType", None), "isUnpackedArray", False):
+        return None, None
+    rng = getattr(t, "range", None)
+    return (int(rng.left), int(rng.right)) if rng is not None else (None, None)
+
+
 class _SourceNames:
     """Keep short, stable names only when they identify exactly one source."""
 
@@ -268,6 +278,8 @@ class _Elaborator:
                 decl_loc=self.loc(sym),
                 has_initializer=getattr(sym, "initializer", None) is not None,
                 depth=_depth(sym),
+                array_left=_array_bounds(sym)[0],
+                array_right=_array_bounds(sym)[1],
             )
         )
 

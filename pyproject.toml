@@ -86,4 +86,7 @@ include = [
 # §14.2 makes property-based testing part of the plan, not an extra: the
 # expression layer is 4-state and the cases nobody thinks of are exactly the
 # ones that produce a confidently wrong causal chain.
-dev = ["pytest>=8.0", "httpx2>=2.12", "hypothesis>=6.0"]
+# `psutil` is what makes §4.2's RAM row measurable on every platform rather
+# than only where `/proc` exists — the development machine is Windows, and a
+# budget that can only be checked in CI is a budget checked once a week.
+dev = ["pytest>=8.0", "httpx2>=2.12", "hypothesis>=6.0", "psutil>=5.9"]

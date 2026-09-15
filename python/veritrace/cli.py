@@ -87,9 +87,11 @@ def guess_clock(files: list[Path]) -> str | None:
 def guess_reset(files: list[Path]) -> tuple[str, str] | None:
     """Reset = the signal in the first reset-looking `if` condition found."""
     for f in files:
-        text = f.read_text(errors="ignore")
+        text = re.sub(r"/\*.*?\*/|//[^\n]*", "", f.read_text(errors="ignore"), flags=re.S)
         for negation, name in IF_COND_RE.findall(text):
-            if "rst" in name.lower() or "reset" in name.lower():
+            # `burst_done` contains `rst`, but is a completion flag, not reset.
+            # Match a conventional reset token, including rst_n_i/aresetn.
+            if re.search(r"(?:^|_)(?:a?rstn?|a?resetn?)(?:_|$)", name, re.I):
                 active = "low" if negation else "high"
                 return name, active
     return None
@@ -1310,6 +1312,8 @@ def _gate(report, fail_on: str) -> None:
     help="Where the build and the waveform land. Default: .veritrace/ beside the sources.",
 )
 @click.option("--timeout", default=120.0, help="Seconds before the simulation is given up on.")
+@click.option("--dump-memory", "dump_memories", multiple=True,
+              help="Capture RTL array words by hierarchical path or glob (repeatable; '*' for all). Does not edit RTL.")
 @click.option("-D", "--define", "defines", multiple=True, help="Passed to the compiler as -D.")
 @click.option("-I", "--incdir", "incdirs", multiple=True, help="Passed to the compiler as -I.")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
@@ -1321,7 +1325,8 @@ def _gate(report, fail_on: str) -> None:
 @click.option("--serve", "then_serve", is_flag=True, help="Open the interface when it is done.")
 @click.pass_context
 def run(
-    click_ctx, sources, top, sim, work, timeout, defines, incdirs, as_json, fail_on, then_serve
+    click_ctx, sources, top, sim, work, timeout, defines, incdirs, as_json, fail_on, then_serve,
+    dump_memories=(),
 ):
     """Simulate a folder of SystemVerilog and report what is wrong (§13.4b).
 
@@ -1432,6 +1437,23 @@ def run(
     say = (lambda *_a, **_k: None) if as_json else click.echo
 
     say(f"{len(files)} source file(s), top module {top!r}")
+    memory_elements = None
+    if dump_memories:
+        from veritrace.memory.arrays import capture_elements
+        from veritrace.graph.elaborate import elaborate
+
+        el = elaborate(rtl, simulate.include_path(run_dir, rtl, list(incdirs)), list(defines), top)
+        # Icarus accepts modules inheriting its default timescale. Slang flags
+        # mixing them with explicit timescales, but that does not invalidate
+        # elaborated array paths or constant bounds. The real compiler remains
+        # authoritative on the simulation; other elaboration errors are fatal.
+        capture_errors = [d for d in el.errors if d.code != "MissingTimeScale"]
+        if capture_errors:
+            raise click.ClickException("Cannot resolve memory capture from RTL: " + str(capture_errors[0]))
+        try:
+            memory_elements = capture_elements(el.graph, dump_memories)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
     try:
         got = simulate.icarus(
             files, top, work, list(defines), list(incdirs), timeout, run_dir,
@@ -1439,6 +1461,7 @@ def run(
             # whole run. Analyse it and print the findings, but preserve the
             # failure as the command's final exit status below.
             allow_testbench_failure=True,
+            **({"memory_elements": memory_elements} if memory_elements is not None else {}),
         )
     except simulate.SimulationError as e:
         raise click.ClickException(str(e)) from e

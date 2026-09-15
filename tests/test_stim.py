@@ -10,7 +10,6 @@ uses the scorer's own predicate to reach them.
 from __future__ import annotations
 
 import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -24,6 +23,7 @@ from veritrace.stim import generate, holes_from, render
 from veritrace.stim.emit import TARGETS
 from veritrace.stim.generate import drivable
 from veritrace.simulate import find_iverilog
+from veritrace.tools import run_capture
 
 DESIGNS = Path(__file__).resolve().parents[1] / "designs"
 AXI = DESIGNS / "axi_lite"
@@ -155,14 +155,13 @@ def test_the_generated_stimulus_closes_the_holes(slave, holes, tmp_path):
     (tmp_path / "vt_stim_tb.sv").write_text(render(plan, pack, iface, dut, "sv"), encoding="utf-8")
 
     iverilog, vvp = find_iverilog()
-    build = subprocess.run(
+    build = run_capture(
         [iverilog, "-g2012", "-s", "vt_stim_tb", "-o", "stim.vvp",
          "axil_slave.sv", "vt_stim_tb.sv"],
-        cwd=tmp_path, capture_output=True, text=True, timeout=180,
+        cwd=tmp_path, timeout=180,
     )
     assert build.returncode == 0, build.stderr
-    run = subprocess.run([vvp, "stim.vvp"], cwd=tmp_path, capture_output=True,
-                         text=True, timeout=180)
+    run = run_capture([vvp, "stim.vvp"], cwd=tmp_path, timeout=180)
     assert run.returncode == 0, run.stdout + run.stderr
     assert "transaction(s) driven" in run.stdout, run.stdout
 

@@ -16,7 +16,7 @@
 import { expect, test } from "@playwright/test";
 import { waitForReady } from "./session";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -127,4 +127,42 @@ test("the application mounts with no console errors", async ({ page, request }) 
     (e) => !e.includes("Download the React DevTools") && !e.includes("favicon"),
   );
   expect(noisy, noisy.join("\n")).toEqual([]);
+});
+
+test("a dropped waveform response reconnects and loads real backend data", async ({ page, request }) => {
+  const project = mkdtempSync(join(tmpdir(), "veritrace reconnect "));
+  const trace = join(project, "dump.vcd");
+  copyFileSync(resolve("../designs/fifo_buggy/dump.vcd"), trace);
+  const opened = await request.post(`${BACKEND}/session`, { data: { trace_path: trace } });
+  expect(opened.ok(), await opened.text()).toBeTruthy();
+  const sid = (await opened.json()).session_id;
+  await waitForReady(request, BACKEND, sid);
+  let interrupted = false;
+  let delivered = false;
+  let resumed = false;
+  await page.routeWebSocket(`**/session/${sid}/ws`, (socket) => {
+    if (interrupted && !resumed) {
+      socket.close({ code: 1011, reason: "outage still active" });
+      return;
+    }
+    const server = socket.connectToServer();
+    server.onMessage((message) => {
+      // Interrupt a real response, not a fixture pretending to be a waveform.
+      if (!interrupted) {
+        interrupted = true;
+        socket.close({ code: 1011, reason: "integration test disconnect" });
+      } else {
+        delivered = true;
+        socket.send(message);
+      }
+    });
+  });
+  await page.goto(`/?session=${sid}`);
+  await page.getByTestId("tab-1").click();
+  await expect(page.getByTestId("wave-connection-error")).toContainText("Reconnecting");
+  resumed = true;
+  await expect.poll(() => delivered).toBe(true);
+  await expect(page.getByTestId("wave-connection-error")).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __vtDataReady?: boolean }).__vtDataReady)).toBe(true);
 });

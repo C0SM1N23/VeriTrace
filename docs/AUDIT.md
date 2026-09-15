@@ -79,6 +79,14 @@ These items are **not certified complete** by this overhaul:
 - Native FST is unavailable in the Windows wheel and is reported as such;
   Linux/macOS use the platform-gated reader. This checkpoint's commands were
   run on Windows, not every supported simulator/platform combination.
+- §4.2's 1.5 GB RAM row is gated on what §6.3 pins it to: a process with the
+  trace **open**, which at tier B retains about 23 MB over a 277 MB store.
+  Conversion is a different shape — `vcd::parse_file` builds the whole `Trace`
+  before `write_vtx` writes it, so a tier-B dump costs roughly 2.8 GB while it
+  is being converted. The specification gives conversion a time target and no
+  memory one, so `bench/pybench.py` reports that number on every run and does
+  not gate on an invented threshold. Streaming the converter is an open item,
+  not a closed one.
 - The exhaustive requirement-by-requirement matrix for the entire specification
   is unfinished. No overall completion percentage is claimed.
 

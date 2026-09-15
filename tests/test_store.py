@@ -285,16 +285,29 @@ def test_cli_convert(tmp_path):
     assert (tmp_path / "out.vtx" / "meta.json").exists()
 
 
-def test_native_conversion_reports_truthful_elapsed_progress(capsys, tmp_path):
+def test_native_conversion_reports_truthful_elapsed_progress(capsys, tmp_path, monkeypatch):
     """A long native parse must not leave the CLI looking frozen (§13.4)."""
-    import time
+    import threading
+    import click
 
     from veritrace.cli import _convert_with_progress
+
+    progress_seen = threading.Event()
+    original_echo = click.echo
+
+    def observe_echo(message, **kwargs):
+        original_echo(message, **kwargs)
+        if "elapsed" in str(message):
+            progress_seen.set()
+
+    monkeypatch.setattr(click, "echo", observe_echo)
 
     class SlowNative:
         @staticmethod
         def convert(_source, _output):
-            time.sleep(0.75)
+            # Wait for actual progress rather than racing 0.75s against a
+            # 0.2s + 0.5s polling loop on a scheduled macOS CI worker.
+            assert progress_seen.wait(5), "conversion did not report progress"
             return 17
 
     events = _convert_with_progress(SlowNative, tmp_path / "large.vcd", tmp_path / "large.vtx")

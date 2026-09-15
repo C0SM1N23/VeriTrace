@@ -18,14 +18,17 @@ sees them, and a shell string is exactly what gives it the chance.
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import shutil
+import signal
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 
-__all__ = ["ToolError", "Tool", "find", "require"]
+__all__ = ["ToolError", "Tool", "find", "require", "run_capture"]
 
 #: `K:\dir\file` or `K:/dir/file`. Bare relative paths are left alone — they are
 #: resolved by the tool against the working directory, which is translated too.
@@ -34,6 +37,94 @@ _WINPATH = re.compile(r"^[A-Za-z]:[\\/]")
 
 class ToolError(RuntimeError):
     """A tool is missing, or a tool run failed."""
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill `proc` *and its descendants*.
+
+    `Popen.kill()` signals the process it started and nothing below it. A
+    simulator is a tree — `iverilog` drives `ivlpp` and `ivl`, and a package
+    manager may install a launcher that runs the real binary as a child — so
+    killing the top of it leaves the work running.
+    """
+    if os.name == "nt":
+        # No process groups to kill on Windows; `taskkill /T` walks the
+        # parent-PID tree, which is the same set.
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+            capture_output=True, timeout=30, check=False,
+        )
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.kill()
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:  # pragma: no cover - the OS refused a kill
+        pass
+
+
+def run_capture(
+    argv: list[str],
+    cwd: Path | str | None = None,
+    timeout: float | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """`subprocess.run(..., capture_output=True, timeout=...)` that cannot outlive
+    its timeout.
+
+    Every external program this project runs is a simulator or a synthesiser, and
+    the stock call has three ways of hanging on one:
+
+    * **The timeout kills one process.** The rest of the tree keeps running, and
+      a testbench with no `$finish` keeps writing its waveform at tens of MB per
+      second. A three-second timeout in the test suite took a CI runner's disk
+      three hours later.
+    * **Draining the pipes waits for every writer.** After the kill,
+      `subprocess.run` calls `communicate()` again to collect what was printed;
+      that returns when the pipe has no writers left, and a surviving grandchild
+      is one. Temporary files have no such rule, so the output is collected from
+      files instead.
+    * **The child inherits stdin.** `vvp` opens an interactive prompt on `$stop`
+      and reads from it; inheriting a console that never sends EOF is a hang with
+      no timeout attached at all.
+
+    `TimeoutExpired` is raised with whatever the tool printed, so callers report
+    the same thing they always did.
+    """
+    # POSIX: a session of its own, so `killpg` reaches every descendant.
+    spawn = {} if os.name == "nt" else {"start_new_session": True}
+    # UTF-8 rather than the locale encoding, and replacing rather than
+    # raising: a simulator's output is diagnostic text, and a stray byte in it
+    # must not become the failure the caller reports.
+    opened = dict(mode="w+", encoding="utf-8", errors="replace")
+    with tempfile.TemporaryFile(**opened) as out, tempfile.TemporaryFile(**opened) as err:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(cwd) if cwd is not None else None,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=out,
+            stderr=err,
+            **spawn,
+        )
+
+        def collected() -> tuple[str, str]:
+            out.seek(0)
+            err.seek(0)
+            return out.read(), err.read()
+
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            said, complained = collected()
+            raise subprocess.TimeoutExpired(
+                argv, timeout or 0.0, output=said, stderr=complained
+            ) from None
+        said, complained = collected()
+        return subprocess.CompletedProcess(argv, proc.returncode, said, complained)
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,10 +162,7 @@ class Tool:
             argv = ["wsl.exe", "-d", self.distro, *(["--cd", _to_wsl(cwd)] if cwd else []), "--", *argv]
             cwd = None
         try:
-            out = subprocess.run(
-                argv, cwd=cwd, capture_output=True, text=True, timeout=timeout,
-                errors="replace",
-            )
+            out = run_capture(argv, cwd=cwd, timeout=timeout)
         except subprocess.TimeoutExpired as e:
             raise ToolError(f"{self.name} did not finish within {timeout:.0f}s") from e
         if check and out.returncode != 0:
@@ -91,15 +179,25 @@ def _to_wsl(p: Path | str) -> str:
     return "/mnt/" + w.drive[0].lower() + "/" + "/".join(w.parts[1:])
 
 
-def _distros() -> list[str]:
-    """Installed WSL distributions, or nothing at all off Windows."""
+@functools.cache
+def _distros() -> tuple[str, ...]:
+    """Installed WSL distributions, or nothing at all off Windows.
+
+    Cached, and never fatal: `find()` is called once per tool — twice at
+    import time by the test suite alone — and each call costs a process on a
+    machine that may have no WSL at all. The answer cannot change within one
+    run, and a launcher that exists without the feature behind it is a
+    machine with no distributions rather than an error.
+    """
     if os.name != "nt" or shutil.which("wsl.exe") is None:
-        return []
-    out = subprocess.run(
-        ["wsl.exe", "-l", "-q"], capture_output=True, text=True, timeout=30, errors="replace"
-    )
-    # `wsl -l -q` answers in UTF-16, which `text=True` decodes as NULs.
-    return [d for d in (l.strip().replace("\x00", "") for l in out.stdout.splitlines()) if d]
+        return ()
+    try:
+        out = run_capture(["wsl.exe", "-l", "-q"], timeout=30)
+    except (subprocess.TimeoutExpired, OSError):
+        return ()
+    # `wsl -l -q` answers in UTF-16, which decodes to text separated by NULs.
+    lines = (l.strip().replace("\x00", "") for l in out.stdout.splitlines())
+    return tuple(d for d in lines if d)
 
 
 def find(name: str) -> Tool | None:
@@ -107,10 +205,12 @@ def find(name: str) -> Tool | None:
     if shutil.which(name):
         return Tool(name)
     for distro in _distros():
-        out = subprocess.run(
-            ["wsl.exe", "-d", distro, "--", "command", "-v", name],
-            capture_output=True, text=True, timeout=60, errors="replace",
-        )
+        try:
+            out = run_capture(
+                ["wsl.exe", "-d", distro, "--", "command", "-v", name], timeout=60
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            continue
         if out.returncode == 0 and out.stdout.strip():
             return Tool(name, distro)
     return None

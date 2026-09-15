@@ -18,7 +18,6 @@ support.
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -30,6 +29,7 @@ from veritrace import simulate
 from veritrace.cli import main
 from veritrace.export import sva
 from veritrace.protocol import pack as pack_mod
+from veritrace.tools import run_capture
 
 ROOT = Path(__file__).resolve().parents[1]
 DESIGNS = ROOT / "designs"
@@ -38,6 +38,12 @@ PACKS = ROOT / "python" / "veritrace" / "protocol" / "packs"
 needs_icarus = pytest.mark.skipif(
     simulate.find_iverilog() is None, reason="Icarus Verilog is not installed"
 )
+
+#: Every one of these testbenches ends in `$finish` within a few thousand
+#: simulated cycles. A run that reaches this has stopped being a test of the
+#: generated checker, and letting it continue costs a CI runner rather than a
+#: test — so it fails here, with whatever the simulator had printed.
+SIM_TIMEOUT_S = 180.0
 
 
 # --- §8.15, the packs -------------------------------------------------------
@@ -209,14 +215,13 @@ def test_the_portable_checker_compiles_and_runs_in_icarus(tmp_path):
     assert got.exit_code == 0, got.output
 
     iverilog, vvp = simulate.find_iverilog()
-    built = subprocess.run(
+    built = run_capture(
         [iverilog, "-g2012", "-o", str(work / "sim.vvp"), *[str(p) for p in work.glob("*.sv")]],
-        capture_output=True,
-        text=True,
         cwd=work,
+        timeout=SIM_TIMEOUT_S,
     )
     assert built.returncode == 0, built.stderr
-    ran = subprocess.run([vvp, str(work / "sim.vvp")], capture_output=True, text=True, cwd=work)
+    ran = run_capture([vvp, str(work / "sim.vvp")], cwd=work, timeout=SIM_TIMEOUT_S)
     assert ran.returncode == 0, ran.stdout + ran.stderr
     # The design satisfies the four stability rules, so a correct checker is
     # silent about them — and a checker that fired here would be the bug.
@@ -244,13 +249,13 @@ def test_the_portable_checker_catches_a_real_violation(tmp_path):
     (work / "checker.sv").write_text(checker.code, encoding="utf-8")
 
     iverilog, vvp = simulate.find_iverilog()
-    built = subprocess.run(
+    built = run_capture(
         [iverilog, "-g2012", "-o", str(work / "sim.vvp"), str(work / "dut.v"),
          str(work / "checker.sv")],
-        capture_output=True, text=True, cwd=work,
+        cwd=work, timeout=SIM_TIMEOUT_S,
     )
     assert built.returncode == 0, built.stderr
-    ran = subprocess.run([vvp, str(work / "sim.vvp")], capture_output=True, text=True, cwd=work)
+    ran = run_capture([vvp, str(work / "sim.vvp")], cwd=work, timeout=SIM_TIMEOUT_S)
     out = ran.stdout + ran.stderr
     assert "AXI_AWSTABLE" in out, out
 

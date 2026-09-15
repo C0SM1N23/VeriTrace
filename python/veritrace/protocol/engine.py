@@ -152,8 +152,13 @@ def extract(
     # channels — `veritrace.memory` extracts those separately, on the same
     # detected-interfaces list, so this pipeline is not asked to assemble
     # transactions out of a pack that declares none.
-    interfaces = [i for i in detect.detect(store, out.packs, config) if not i.pack.is_memory]
+    interfaces = [i for i in detect.detect(store, out.packs, config, out.errors) if not i.pack.is_memory]
     if not interfaces:
+        for p in out.packs:
+            if not p.is_memory:
+                for scope, missing in detect.near_misses(store, p):
+                    if missing:
+                        out.errors.append(f"{p.slug} {scope}: incomplete interface; missing " + ", ".join(missing))
         _ingest(out, config, store)
         out.elapsed_ms = (_time.perf_counter() - started) * 1000.0
         return out
@@ -263,6 +268,7 @@ def _extract_one(
     ex.violations = list(asm.violations)
     ex.n_events = asm.n_events
     ex.n_matched = asm.n_matched
+    ex.skipped.update(asm.skipped)
 
     # §8.17, while the sampled matrix is still in hand.
     try:

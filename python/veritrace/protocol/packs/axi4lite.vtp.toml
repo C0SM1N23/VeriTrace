@@ -10,7 +10,7 @@ version = "1.0"
 required_suffixes = ["awvalid", "awready", "awaddr", "wvalid", "wready", "wdata",
                      "bvalid", "bready", "arvalid", "arready", "araddr",
                      "rvalid", "rready", "rdata"]
-prefix_strip      = ["m_axi_", "s_axi_", "axi_", "m_axil_", "s_axil_", "m_", "s_", ""]
+prefix_strip      = ["m_axi_", "s_axi_", "axi_", "m_axil_", "s_axil_", "m_", "s_", "", "*"]
 clock             = "aclk|clk|.*_aclk|.*_clk"
 reset             = "aresetn|areset_n|rst_n|resetn|.*_aresetn|.*_rst_n"
 

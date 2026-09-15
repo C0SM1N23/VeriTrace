@@ -11,9 +11,9 @@ tab is chosen.
 
 Two rules decide what happens when more than one answer is available:
 
-* **Specificity wins.** A generic valid/ready pack matches every AXI channel
-  too. Ranking by how many signals a pack demands puts AXI4 above AXI4-Lite
-  above handshake, with no priority numbers for pack authors to keep in sync.
+* **Specificity wins.** Rank the signals actually resolved, then the required
+  subset. Burst length/last/ID payloads distinguish AXI4 from Lite; counting
+  only required pins misclassified full AXI whenever Lite demanded more pins.
 * **The same wires are one interface.** A master port and the slave port it
   drives carry different names for the same nets, and the store already knows
   they share an event stream. Extracting both would double every transaction,
@@ -29,6 +29,34 @@ from typing import Any, Iterable
 
 from veritrace.protocol.model import Interface
 from veritrace.protocol.pack import Channel, Pack
+
+
+class AmbiguousSignal(ValueError):
+    """Naming alone cannot safely choose between different event streams."""
+
+
+def _without_direction(name: str) -> str:
+    return name[:-2] if name.endswith(("_i", "_o")) else name
+
+
+def _unique(candidates: list[Any], label: str) -> Any | None:
+    if not candidates:
+        return None
+    # Aliased ports are one wire; equal-looking values on independent wires
+    # are not. Never infer identity by comparing the observed payloads.
+    identities = {getattr(s, "stream_id", s.path) for s in candidates}
+    if len(identities) != 1:
+        raise AmbiguousSignal(f"ambiguous {label}: " + ", ".join(sorted(s.path for s in candidates)))
+    return min(candidates, key=lambda s: (len(s.path), s.path))
+
+
+def _signal(names: dict[str, Any], wanted: str) -> Any | None:
+    wanted = wanted.lower()
+    # An explicitly spelled pack signal wins. Direction suffixes are a
+    # fallback, not a renaming of the native store or the pack's vocabulary.
+    if wanted in names:
+        return names[wanted]
+    return _unique([names[n] for n in (wanted + "_i", wanted + "_o") if n in names], wanted)
 
 
 def _scope_index(store: Any) -> dict[str, dict[str, Any]]:
@@ -69,11 +97,15 @@ def _find_named(
         return None
     for anc in _ancestors(scope):
         names = index.get(anc) or {}
-        hits = [s for n, s in names.items() if rx.fullmatch(n) or rx.fullmatch(n.removeprefix(prefix.lower()))]
+        hits = [s for n, s in names.items() if any(
+            rx.fullmatch(candidate) or rx.fullmatch(candidate.removeprefix(prefix.lower()))
+            for candidate in (n, _without_direction(n))
+        )]
         if not hits:
             continue
-        hits.sort(key=lambda s: (not s.name.lower().startswith(prefix.lower()), len(s.name), s.name))
-        return hits[0].path
+        preferred = [s for s in hits if prefix and s.name.lower().startswith(prefix.lower())]
+        found = _unique(preferred or hits, f"clock/reset in {anc}")
+        return found.path
     return None
 
 
@@ -102,8 +134,16 @@ def configured_signal(store: Any, path: str | None) -> str | None:
         return path
 
     suffix = "." + path
-    matches = [s.path for s in store.signals() if s.path == path or s.path.endswith(suffix)]
-    return matches[0] if len(matches) == 1 else None
+    signals = list(store.signals())
+    matches = [s for s in signals if s.path == path or s.path.endswith(suffix)]
+    if not matches:
+        matches = [s for s in signals if _without_direction(s.path) == path
+                   or _without_direction(s.path).endswith(suffix)]
+    try:
+        found = _unique(matches, f"configured signal {path}")
+    except AmbiguousSignal:
+        return None
+    return found.path if found is not None else None
 
 
 #: `prefix_strip = ["*"]` — infer the prefix from the design instead of listing
@@ -121,7 +161,8 @@ def _prefixes(names: dict[str, Any], pack: Pack) -> list[str]:
             continue
         anchor = pack.detect.required_suffixes[0].lower()
         out += sorted(
-            {n[: -len(anchor)] for n in names if n.endswith(anchor) and len(n) > len(anchor)}
+            {n[: -len(anchor)] for name in names for n in (name, _without_direction(name))
+             if n.endswith(anchor) and len(n) > len(anchor)}
         )
     # Longest first: given `push_valid`, `push_` is the intended reading and a
     # shorter accidental match would claim the same wires under a worse name.
@@ -138,13 +179,13 @@ def _match(names: dict[str, Any], pack: Pack, prefix: str) -> dict[str, str] | N
     """
     resolved: dict[str, str] = {}
     for suffix in pack.detect.required_suffixes:
-        sig = names.get((prefix + suffix).lower())
+        sig = _signal(names, prefix + suffix)
         if sig is None:
             return None
         resolved[suffix] = sig.path
     for ch in pack.channels:
         for suffix in ch.signals:
-            sig = names.get((prefix + suffix).lower())
+            sig = _signal(names, prefix + suffix)
             if sig is not None:
                 resolved[suffix] = sig.path
     return resolved
@@ -226,6 +267,7 @@ def detect(
     store: Any,
     packs: Iterable[Pack],
     config: Any = None,
+    diagnostics: list[str] | None = None,
 ) -> list[Interface]:
     """Every interface in the trace, most specific pack per set of wires."""
     packs = list(packs)
@@ -233,31 +275,37 @@ def detect(
     ignored = list(getattr(config, "protocol_ignore", ()) or ())
     configured_reset = configured_signal(store, getattr(config, "reset_signal", None))
 
-    candidates: list[tuple[int, Interface]] = []
+    candidates: list[tuple[tuple[int, int], Interface]] = []
     for scope, names in index.items():
         if any(_glob(scope, pat) for pat in ignored):
             continue
         for pack in packs:
             for prefix in _prefixes(names, pack):
-                resolved = _match(names, pack, prefix)
-                if resolved is None:
+                try:
+                    resolved = _match(names, pack, prefix)
+                    if resolved is None:
+                        continue
+                    clock = _find_named(index, scope, pack.detect.clock, prefix)
+                    reset = configured_reset or _find_named(index, scope, pack.detect.reset, prefix)
+                except AmbiguousSignal as exc:
+                    if diagnostics is not None:
+                        diagnostics.append(f"{pack.slug} {scope}.{prefix}: {exc}; interface not extracted")
                     continue
                 candidates.append(
                     (
-                        pack.detect.specificity,
+                        (len(resolved), pack.detect.specificity),
                         Interface(
                             name=_interface_name(scope, prefix),
                             scope=scope,
                             prefix=prefix,
                             pack=pack,
                             signals=resolved,
-                            clock=_find_named(index, scope, pack.detect.clock, prefix),
+                            clock=clock,
                             # §4.3 names this once for the project.  Previously
                             # the field was parsed and then never read, so a
                             # non-conventional reset name made transfers during
                             # reset appear as real protocol traffic.
-                            reset=configured_reset
-                            or _find_named(index, scope, pack.detect.reset, prefix),
+                            reset=reset,
                         ),
                     )
                 )
@@ -266,7 +314,7 @@ def detect(
     # left at that point describes the same wires, so the tie-break is purely
     # "what will someone have to type in `txn(...)`" — `cpu` over
     # `tb_axi_lite.s_axi` for the same bus.
-    candidates.sort(key=lambda c: (-c[0], len(c[1].name), c[1].name))
+    candidates.sort(key=lambda c: (-c[0][0], -c[0][1], len(c[1].name), c[1].name))
 
     chosen: list[Interface] = []
     taken: dict[frozenset[int], Interface] = {}
@@ -317,7 +365,13 @@ def near_misses(store: Any, pack: Pack, limit: int = 3) -> list[tuple[str, list[
     out: list[tuple[int, str, list[str]]] = []
     for scope, names in _scope_index(store).items():
         for prefix in _prefixes(names, pack):
-            missing = [s for s in pack.detect.required_suffixes if (prefix + s).lower() not in names]
+            missing = []
+            for suffix in pack.detect.required_suffixes:
+                try:
+                    if _signal(names, prefix + suffix) is None:
+                        missing.append(suffix)
+                except AmbiguousSignal:
+                    missing.append(f"{suffix} (ambiguous)")
             # Nothing found at all is not a near miss — it is a scope that has
             # nothing to do with this bus.
             if len(missing) < len(pack.detect.required_suffixes):

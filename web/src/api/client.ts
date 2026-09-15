@@ -17,6 +17,7 @@ import type {
   Layout,
   Machine,
   MemoryReport,
+  MemoryWords,
   OpenSession,
   PerfHistory,
   PerfReport,
@@ -222,33 +223,55 @@ export class WaveSocket {
   private inflight: WaveRequest | null = null;
   private buffer: WaveChunk[] = [];
   private onChunks: ChunkHandler;
-  private onOpenCb: (() => void) | null = null;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private cancelConnect: (() => void) | null = null;
   private closed = false;
 
   constructor(
     private session: string,
     onChunks: ChunkHandler,
+    private onStatus: (error: string | null) => void = () => {},
   ) {
     this.onChunks = onChunks;
   }
 
   connect(): Promise<void> {
+    if (this.closed) return Promise.reject(new DOMException("Wave socket closed", "AbortError"));
     const url = `${WS_ORIGIN.replace(/^http/, "ws")}/session/${this.session}/ws`;
-    this.ws = new WebSocket(url);
-    this.ws.binaryType = "arraybuffer";
+    const ws = new WebSocket(url);
+    this.ws = ws;
+    ws.binaryType = "arraybuffer";
     return new Promise((resolve, reject) => {
-      if (!this.ws) return reject(new Error("no socket"));
-      this.ws.onopen = () => {
-        this.onOpenCb?.();
+      this.cancelConnect = () => reject(new DOMException("Wave socket closed", "AbortError"));
+      ws.onopen = () => {
+        this.cancelConnect = null;
+        // StrictMode/unmount may dispose a connection during its handshake.
+        // Closing a CONNECTING browser socket itself emits a console error;
+        // finish that handshake, then close without ever requesting data.
+        if (this.closed) { ws.close(); return; }
+        this.onStatus(null);
         this.flush();
         resolve();
       };
-      this.ws.onerror = () => reject(new Error("websocket error"));
-      this.ws.onmessage = (ev) => this.handle(ev);
-      this.ws.onclose = () => {
+      ws.onerror = () => {
+        if (!this.closed) this.onStatus("Waveform connection failed. Reconnecting…");
+        reject(new Error("websocket error"));
+      };
+      ws.onmessage = (ev) => { if (!this.closed) this.handle(ev); };
+      ws.onclose = () => {
+        this.cancelConnect = null;
+        reject(new Error("websocket closed before opening"));
         if (!this.closed) {
-          // A dropped socket must not wedge the UI; retry quietly.
-          setTimeout(() => !this.closed && this.connect().catch(() => {}), 1000);
+          // A partial response is not a completed viewport. Replay its request
+          // unless a newer pan/zoom already queued a better one.
+          this.pending ??= this.inflight;
+          this.inflight = null;
+          this.buffer = [];
+          this.onStatus("Waveform connection lost. Reconnecting…");
+          this.retryTimer = setTimeout(() => {
+            this.retryTimer = null;
+            if (!this.closed) void this.connect().catch(() => { /* onStatus reports the failure */ });
+          }, 1000);
         }
       };
     });
@@ -307,7 +330,10 @@ export class WaveSocket {
 
   close(): void {
     this.closed = true;
-    this.ws?.close();
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.cancelConnect?.();
+    this.cancelConnect = null;
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.close();
   }
 }
 
@@ -566,6 +592,11 @@ export async function fetchPerformanceHistory(
 
 export async function fetchMemory(session: string): Promise<MemoryReport> {
   return getJson<MemoryReport>(`${API}/session/${session}/memory`);
+}
+
+export function fetchMemoryWords(session: string, path: string, time: number, offset: number): Promise<MemoryWords> {
+  const query = new URLSearchParams({ path, time: String(time), offset: String(offset), count: "64" });
+  return getJson<MemoryWords>(`${API}/session/${session}/memory/array?${query}`);
 }
 
 export async function setMemoryTiming(session: string, iface: string, choice: { chip?: string; toml?: string }): Promise<MemoryReport> {

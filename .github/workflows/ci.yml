@@ -53,7 +53,7 @@ jobs:
       # and why the FST job below stays on Linux.
       - name: Install FST build dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libclang-dev iverilog
+        uses: ./.github/actions/ubuntu-deps
 
       - name: Install FST build dependencies (macOS)
         if: runner.os == 'macOS'
@@ -100,10 +100,22 @@ jobs:
           fi
 
       - name: pytest
-        run: uv run pytest -W error
+        # Installing Icarus on the Windows runner (above) made ~30 real-simulator
+        # tests run there for the first time, and one of them deliberately times
+        # a simulation out. `subprocess.run(timeout=)` could not end it — see
+        # `veritrace.tools.run_capture` — so the job stopped producing output and
+        # the runner was lost three hours later, with no log uploaded at all.
+        #
+        # The cause is fixed; these two are what make the *next* one diagnosable.
+        # The per-test timeout dumps every thread's stack and names the test;
+        # 300 s is above the 120 s a simulation may legitimately take.
+        timeout-minutes: 15
+        run: uv run pytest -v -W error -o faulthandler_timeout=300
 
       - name: Python undefined names and ignored values
-        run: uvx ruff check python tests --select F
+        # `bench/` too: `pybench.py` decides whether §4.2's budgets are met, and
+        # a name that does not exist there fails the gate rather than the code.
+        run: uvx ruff check python tests bench --select F
 
   # §4.2's stress tier. Heavy (1 GB of scratch, about a minute), so it does not
   # gate every push — but nothing would catch a regression there without it.
@@ -118,7 +130,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install FST build dependencies
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libclang-dev
+        uses: ./.github/actions/ubuntu-deps
       - name: Tier B — 1 GB over 50k signals
         run: cargo run --release -p vt-trace --example bench -- 1000 50000
       - run: uv sync
@@ -138,7 +150,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install FST build dependencies
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libclang-dev
+        uses: ./.github/actions/ubuntu-deps
       - run: uv sync
 
       - name: The golden suite — every reference design reaches its own root cause
@@ -250,19 +262,28 @@ jobs:
             echo "the deadlock did not fail the build"; exit 1
           fi
 
-      # §8.20's acceptance criterion, both halves. Four timing violations, one
-      # per category, each with its exact cycle — and none at all on the same
-      # controller compiled clean.
+      # §8.20: three injected timing violations and a legal four-ACTIVATE
+      # window. Only a fifth activation may violate tFAW. Test both boundaries
+      # through real Icarus -> native trace -> API, not a stale textual count.
       - name: Every injected SDRAM timing violation is found, and only then
         run: |
           uv run veritrace memory designs/sdram/dump.vcd | tee mem.txt
-          for c in tRCD tRP tRFC tFAW; do
+          for c in tRCD tRP tRFC; do
             grep -q "! $c violated 1 time(s)" mem.txt || { echo "MISSED: $c"; exit 1; }
           done
           # The exact cycle and both commands, not just "something looks wrong".
           grep -q "ACTIVATE@c8 -> READ@c9" mem.txt
           # Constraints that held are stated, not merely absent.
           grep -q "conformant" mem.txt
+          if grep -q "! tFAW violated" mem.txt; then
+            echo "four legal activations were reported as a tFAW violation"; exit 1
+          fi
+          # Both boundaries, through real Icarus and the production Memory API.
+          # The count is asserted because `@needs_icarus` turns a missing
+          # simulator into a skip, and a skipped gate exits zero.
+          uv run pytest tests/test_run.py -v \
+            -k real_command_bus_tfaw_only_flags_the_fifth_activate | tee tfaw.txt
+          grep -q "2 passed" tfaw.txt
           uv run veritrace memory designs/sdram/dump_ok.vcd | tee memok.txt
           if grep -q "violated" memok.txt; then
             echo "a clean run reported a violation"; exit 1
@@ -363,7 +384,7 @@ jobs:
 
       - name: Install FST build dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libclang-dev
+        uses: ./.github/actions/ubuntu-deps
 
       - name: Install FST build dependencies (macOS)
         if: runner.os == 'macOS'
@@ -435,7 +456,7 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - name: Install FST build dependencies
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libclang-dev
+        uses: ./.github/actions/ubuntu-deps
 
       - name: Build the UI into the package
         run: npm ci && npm run build
@@ -528,15 +549,11 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - name: Install FST build dependencies
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libclang-dev
+        uses: ./.github/actions/ubuntu-deps
 
       - run: uv sync
 
-      # §8.3's "generate and verify" compiles the testbench it produced and runs
-      # it. Without a simulator the verdict is "not run", and the test that
-      # asserts the simulator's own answer has nothing to read.
-      - name: Install Icarus, for the repro validation test
-        run: sudo apt-get update && sudo apt-get install -y iverilog
+      # ubuntu-deps also supplies the real Icarus used by repro validation.
 
       - name: Convert the reference dumps
         # fifo_buggy carries the injected bug, so the causal tests have a real
@@ -614,7 +631,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install FST build dependencies
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libclang-dev
+        uses: ./.github/actions/ubuntu-deps
       - name: Benchmark against the tier-A budget
         run: cargo run --release -p vt-trace --example bench -- 100 5000
 

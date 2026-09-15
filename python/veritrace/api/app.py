@@ -1329,6 +1329,7 @@ def create_app(
         decoded command stream is what `cmds(iface)` is for.
         """
         from veritrace.memory import timing
+        from veritrace.memory.arrays import inventory
 
         session = require(session_id)
         timing_errors: list[str] = []
@@ -1336,7 +1337,8 @@ def create_app(
                                 errors=timing_errors)
         selection = session.layout_file.load().get("memoryTiming", {})
         catalog = {"chips": [c.to_dict() for c in chips], "timing_errors": timing_errors,
-                   "selection": selection}
+                   "selection": selection, "arrays": inventory(session.graph),
+                   "rtl_error": session.rtl_error}
         if not session.memory:
             return {
                 **catalog,
@@ -1348,6 +1350,19 @@ def create_app(
             "interfaces": [r.to_dict(with_commands=False) for r in session.memory],
             "errors": [session.memory_error] if session.memory_error else [],
         }
+
+    @api.get("/session/{session_id}/memory/array")
+    def memory_array(session_id: str, path: str, time: int = Query(ge=0),
+                     offset: int = Query(default=0, ge=0), count: int = Query(default=64, ge=1, le=256)):
+        from veritrace.memory.arrays import sample
+
+        session = require(session_id)
+        try:
+            return sample(session.graph, session.store, path, time, offset, count)
+        except KeyError as exc:
+            raise HTTPException(404, detail=f"Unknown RTL memory: {path}") from exc
+        except ValueError as exc:
+            raise HTTPException(400, detail=str(exc)) from exc
 
     @api.post("/session/{session_id}/memory/timing")
     def memory_timing(session_id: str, body: MemoryTimingBody) -> dict[str, Any]:

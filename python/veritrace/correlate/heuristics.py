@@ -45,7 +45,7 @@ def suffixes(path: str) -> list[str]:
     return [".".join(parts[i:]) for i in range(len(parts))]
 
 
-_ELEMENT = re.compile(r"^(.*)\[(\d+)\]$")
+_ELEMENT = re.compile(r"^(.*)\[(-?\d+)\]$")
 
 
 def build_index(

@@ -26,6 +26,7 @@ import { formatTime } from "../lib/time";
 import { addressPattern, decodeAddress } from "../lib/address";
 import type { CmdEvent, MemoryInterface, MemoryReport, TimingViolation } from "../lib/types";
 import { useWave } from "../state/store";
+import { RTLMemoryPanel } from "./RTLMemoryPanel";
 
 /** Height of one bank row in the timeline. */
 const BANK_H = 22;
@@ -37,6 +38,7 @@ export function MemoryTab() {
   const load = useWave((s) => s.loadMemory);
   const iface = useWave((s) => s.memIface);
   const select = useWave((s) => s.selectMemIface);
+  const session = useWave((s) => s.session);
 
   useEffect(() => {
     if (!report && !busy && !error) void load();
@@ -48,8 +50,10 @@ export function MemoryTab() {
 
   if (!report.interfaces.length) {
     return (
-      <div className="pane-note" data-testid="mem-empty">
-        No memory interfaces were detected.
+      <div className="mem" data-testid="memory-tab">
+        <RTLMemoryPanel key={session} arrays={report.arrays ?? []} rtlError={report.rtl_error} />
+        <div className="pane-note" data-testid="mem-empty">
+        No SDRAM/DDR command interfaces were detected.
         <div className="pane-hint">
           A memory pack matches a scope only when every signal it requires is in the
           dump — for SDR SDRAM that is <code>cs_n</code>, <code>ras_n</code>,{" "}
@@ -61,6 +65,7 @@ export function MemoryTab() {
             {e}
           </div>
         ))}
+        </div>
       </div>
     );
   }
@@ -69,6 +74,7 @@ export function MemoryTab() {
 
   return (
     <div className="mem" data-testid="memory-tab">
+      <RTLMemoryPanel key={session} arrays={report.arrays ?? []} rtlError={report.rtl_error} />
       {error && <div className="pane-note" role="alert">{error} <button onClick={() => void load()}>Retry</button></div>}
       {report.errors.concat(report.timing_errors).map((e) => <div className="pane-note" role="alert" key={e}>{e}</div>)}
       <div className="mem-head">

@@ -33,7 +33,7 @@ from veritrace.protocol.model import Beat, ChannelEvent, Extraction, Interface, 
 
 #: Bumped when the columns or the assembly semantics change, so an old table is
 #: rebuilt instead of being read with today's assumptions.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 #: Columns every table has, whatever the protocol. Kept first and in this order
 #: so a `SELECT *` is readable without knowing the pack.

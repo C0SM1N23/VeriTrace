@@ -62,21 +62,31 @@ $ veritrace memory designs/sdram/dump.vcd
 ctrl   [mt48lc16m16a2]   4 banks   13 commands
     ACTIVATE=7  PRECHARGE=3  READ=1  REFRESH=1  WRITE=1
     ! tRCD violated 1 time(s)
-        c9   bank 0  ACTIVATE@c8 -> READ@c9  (1 cycles, min 2)
+        c9  bank 0  ACTIVATE@c8 -> READ@c9  (1 cycles, min 2)
     ! tRFC violated 1 time(s)
         c29  REFRESH@c23 -> ACTIVATE@c29  (6 cycles, min 7)
     ! tRP violated 1 time(s)
         c15  bank 0  PRECHARGE@c14 -> ACTIVATE@c15  (1 cycles, min 2)
-    ok  tRAS, tRC, tRRD, tRTP, tFAW: conformant
-    skipped tREFI: no consecutive refreshes observed
-    skipped tWR: no last data beat observed (command-only lower bound)
+    ok  tFAW, tRAS, tRC, tRRD, tRTP: conformant
+    rows  0 hit / 4 miss / 3 conflict  (0% hit)
+    bus utilization 3.4%
+    refresh overhead 11.2%
+    read/write turnaround 22 cycles over 1 switches
+    bank parallelism 1.66 banks active on average
+    not checked: CL - needs a data-bus signal correlated to the command; ...
+    not checked: CWL - needs a data-bus signal correlated to the command; ...
+    not checked: tWR - the last write data beat is not observed; ...
+    not checked: tWTR - no qualifying command pair/window was observed in this trace
+    not checked: tREFI - no qualifying command pair/window was observed in this trace
 ```
 
-Two things there are the point of the exercise. Each violation names **both
+Three things there are the point of the exercise. Each violation names **both
 commands it was measured between and the exact cycle** — §8.20 warns against a
-report that only says something looks wrong. And the constraints that held are
+report that only says something looks wrong. The constraints that held are
 *listed*, because "conformant" has to be a stated fact rather than the absence
-of a line.
+of a line. And a constraint this trace cannot decide is neither a violation nor
+a pass: `not checked` says which observation was missing, so silence is never
+read as compliance.
 
 ## What the bank timeline shows
 

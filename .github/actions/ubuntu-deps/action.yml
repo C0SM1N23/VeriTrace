@@ -1,0 +1,16 @@
+name: Ubuntu HDL dependencies
+description: Install the toolchain from Ubuntu without unrelated runner repositories.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        # Hosted Ubuntu also ships Chrome and Microsoft package sources. They
+        # are not dependencies of this build, and a Chrome index hash mismatch
+        # used to prevent every Linux test from even starting. Keep Ubuntu's
+        # signed sources and hash verification intact. This also applies to
+        # Playwright's later apt invocation on this disposable CI runner.
+        test -s /etc/apt/sources.list.d/ubuntu.sources
+        sudo install -m 0644 .github/actions/ubuntu-deps/apt.conf /etc/apt/apt.conf.d/99veritrace-ci
+        sudo apt-get update
+        sudo apt-get install -y zlib1g-dev libclang-dev iverilog

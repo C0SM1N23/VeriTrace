@@ -250,6 +250,9 @@ class Signal:
     #: Such a signal has no design driver but is not floating either: it comes
     #: from outside the design, which is §8.1's `PRIMARY_INPUT`.
     stimulus_only: bool = False
+    #: Literal bounds for a one-dimensional fixed unpacked array.
+    array_left: int | None = None
+    array_right: int | None = None
 
     @property
     def path(self) -> str:

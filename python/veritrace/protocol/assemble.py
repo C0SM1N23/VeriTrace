@@ -41,6 +41,13 @@ MAX_VIOLATIONS_PER_RULE = 20
 # --- the environment a pack expression sees ---------------------------------
 
 
+def _payload_operand(value: FieldValue) -> FieldValue:
+    """Keep raw four-state payloads in exports, but never compare X/Z as text."""
+    if isinstance(value, str) and value and set(value.lower()) <= set("01xz"):
+        return None if any(c in value.lower() for c in "xz") else int(value, 2)
+    return value
+
+
 class TxnEnv:
     """Names visible to `[metrics]`, `match_on` and per-transaction rules.
 
@@ -87,7 +94,7 @@ class TxnEnv:
 
     def lookup(self, name: str) -> Any:
         if name in self.extra:
-            return self.extra[name]
+            return _payload_operand(self.extra[name])
         head, _, tail = name.partition(".")
         if tail:
             if head == "param":
@@ -106,10 +113,10 @@ class TxnEnv:
         if name in self.txn.metrics:
             return self.txn.metrics[name]
         if name in self.txn.fields:
-            return self.txn.fields[name]
+            return _payload_operand(self.txn.fields[name])
         for e in self.txn.events:
             if name in e.fields:
-                return e.fields[name]
+                return _payload_operand(e.fields[name])
         if name in self._declared:
             return None  # declared by the pack, absent from this design
         raise expr.ExprError(f"unknown name `{name}` in transaction {self.txn.ref}")
@@ -133,7 +140,7 @@ class TxnEnv:
                 return self._cycle(ev.assert_time)
             case "stall":
                 return ev.stall
-        return ev.fields.get(field_name)
+        return _payload_operand(ev.fields.get(field_name))
 
     def call(self, fn: str, args: Sequence[expr.Node], ev: Callable[[expr.Node], Any]) -> Any:
         match fn:
@@ -193,7 +200,7 @@ class _EventEnv:
             case "channel":
                 return self.ev.channel
         if name in self.ev.fields:
-            return self.ev.fields[name]
+            return _payload_operand(self.ev.fields[name])
         return self.parent.lookup(name)
 
     def call(self, fn: str, args: Sequence[expr.Node], ev: Callable[[expr.Node], Any]) -> Any:
@@ -262,6 +269,7 @@ def assemble(
     for m in machines:
         m.finish()
         out.transactions.extend(m.done)
+        out.skipped.update(m.skipped)
 
     for txn in out.transactions:
         lift_payload(txn)
@@ -287,6 +295,7 @@ class _Machine:
         self.open: list[_Open] = []
         self.done: list[Transaction] = []
         self._n = 0
+        self.skipped: dict[str, str] = {}
         #: Beats that arrived before the transaction they belong to. AXI
         #: explicitly permits write data ahead of its address, and dropping
         #: those beats would silently under-count every such burst.
@@ -409,8 +418,30 @@ class _Machine:
             # stored address-phase id on the right.
             env = TxnEnv(entry.txn, self.iface.pack, self.clock, extra=dict(ev.fields))
             try:
-                if expr.evaluate(expr.parse(phase.match_on), env):
+                condition = expr.parse(phase.match_on)
+                if expr.evaluate(condition, env):
                     return entry
+                # ID-less implementations omit both ID pins. With exactly
+                # one outstanding request, its response is unambiguous. Never
+                # use this for dumped X IDs, a one-sided missing ID, multiple
+                # outstanding requests, or arbitrary pack predicates.
+                if (isinstance(condition, expr.Binary) and condition.op == "=="
+                        and isinstance(condition.lhs, expr.Name)
+                        and isinstance(condition.rhs, expr.Name)):
+                    fields = {name.rsplit(".", 1)[-1] for name in expr.identifiers(condition)}
+                    # Scanners retain undumped optional fields as None. The
+                    # interface map, not presence of a dictionary key, tells
+                    # absent pins apart from dumped pins carrying X/Z.
+                    present = set(self.iface.signals) | {k for k, v in ev.fields.items() if v is not None}
+                    present.update(k for event in entry.txn.events for k, v in event.fields.items()
+                                   if v is not None)
+                    if len(fields) == 2 and self.spec.id in fields and not fields & present:
+                        self.skipped[f"{self.spec.name} IDs"] = (
+                            "ID pins are absent; responses are matched only with one outstanding "
+                            "request. ID equality and out-of-order completion cannot be verified."
+                        )
+                        if len(self.open) == 1:
+                            return entry
             except expr.ExprError:
                 continue
         return None
