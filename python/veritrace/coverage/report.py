@@ -45,11 +45,15 @@ def build(
     else:
         out.skipped["functional"] = "no protocol interface was extracted"
 
+    # Taken as given. A path typed on the command line is relative to where it
+    # was typed, and one read from `.veritrace.toml` is resolved against the
+    # configuration by `Config.coverage_file()` — the same rule `design.rtl`
+    # follows. Re-rooting here applied the config rule to both, so
+    # `--coverage cov.csv` was validated against the process and then read from
+    # the project directory.
     path = Path(coverage_path) if coverage_path else (
         code_mod.discover(project_root) if project_root else None
     )
-    if coverage_path and path is not None and not path.is_absolute() and project_root:
-        path = Path(project_root) / path
     if path is None:
         out.skipped["code"] = (
             "no coverage database found; run verilator --coverage or xcrg, "

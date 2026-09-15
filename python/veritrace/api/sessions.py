@@ -585,7 +585,8 @@ class Session:
                 self.store,
                 self.clock,
                 self.graph,
-                coverage_path=getattr(self.config, "coverage_path", None),
+                # Resolved against the configuration, not this process's cwd.
+                coverage_path=getattr(self.config, "coverage_file", lambda: None)(),
                 project_root=root,
                 elaboration=self.elaboration,
             )

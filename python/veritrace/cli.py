@@ -376,7 +376,13 @@ class Context:
                 self.store,
                 self.clock,
                 self.graph,
-                coverage_path=coverage_path,
+                # `--coverage` first, then `coverage.path` from the project
+                # (already resolved against the configuration), then discovery.
+                # The API has always honoured the configured path; the CLI
+                # ignored it, so `veritrace serve` and `veritrace coverage`
+                # disagreed about the same project.
+                coverage_path=coverage_path
+                or getattr(self.config, "coverage_file", lambda: None)(),
                 project_root=root,
                 source=source,
                 elaboration=self.elaboration,

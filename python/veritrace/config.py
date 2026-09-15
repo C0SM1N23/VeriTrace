@@ -151,6 +151,19 @@ class Config:
         seen: set[Path] = set()
         return [p for p in out if p.is_file() and not (p in seen or seen.add(p))]
 
+    def coverage_file(self) -> Path | None:
+        """`coverage.path`, resolved like every other path in the file (§4.3).
+
+        A path written in the configuration is relative to the configuration,
+        not to whichever directory a later command happens to run from — the
+        same rule `design.rtl` follows above. A path typed on the command line
+        is the caller's, and is left exactly as given.
+        """
+        if not self.coverage_path:
+            return None
+        p = Path(self.coverage_path)
+        return p if p.is_absolute() else self.root / p
+
     def is_ignored(self, path: str) -> bool:
         """§4.3: `trace.ignore` excludes a signal from stuck, lint and correlation.
 

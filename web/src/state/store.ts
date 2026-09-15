@@ -596,9 +596,20 @@ export const useWave = create<WaveState>((set, get) => ({
 
       const bounds = { t0: status.t0, t1: Math.max(status.t1, status.t0 + 1) };
       const saved = Array.isArray(layout.signals) ? (layout.signals as Row[]) : [];
-      const known = new Set(signals.map((s) => s.handle));
-      // Drop rows whose signal no longer exists (the dump may have changed).
-      const rows = saved.filter((r) => r.kind === "group" || known.has(r.handle));
+      // A layout is a list of signal *paths*; the handle beside each one is an
+      // index into the signal table of the trace it was saved against. A later
+      // run of the same project writes a different trace whose handles are the
+      // same numbers pointing at different signals — so filtering on the handle
+      // kept every stale row, renamed to whatever now sits at that index, and
+      // `why` on one answered "unknown signal". Match the path, and re-bind the
+      // handle to this trace.
+      const byPath = new Map(signals.map((s) => [s.path, s]));
+      const rows = saved.flatMap<Row>((r) => {
+        if (r.kind === "group") return [r];
+        const sig = byPath.get(r.path);
+        return sig ? [{ ...r, handle: sig.handle }] : [];
+      });
+      const droppedRows = saved.length - rows.length;
       const configuredRadix = Object.fromEntries(
         Object.entries(layout.radix ?? {}).filter((entry): entry is [string, Radix] =>
           isRadix(entry[1]),
@@ -679,7 +690,12 @@ export const useWave = create<WaveState>((set, get) => ({
         error: null,
         note: status.layout_error
           ? `${status.layout_error}. Defaults are shown; the original will be backed up on save.`
-          : "",
+          // A saved layout outlives the trace it was saved against. Say how many
+          // of its signals this run does not have, rather than quietly showing a
+          // shorter list and leaving the reader to wonder what happened to it.
+          : droppedRows > 0
+            ? `${droppedRows} signal(s) in the saved layout are not in this trace, and were left out.`
+            : "",
       });
       // Always, not only on the Checks tab: §13.7's plugin tables arrive with
       // the checks, and the tab strip cannot show them before they are here.

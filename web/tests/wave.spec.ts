@@ -414,4 +414,52 @@ test.describe("layout persistence", () => {
     await expect(page.locator('[data-testid="signal-row"]').first()).toBeVisible();
     expect(await order()).toEqual(moved);
   });
+
+  /**
+   * A layout saved against an earlier run of the same project.
+   *
+   * The handle beside each row is an index into the signal table of the trace
+   * it was saved against, and a later simulation writes a trace whose handles
+   * are the same numbers over different signals. Filtering the restored rows on
+   * the handle therefore kept every stale row and relabelled it, so the Wave
+   * tab showed signals this trace does not have and `why` on one of them
+   * answered `unknown signal`. The path is what a layout is a list of.
+   */
+  test("a row from an earlier run is dropped, not relabelled", async ({ page, request }) => {
+    const sid = (await (await request.get(`${BACKEND}/`)).json()).default_session;
+    const real = (await (await request.get(
+      `${BACKEND}/session/${sid}/signals?limit=5`,
+    )).json()).signals[0] as { handle: number; path: string };
+
+    await request.put(`${BACKEND}/session/${sid}/layout`, {
+      data: {
+        signals: [
+          // A handle this trace really has, under a name from the previous run.
+          { kind: "signal", handle: real.handle, path: "old_top.gone.arvalid_i" },
+          { kind: "signal", handle: real.handle, path: real.path },
+        ],
+        groups: [], radix: {}, bookmarks: [], cursors: [], zoom: null,
+      },
+    });
+
+    await openApp(page);
+    const shown = await page.locator('[data-testid="signal-row"]').evaluateAll((els) =>
+      els.map((e) => e.getAttribute("data-path")),
+    );
+    expect(shown).toEqual([real.path]);
+
+    // And it says so, rather than quietly showing a shorter list.
+    expect(await page.evaluate(() => (window as any).__vtStore.getState().note))
+      .toContain("not in this trace");
+
+    // And the row that did survive answers `why`, rather than naming a signal
+    // the backend has never heard of.
+    const answered = await page.evaluate(async (path: string) => {
+      const store = (window as any).__vtStore;
+      await store.getState().runWhy(path, 0);
+      return { error: store.getState().causalError, root: store.getState().causal?.root?.signal };
+    }, real.path);
+    expect(answered.error ?? "").not.toContain("unknown signal");
+    expect(answered.root).toBe(real.path);
+  });
 });

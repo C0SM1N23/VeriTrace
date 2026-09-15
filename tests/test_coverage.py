@@ -398,7 +398,20 @@ def test_the_exported_table_carries_the_response_a_reader_would_want(tmp_path):
     assert any(v == 2 for v in cols["bresp"] if v is not None), "the SLVERR is not in the table"
 
 
-def test_relative_coverage_path_is_relative_to_project_not_process(tmp_path, monkeypatch):
+def test_a_configured_coverage_path_follows_the_project_and_a_typed_one_the_caller(
+    tmp_path, monkeypatch
+):
+    """Two relative paths, two different rules — and both of them are right.
+
+    `coverage.path` is written in `.veritrace.toml` and is relative to it, like
+    `design.rtl`: a project must analyse the same way from any directory. A
+    path typed after `--coverage` is relative to where it was typed, like every
+    other command-line path — and resolving *that* one against the project made
+    `--coverage cov.csv` pass Click's existence check against the process and
+    then fail to open, one directory away.
+    """
+    from veritrace.config import Config
+
     project = tmp_path / "project"
     project.mkdir()
     other = tmp_path / "unrelated"
@@ -406,11 +419,18 @@ def test_relative_coverage_path_is_relative_to_project_not_process(tmp_path, mon
     (project / "coverage.csv").write_text("v_branch,design.sv,42,7\n")
     (other / "coverage.csv").write_text("v_branch,wrong.sv,99,0\n")
     monkeypatch.chdir(other)
-    report = cov_report.build(coverage_path="coverage.csv", project_root=project)
-    assert report.code_error is None
-    assert report.code is not None
+
+    configured = Config.empty(project)
+    configured.coverage_path = "coverage.csv"
+    report = cov_report.build(coverage_path=configured.coverage_file(), project_root=project)
+    assert report.code_error is None and report.code is not None
     assert report.code.files[0].points[0].line == 42
     assert report.code.files[0].points[0].count == 7
+
+    # The same spelling, typed by a caller standing in `other`.
+    typed = cov_report.build(coverage_path="coverage.csv", project_root=project)
+    assert typed.code_error is None and typed.code is not None
+    assert typed.code.files[0].points[0].line == 99
 
 
 def test_real_verilator_object_label_is_not_replaced_by_source_column(tmp_path):
