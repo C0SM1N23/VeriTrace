@@ -346,6 +346,46 @@ fn writer_rejects_duplicate_paths_before_publishing_a_store() {
 }
 
 #[test]
+fn open_rejects_rows_indexed_under_the_wrong_stream() {
+    use vt_trace::index::{ENTRY_LEN, HEADER_LEN};
+
+    let (dir, s, _) = convert(GLITCH);
+    drop(s);
+    let path = dir.path().join("dump.vtx").join("index.bin");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let n_chunks = u32::from_le_bytes(bytes[40..44].try_into().unwrap()) as usize;
+    let field = |b: &[u8], i: usize, o: usize| {
+        let at = HEADER_LEN + i * ENTRY_LEN + o;
+        u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    };
+    // The last chunk of each of two streams. Moving one row from the first to
+    // the second keeps every offset contiguous and the total unchanged, so the
+    // only check that can see it is the per-stream comparison with the signals
+    // table — the one whose lookup this test pins down.
+    let last_of = |stream: u32| {
+        (0..n_chunks)
+            .rev()
+            .find(|&i| field(&bytes, i, 0) == stream)
+            .unwrap()
+    };
+    let (from, to) = (last_of(0), last_of(1));
+    assert!(field(&bytes, from, 12) >= 2, "need a row to spare");
+    for (i, delta) in [(from, -1i64), (to, 1)] {
+        let at = HEADER_LEN + i * ENTRY_LEN + 12;
+        let n = (field(&bytes, i, 12) as i64 + delta) as u32;
+        bytes[at..at + 4].copy_from_slice(&n.to_le_bytes());
+    }
+    std::fs::write(&path, bytes).unwrap();
+
+    let err = TraceStore::open(dir.path().join("dump.vtx"))
+        .err()
+        .expect("a store whose index disagrees with its signals must not open")
+        .to_string();
+    assert!(err.contains("stream 0 has"), "{err}");
+    assert!(err.contains("signals table declares"), "{err}");
+}
+
+#[test]
 fn writer_can_replace_a_store_it_previously_created() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("dump.vtx");

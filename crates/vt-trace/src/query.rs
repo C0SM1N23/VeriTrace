@@ -1185,7 +1185,12 @@ fn validate_store(
     if let Some(missing) = stream_meta.iter().position(Option::is_none) {
         return Err(bad(format!("stream {missing} has no signal declaration")));
     }
-    let table_events: u64 = stream_meta.into_iter().flatten().map(|x| x.2).sum();
+    // Every slot is filled (checked just above). Kept by stream id so the
+    // per-stream row check below is a lookup: searching `signals` once per
+    // stream was O(streams × signals) and alone pushed a tier-B open (50k
+    // signals) past §4.2's 2 s.
+    let declared: Vec<u64> = stream_meta.into_iter().flatten().map(|x| x.2).collect();
+    let table_events: u64 = declared.iter().sum();
     if table_events != meta.n_events {
         return Err(bad(format!(
             "event count mismatch: meta={}, signals={table_events}",
@@ -1230,12 +1235,7 @@ fn validate_store(
             meta.n_events
         )));
     }
-    for (stream, expected) in next_offset.into_iter().enumerate() {
-        let declared = signals
-            .iter()
-            .find(|s| s.stream_id as usize == stream)
-            .map(|s| s.n_events)
-            .unwrap_or(0);
+    for (stream, (expected, declared)) in next_offset.into_iter().zip(declared).enumerate() {
         if expected != declared {
             return Err(bad(format!(
                 "stream {stream} has {expected} indexed rows, signals table declares {declared}"
